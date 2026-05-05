@@ -1,0 +1,61 @@
+Here's a complete guide to tackling the Webserv project as a team.
+
+Overall Architecture
+
+
+
+1. How the Components Interact
+The event loop is the backbone. A single call to poll() (or equivalent) sits in an infinite loop, watching a list of file descriptors — your listening sockets plus every connected client socket. When poll() signals a descriptor as readable or writable, you act on it: accept a new connection, read incoming bytes, or flush a pending response. Nothing blocks. If a socket isn't ready, you skip it and keep the loop turning.
+Connections carry state. Each connected client has an associated object holding its incoming buffer (partially-received request bytes), its outgoing buffer (response bytes waiting to be sent), and a state machine (e.g. READING_HEADERS → READING_BODY → BUILDING_RESPONSE → SENDING). The event loop feeds bytes in and drains bytes out; the state machine tells you what to do with them.
+The parser produces a Request struct. As bytes arrive, the parser incrementally processes them — first the request line (method, URI, HTTP version), then headers (a key-value map), then the body. For chunked transfer encoding, you un-chunk on the fly. When the full request is assembled, you hand a clean Request object to the router.
+The router matches a config block. Given the request's Host header and URI, the router walks the configuration to find the matching server block and location block. It checks whether the HTTP method is allowed, whether a redirect applies, what the filesystem root is, and whether CGI should be invoked.
+Handlers produce a Response struct. For a GET request on a static file, the handler opens the file and sets the body. For POST with an upload, it writes to disk. For CGI, it forks a child, sets environment variables, pipes the request body in, reads stdout back. For DELETE, it removes the file. The response object always carries a status code, headers, and a body.
+The response builder serializes and queues. The builder turns the Response struct into raw bytes (status line + \r\n, headers each followed by \r\n, blank line, body) and places them in the client's outgoing buffer. The event loop then drains that buffer through send() whenever poll() reports the socket writable.
+
+2. Step-by-Step Build Plan
+Build incrementally — each step produces something you can test before the next.
+Phase 1 — Minimal server that echoes. Parse the config file and bind + listen on each configured port. Accept connections. In the event loop, read a raw request and write a hardcoded 200 OK\r\n\r\nHello back. This validates your socket and event-loop machinery before touching HTTP logic.
+Phase 2 — HTTP request parsing. Build a real parser that extracts the method, URI, HTTP version, and all headers. Handle the two body-reading strategies: fixed-size body from Content-Length, and chunked transfer encoding. Test with telnet and raw curl --http1.1 before wiring the parser into the event loop.
+Phase 3 — Configuration parser. Parse the NGINX-style config file into a tree of server blocks and location blocks. Each location block records its allowed methods, root directory, index file, redirection target, upload directory, directory listing flag, and CGI extension map.
+Phase 4 — Router and GET for static files. Match an incoming request to a config block. Resolve the URI to a filesystem path. Serve the file, generate a directory listing if enabled, fall back to the configured error page, and return the right status codes (200, 301, 403, 404, 405, 413…).
+Phase 5 — POST and file uploads. Implement multipart/form-data parsing and plain-body POST. Write uploaded content to the configured upload directory. Return 201 on success.
+Phase 6 — DELETE. Locate the file, check permissions, remove it, return 204 or 404.
+Phase 7 — CGI. Fork a child process, set the required environment variables (REQUEST_METHOD, QUERY_STRING, CONTENT_TYPE, CONTENT_LENGTH, PATH_INFO, SCRIPT_FILENAME…), pipe the request body to its stdin, read its stdout, parse the CGI response headers, and relay the output.
+Phase 8 — Stress testing and edge cases. Test with siege, wrk, or a custom Python/Go script. Handle slow clients, partial reads, large uploads, connection timeouts, and back-to-back requests on the same connection.
+
+3. Team Division (Three People)
+Here's a clean split that lets each person own a vertical slice, with shared integration points defined up front.
+Member A — Network layer and event loop. Owns: socket creation and binding, the poll()-based event loop, connection accept/close, the client state machine, the read/write buffer management, and the config file parser. This person defines the data structures that the rest of the team builds against — the Client object, the ServerConfig tree, and the Request/Response structs. Work on this first because everything else depends on it.
+Member B — HTTP parsing and response building. Owns: the incremental HTTP request parser (request line, headers, body with both length-delimited and chunked modes), the response serializer (status line, headers, body), the MIME type map, and all HTTP status code logic. Also owns default error page generation. This person delivers two clean functions: parseRequest(buffer) → Request and buildResponse(Response) → buffer.
+Member C — Router, handlers, and CGI. Owns: route matching against the config tree, the GET/POST/DELETE handler implementations, directory listing HTML generation, file upload storage, and the CGI fork-and-pipe mechanism. This person works against the Request and Response structs that Member B defines, and calls into the config structures that Member A defines.
+All three agree on the shared data structures in week one before writing handler or parsing code. Changes to Request, Response, or ServerConfig go through a quick team review since they affect everyone.
+
+4. Concepts Everyone Must Understand
+These topics will come up during peer evaluation for all three of you, so no one can treat them as someone else's problem.
+Non-blocking I/O and the event loop. Why blocking is fatal for a multi-client server. How poll() multiplexes many file descriptors in a single thread. What POLLIN and POLLOUT mean. Why you must never call read() or recv() on a socket without first checking readiness via poll().
+The HTTP/1.1 request and response format. The precise structure: request line, CRLF-separated headers, blank line, body. How Content-Length works. What chunked transfer encoding is and how to decode it. The meaning of the most common status codes (200, 201, 204, 301, 302, 400, 403, 404, 405, 408, 413, 500, 501).
+How file descriptors and sockets work. socket(), bind(), listen(), accept(), recv(), send(), close(). Why you need SO_REUSEADDR. The difference between a listening socket and a connected socket.
+The NGINX config format (as inspiration). What a server block is, what a location block is, what root, index, return, limit_except, and client_max_body_size do — since your config format mirrors these.
+CGI basics. What a CGI script is. How environment variables communicate the request to the script. How stdin carries the body and stdout carries the response. Why fork() + execve() is the mechanism and why you must waitpid() to avoid zombies.
+
+5. Individual Specializations
+Beyond the shared knowledge, each person goes deeper in their own area.
+Member A specializes in: the edge cases of poll() (what happens when a client disconnects mid-send, how to handle POLLHUP and POLLERR), timeout management (dropping connections that go silent), the correct use of fcntl(F_SETFL, O_NONBLOCK), and SO_REUSEADDR / SO_REUSEPORT for multi-port listening.
+Member B specializes in: the HTTP spec details (token characters, header folding, obs-fold, transfer codings), correct MIME type detection from file extensions, the exact format of Date and Last-Modified headers, and the nuances of HTTP/1.0 vs 1.1 keep-alive behavior.
+Member C specializes in: CGI environment variable names and meanings (the full CGI/1.1 variable set), the PATH_INFO / SCRIPT_NAME split, how to handle CGI timeouts (the child must not run forever), directory listing HTML generation, and multipart/form-data boundary parsing for uploads.
+
+6. Common Challenges and How to Handle Them
+Partial reads. A single recv() call rarely delivers a complete HTTP request. You must accumulate bytes in a per-client buffer and re-enter the parser each time new bytes arrive. The parser must be re-entrant — it picks up where it left off without starting over. Design your parser as a state machine from the beginning.
+Partial writes. send() may not flush your entire response buffer in one call. Track how many bytes have been sent, register the socket for POLLOUT, and continue draining on subsequent event loop iterations.
+The CGI pipe is also a file descriptor. The CGI child's stdout pipe must also be managed by poll(). You pipe the body to the child's stdin and read the response from its stdout, all non-blocking, all within the same event loop. Member C and Member A need to collaborate closely here.
+Chunked encoding. Many HTTP clients (curl, browsers) use chunked transfer encoding for POST bodies. If you ignore this, uploads will silently fail. The chunk format is: hex-length CRLF, chunk-data CRLF, repeat, terminated by a zero-length chunk.
+Client disconnection during upload. If a client closes the connection mid-way, recv() returns 0. You must clean up that client's state, close the socket, and remove it from poll()'s watch list — without crashing the server.
+Configuration parsing ambiguity. Define your config grammar precisely in week one. What delimiter do you use? What happens if a required field is missing? What is the default body size limit? Decide and document these before anyone writes a parser line.
+
+7. Collaboration Best Practices
+Git workflow. Use feature branches: feature/event-loop, feature/http-parser, feature/router, feature/cgi. Merge to main only when the feature passes your integration tests. Commit messages should say what changed and why, not just "fix bug."
+Define interfaces before implementing. In week one, write out the Request struct, the Response struct, and the ServerConfig tree as header files with comments. All three members agree and sign off. No one writes a parser or handler until the interface is frozen.
+Write tests in a separate language. The subject explicitly recommends Python or Golang for testing. Write a test script that sends raw HTTP requests over TCP and asserts on the response. This lets you test the server without a browser and catch regressions automatically. Cover: normal GET, missing file (404), wrong method (405), oversized body (413), directory listing, file upload, delete, CGI response, and concurrent connections.
+Use NGINX as your ground truth. When you're unsure how a request should be handled — an ambiguous URI, a missing header, a redirect — send that exact request to NGINX and match its response. The subject explicitly endorses this.
+Integration checkpoints. At the end of each phase (listed above), all three members merge, run the full test suite together, and test with a real browser. Don't let integration debt accumulate past one phase.
+README as living documentation. Keep the README updated throughout development. Each member documents their component: how to run, what configuration options are supported, known limitations, and how AI was used (required by the subject). Write it as you go — a last-minute README shows.
