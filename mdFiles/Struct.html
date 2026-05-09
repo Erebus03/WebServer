@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Webserv — Struct Hierarchy</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f8f7f4;
+      color: #1a1a18;
+    }
+    h1 {
+      font-size: 18px;
+      font-weight: 500;
+      margin: 0 0 4px;
+      color: #1a1a18;
+    }
+    p.sub {
+      font-size: 13px;
+      color: #6b6a64;
+      margin: 0 0 24px;
+    }
+    svg { display: block; max-width: 760px; width: 100%; }
+
+    /* box fills */
+    .bg-config  { fill: #F1EFE8; stroke: #B4B2A9; }
+    .box-config { fill: #D3D1C7; stroke: #888780; }
+    .box-client { fill: #9FE1CB; stroke: #0F6E56; }
+    .box-req    { fill: #CECBF6; stroke: #534AB7; }
+    .box-res    { fill: #F5C4B3; stroke: #993C1D; }
+
+    /* text */
+    .label-title { font-size: 14px; font-weight: 600; fill: #2C2C2A; }
+    .label-sub   { font-size: 11.5px; font-weight: 400; fill: #5F5E5A; }
+    .label-step  { font-size: 11px; font-weight: 400; fill: #888780; }
+    .label-arrow { font-size: 11px; font-weight: 500; fill: #3d3d3a; }
+
+    /* arrows */
+    .arr-solid  { stroke: #3d3d3a; stroke-width: 1.5; fill: none; }
+    .arr-dashed { stroke: #888780; stroke-width: 1;   fill: none; stroke-dasharray: 4 3; }
+    .arr-flow   { stroke: #444441; stroke-width: 1.3; fill: none; }
+
+    @media (prefers-color-scheme: dark) {
+      body          { background: #1a1a18; color: #e0ddd5; }
+      h1            { color: #e0ddd5; }
+      p.sub         { color: #888780; }
+      .bg-config    { fill: #2c2c2a; stroke: #444441; }
+      .box-config   { fill: #3d3d3a; stroke: #888780; }
+      .box-client   { fill: #085041; stroke: #1D9E75; }
+      .box-req      { fill: #26215C; stroke: #7F77DD; }
+      .box-res      { fill: #4A1B0C; stroke: #D85A30; }
+      .label-title  { fill: #e0ddd5; }
+      .label-sub    { fill: #a0a09a; }
+      .label-step   { fill: #888780; }
+      .label-arrow  { fill: #c2c0b6; }
+      .arr-solid    { stroke: #c2c0b6; }
+      .arr-dashed   { stroke: #5F5E5A; }
+      .arr-flow     { stroke: #B4B2A9; }
+    }
+  </style>
+</head>
+<body>
+<h1>Webserv — Struct Hierarchy &amp; Interaction</h1>
+<p class="sub">Read top to bottom: ① config loaded first, ② Client created per connection, ③ Request parsed from bytes, ④ Response built by handler.</p>
+
+<svg viewBox="0 0 700 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="head-solid" viewBox="0 0 10 10" refX="8" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke-width="1.5"
+            stroke-linecap="round" stroke-linejoin="round" stroke="context-stroke"/>
+    </marker>
+    <marker id="head-dashed" viewBox="0 0 10 10" refX="8" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke-width="1.5"
+            stroke-linecap="round" stroke-linejoin="round" stroke="context-stroke"/>
+    </marker>
+  </defs>
+
+  <!-- ══════════════════════════════════════════
+       ① CONFIG LAYER BACKGROUND
+  ══════════════════════════════════════════ -->
+  <rect x="28" y="28" width="644" height="154" rx="12"
+        class="bg-config" stroke-width="1" stroke-dasharray="6 3"/>
+  <text x="350" y="20" text-anchor="middle" class="label-step">
+    ① Parsed once at startup — never changes at runtime
+  </text>
+
+  <!-- ServerConfig box -->
+  <rect x="48" y="42" width="226" height="124" rx="8" class="box-config" stroke-width="0.6"/>
+  <text x="161" y="72"  text-anchor="middle" class="label-title">ServerConfig</text>
+  <text x="161" y="93"  text-anchor="middle" class="label-sub">listen  addr : port</text>
+  <text x="161" y="110" text-anchor="middle" class="label-sub">error_pages  map</text>
+  <text x="161" y="127" text-anchor="middle" class="label-sub">client_max_body_size</text>
+  <text x="161" y="144" text-anchor="middle" class="label-sub">locations [ ]</text>
+
+  <!-- Ownership arrow -->
+  <text x="350" y="83" text-anchor="middle" class="label-arrow">owns [ ]</text>
+  <line x1="276" y1="96" x2="424" y2="96" class="arr-solid"
+        marker-end="url(#head-solid)"/>
+
+  <!-- LocationConfig box -->
+  <rect x="426" y="42" width="226" height="124" rx="8" class="box-config" stroke-width="0.6"/>
+  <text x="539" y="72"  text-anchor="middle" class="label-title">LocationConfig</text>
+  <text x="539" y="93"  text-anchor="middle" class="label-sub">methods · root</text>
+  <text x="539" y="110" text-anchor="middle" class="label-sub">redirect · index</text>
+  <text x="539" y="127" text-anchor="middle" class="label-sub">upload_dir · dir_listing</text>
+  <text x="539" y="144" text-anchor="middle" class="label-sub">CGI ext map</text>
+
+  <!-- ══════════════════════════════════════════
+       ② CLIENT
+  ══════════════════════════════════════════ -->
+  <text x="350" y="210" text-anchor="middle" class="label-step">
+    ② One Client object per accepted connection — driven by poll()
+  </text>
+
+  <!-- Dashed pointer reference: Client → ServerConfig -->
+  <path d="M 238,218 L 238,192 L 161,192 L 161,168"
+        class="arr-dashed" marker-end="url(#head-dashed)"/>
+  <text x="178" y="186" class="label-step">*ref</text>
+
+  <!-- Client box -->
+  <rect x="218" y="218" width="264" height="128" rx="8" class="box-client" stroke-width="0.6"/>
+  <text x="350" y="249"  text-anchor="middle" class="label-title">Client</text>
+  <text x="350" y="271"  text-anchor="middle" class="label-sub">socket_fd · state_enum</text>
+  <text x="350" y="288"  text-anchor="middle" class="label-sub">input_buf · output_buf</text>
+  <text x="350" y="305"  text-anchor="middle" class="label-sub">bytes_sent</text>
+  <text x="350" y="322"  text-anchor="middle" class="label-sub">*server_config · cgi_pipe_fd</text>
+
+  <!-- ══════════════════════════════════════════
+       CONNECTING ARROWS  (Client ↔ HTTP layer)
+  ══════════════════════════════════════════ -->
+
+  <!-- Parser arrow: Client.input_buf → HttpRequest -->
+  <path d="M 268,346 L 268,368 L 161,368 L 161,388"
+        class="arr-flow" marker-end="url(#head-solid)"/>
+  <text x="208" y="362" class="label-arrow">Parser</text>
+
+  <!-- Serializer arrow: HttpResponse → Client.output_buf -->
+  <path d="M 540,388 L 540,368 L 432,368 L 432,346"
+        class="arr-flow" marker-end="url(#head-solid)"/>
+  <text x="500" y="362" class="label-arrow">Serializer</text>
+
+  <!-- ══════════════════════════════════════════
+       ③ HTTP REQUEST
+  ══════════════════════════════════════════ -->
+  <text x="161" y="384" text-anchor="middle" class="label-step">③ built by parser</text>
+
+  <rect x="48" y="390" width="226" height="124" rx="8" class="box-req" stroke-width="0.6"/>
+  <text x="161" y="422" text-anchor="middle" class="label-title">HttpRequest</text>
+  <text x="161" y="443" text-anchor="middle" class="label-sub">method · uri · version</text>
+  <text x="161" y="460" text-anchor="middle" class="label-sub">query_string</text>
+  <text x="161" y="477" text-anchor="middle" class="label-sub">headers · body</text>
+  <text x="161" y="494" text-anchor="middle" class="label-sub">is_complete · parse_state</text>
+
+  <!-- Router → Handler arrow -->
+  <text x="350" y="432" text-anchor="middle" class="label-arrow">Router → Handler</text>
+  <line x1="276" y1="444" x2="424" y2="444" class="arr-solid"
+        marker-end="url(#head-solid)"/>
+  <text x="350" y="461" text-anchor="middle" class="label-step">(uses LocationConfig)</text>
+
+  <!-- ══════════════════════════════════════════
+       ④ HTTP RESPONSE
+  ══════════════════════════════════════════ -->
+  <text x="539" y="384" text-anchor="middle" class="label-step">④ built by handler</text>
+
+  <rect x="426" y="390" width="226" height="124" rx="8" class="box-res" stroke-width="0.6"/>
+  <text x="539" y="422" text-anchor="middle" class="label-title">HttpResponse</text>
+  <text x="539" y="443" text-anchor="middle" class="label-sub">status_code · reason</text>
+  <text x="539" y="460" text-anchor="middle" class="label-sub">headers map</text>
+  <text x="539" y="477" text-anchor="middle" class="label-sub">body</text>
+  <text x="539" y="494" text-anchor="middle" class="label-sub">file_path · is_cgi</text>
+
+  <!-- ══════════════════════════════════════════
+       LEGEND
+  ══════════════════════════════════════════ -->
+  <line x1="48" y1="526" x2="82" y2="526" class="arr-solid"
+        marker-end="url(#head-solid)"/>
+  <text x="88" y="530" class="label-step">owns / produces / data flow</text>
+
+  <line x1="250" y1="526" x2="284" y2="526" class="arr-dashed"
+        marker-end="url(#head-dashed)"/>
+  <text x="290" y="530" class="label-step">pointer reference</text>
+</svg>
+</body>
+</html>
