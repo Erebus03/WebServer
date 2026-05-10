@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Webserv — Project Structure</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f7f6f2;
+      color: #1a1a18;
+      padding: 32px 24px 48px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+    .subtitle { color: #6b6a64; font-size: 13px; margin-bottom: 36px; }
+
+    /* ── GRID LAYOUT ── */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 28px;
+      max-width: 1060px;
+    }
+    .full { grid-column: 1 / -1; }
+
+    /* ── CARD ── */
+    .card {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 20px 22px;
+    }
+    .card h2 {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: 14px;
+      color: #888;
+    }
+
+    /* ── DIRECTORY TREE ── */
+    .tree { font-family: "SF Mono", "Fira Mono", monospace; font-size: 12.5px; }
+    .tree ul { list-style: none; padding-left: 20px; border-left: 1px solid #e0dfda; margin-left: 4px; }
+    .tree > ul { padding-left: 0; border-left: none; margin-left: 0; }
+    .tree li { padding: 2px 0; }
+    .tree .dir  { color: #1a1a18; font-weight: 600; }
+    .tree .file { color: #555; }
+    .tree .tag  {
+      display: inline-block;
+      font-size: 10px;
+      font-family: -apple-system, sans-serif;
+      font-weight: 500;
+      border-radius: 3px;
+      padding: 1px 5px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .tag-a  { background: #D6F0E8; color: #0A5C42; }
+    .tag-b  { background: #DDD9FA; color: #3A2FA0; }
+    .tag-c  { background: #FDE8D8; color: #8A3010; }
+    .tag-s  { background: #E8E7E2; color: #555; }
+    .tag-r  { background: #FFF3CC; color: #7A5200; }
+
+    /* ── CLASSES TABLE ── */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th {
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: #888;
+      padding: 0 8px 8px 0;
+      border-bottom: 1px solid #e0dfda;
+    }
+    td {
+      padding: 7px 8px 7px 0;
+      border-bottom: 1px solid #f0efea;
+      vertical-align: top;
+    }
+    td:last-child { color: #555; font-size: 12px; }
+    tr:last-child td { border-bottom: none; }
+    .owner {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      border-radius: 3px;
+      padding: 1px 6px;
+      white-space: nowrap;
+    }
+    code {
+      font-family: "SF Mono", "Fira Mono", monospace;
+      font-size: 12px;
+      background: #f0efea;
+      border-radius: 3px;
+      padding: 1px 4px;
+    }
+
+    /* ── FLOW DIAGRAM (Member C) ── */
+    .flow {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      flex-wrap: wrap;
+      row-gap: 12px;
+    }
+    .flow-box {
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 12.5px;
+      font-weight: 500;
+      text-align: center;
+      min-width: 110px;
+    }
+    .flow-arrow {
+      padding: 0 6px;
+      color: #aaa;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .fb-req    { background: #DDD9FA; color: #3A2FA0; border: 1px solid #BCB7F5; }
+    .fb-loc    { background: #E8E7E2; color: #3d3d3a; border: 1px solid #ccc; }
+    .fb-router { background: #FFF3CC; color: #7A5200; border: 1px solid #F5D97A; }
+    .fb-disp   { background: #FFF3CC; color: #7A5200; border: 1px solid #F5D97A; }
+    .fb-get    { background: #FDE8D8; color: #8A3010; border: 1px solid #F5C4A0; }
+    .fb-post   { background: #FDE8D8; color: #8A3010; border: 1px solid #F5C4A0; }
+    .fb-del    { background: #FDE8D8; color: #8A3010; border: 1px solid #F5C4A0; }
+    .fb-cgi    { background: #FDE8D8; color: #8A3010; border: 1px solid #F5C4A0; }
+    .fb-res    { background: #F5C4A0; color: #5A1E06; border: 1px solid #E0906A; }
+
+    .handler-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    /* ── RULES ── */
+    .rules { display: flex; flex-direction: column; gap: 8px; }
+    .rule {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      font-size: 13px;
+    }
+    .rule-num {
+      min-width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: #FDE8D8;
+      color: #8A3010;
+      font-size: 11px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-top: 1px;
+    }
+    .rule-text { color: #333; }
+    .rule-text strong { color: #1a1a18; }
+
+    /* ── LEGEND ── */
+    .legend {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      font-size: 12px;
+    }
+    .legend-item { display: flex; align-items: center; gap: 5px; }
+
+    @media (prefers-color-scheme: dark) {
+      body        { background: #1a1a18; color: #e0ddd5; }
+      .card       { background: #242422; border-color: #3a3a38; }
+      .card h2    { color: #666; }
+      .tree .dir  { color: #e0ddd5; }
+      .tree .file { color: #a0a09a; }
+      .tree ul    { border-color: #3a3a38; }
+      th          { color: #666; border-color: #3a3a38; }
+      td          { border-color: #2e2e2c; }
+      td:last-child { color: #a0a09a; }
+      code        { background: #2e2e2c; color: #c0bfb9; }
+      .fb-loc     { background: #2e2e2c; color: #c0bfb9; border-color: #444; }
+    }
+  </style>
+</head>
+<body>
+
+<h1>Webserv — Recommended Project Structure</h1>
+<p class="subtitle">One file per class · Clear ownership · Each member's domain is isolated · Member C territory highlighted in orange</p>
+
+<div class="grid">
+
+  <!-- ── DIRECTORY TREE ── -->
+  <div class="card full">
+    <h2>Directory Layout</h2>
+    <div class="legend" style="margin-bottom:14px; margin-top:-4px;">
+      <div class="legend-item"><span class="tag tag-a">A</span> Member A — networking</div>
+      <div class="legend-item"><span class="tag tag-b">B</span> Member B — HTTP parsing</div>
+      <div class="legend-item"><span class="tag tag-c">C</span> Member C — routing &amp; handlers</div>
+      <div class="legend-item"><span class="tag tag-s">shared</span> All three agree, no one owns alone</div>
+      <div class="legend-item"><span class="tag tag-r">runtime</span> Not source — files used at runtime</div>
+    </div>
+    <div class="tree">
+      <ul>
+        <li><span class="dir">webserv/</span></li>
+        <li><ul>
+          <li><span class="file">Makefile</span> <span class="tag tag-s">shared</span></li>
+          <li><span class="file">README.md</span> <span class="tag tag-s">shared</span></li>
+          <li></li>
+
+          <li><span class="dir">include/</span> <span style="color:#aaa;font-size:11px;">— all .hpp headers</span></li>
+          <li><ul>
+            <li><span class="file">types.hpp</span> <span class="tag tag-s">shared</span>
+              <span style="color:#aaa;font-size:11px;margin-left:6px;">— ServerConfig, LocationConfig, HttpRequest, HttpResponse, Client — frozen Day 1</span></li>
+            <li><span class="file">ConfigParser.hpp</span> <span class="tag tag-a">A</span></li>
+            <li><span class="file">EventLoop.hpp</span> <span class="tag tag-a">A</span></li>
+            <li><span class="file">Client.hpp</span> <span class="tag tag-a">A</span></li>
+            <li><span class="file">HttpParser.hpp</span> <span class="tag tag-b">B</span></li>
+            <li><span class="file">ResponseBuilder.hpp</span> <span class="tag tag-b">B</span></li>
+            <li><span class="file">MimeTypes.hpp</span> <span class="tag tag-b">B</span></li>
+            <li><span class="file">Router.hpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">Dispatcher.hpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">GetHandler.hpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">PostHandler.hpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">DeleteHandler.hpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">CgiHandler.hpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">FileUtils.hpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">DirectoryLister.hpp</span> <span class="tag tag-c">C</span></li>
+          </ul></li>
+          <li></li>
+
+          <li><span class="dir">src/</span> <span style="color:#aaa;font-size:11px;">— all .cpp implementations</span></li>
+          <li><ul>
+            <li><span class="file">main.cpp</span> <span class="tag tag-s">shared</span>
+              <span style="color:#aaa;font-size:11px;margin-left:6px;">— parses args, calls ConfigParser, starts EventLoop</span></li>
+            <li><span class="file">ConfigParser.cpp</span> <span class="tag tag-a">A</span></li>
+            <li><span class="file">EventLoop.cpp</span> <span class="tag tag-a">A</span></li>
+            <li><span class="file">Client.cpp</span> <span class="tag tag-a">A</span></li>
+            <li><span class="file">HttpParser.cpp</span> <span class="tag tag-b">B</span></li>
+            <li><span class="file">ResponseBuilder.cpp</span> <span class="tag tag-b">B</span></li>
+            <li><span class="file">MimeTypes.cpp</span> <span class="tag tag-b">B</span></li>
+            <li><span class="file">Router.cpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">Dispatcher.cpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">GetHandler.cpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">PostHandler.cpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">DeleteHandler.cpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">CgiHandler.cpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">FileUtils.cpp</span> <span class="tag tag-c">C</span></li>
+            <li><span class="file">DirectoryLister.cpp</span> <span class="tag tag-c">C</span></li>
+          </ul></li>
+          <li></li>
+
+          <li><span class="dir">config/</span> <span class="tag tag-r">runtime</span></li>
+          <li><ul>
+            <li><span class="file">default.conf</span>
+              <span style="color:#aaa;font-size:11px;margin-left:6px;">— the config file used during evaluation</span></li>
+          </ul></li>
+          <li></li>
+
+          <li><span class="dir">www/</span> <span class="tag tag-r">runtime</span></li>
+          <li><ul>
+            <li><span class="file">index.html</span></li>
+            <li><span class="dir">errors/</span></li>
+            <li><ul>
+              <li><span class="file">404.html</span></li>
+              <li><span class="file">500.html</span></li>
+            </ul></li>
+            <li><span class="dir">uploads/</span>
+              <span style="color:#aaa;font-size:11px;margin-left:6px;">— where POST uploads land</span></li>
+          </ul></li>
+          <li></li>
+
+          <li><span class="dir">cgi-bin/</span> <span class="tag tag-r">runtime</span></li>
+          <li><ul>
+            <li><span class="file">test.py</span>
+              <span style="color:#aaa;font-size:11px;margin-left:6px;">— CGI test script used for evaluation</span></li>
+            <li><span class="file">echo.py</span>
+              <span style="color:#aaa;font-size:11px;margin-left:6px;">— echoes QUERY_STRING and body</span></li>
+          </ul></li>
+          <li></li>
+
+          <li><span class="dir">tests/</span></li>
+          <li><ul>
+            <li><span class="file">test_router.cpp</span> <span class="tag tag-c">C</span>
+              <span style="color:#aaa;font-size:11px;margin-left:6px;">— unit tests, no server needed</span></li>
+            <li><span class="file">test_http.py</span> <span class="tag tag-s">shared</span>
+              <span style="color:#aaa;font-size:11px;margin-left:6px;">— end-to-end HTTP tests</span></li>
+          </ul></li>
+
+        </ul></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ── MEMBER C FLOW ── -->
+  <div class="card full">
+    <h2>Member C — How your classes connect at runtime</h2>
+    <div style="display:flex; align-items:center; gap:0; flex-wrap:wrap; row-gap:14px;">
+
+      <div class="flow-box fb-req">HttpRequest<br><span style="font-size:11px;font-weight:400;">(from Member B)</span></div>
+      <div class="flow-arrow">→</div>
+
+      <div class="flow-box fb-router">Router<br><span style="font-size:11px;font-weight:400;">finds LocationConfig</span></div>
+      <div class="flow-arrow">→</div>
+
+      <div class="flow-box fb-loc">LocationConfig<br><span style="font-size:11px;font-weight:400;">(from Member A config)</span></div>
+      <div class="flow-arrow">→</div>
+
+      <div class="flow-box fb-disp">Dispatcher<br><span style="font-size:11px;font-weight:400;">picks the handler</span></div>
+      <div class="flow-arrow">→</div>
+
+      <div class="handler-group">
+        <div class="flow-box fb-get" style="min-width:90px;">GetHandler</div>
+        <div class="flow-box fb-post" style="min-width:90px;">PostHandler</div>
+        <div class="flow-box fb-del" style="min-width:90px;">DeleteHandler</div>
+        <div class="flow-box fb-cgi" style="min-width:90px;">CgiHandler</div>
+      </div>
+      <div class="flow-arrow">→</div>
+
+      <div class="flow-box fb-res">HttpResponse<br><span style="font-size:11px;font-weight:400;">(to Member B serializer)</span></div>
+    </div>
+  </div>
+
+  <!-- ── CLASS RESPONSIBILITIES ── -->
+  <div class="card full">
+    <h2>Member C — What each class does (one responsibility only)</h2>
+    <table>
+      <thead>
+      <tr>
+        <th style="width:160px;">Class</th>
+        <th style="width:90px;">Owner</th>
+        <th style="width:260px;">One sentence job</th>
+        <th>What it reads · What it produces</th>
+      </tr>
+      </thead>
+      <tbody>
+      <tr>
+        <td><code>Router</code></td>
+        <td><span class="owner tag-c">C</span></td>
+        <td>Finds the best matching <code>LocationConfig</code> for a URI using longest-prefix matching.</td>
+        <td>Reads: URI string + <code>ServerConfig</code>. Returns: <code>LocationConfig&</code></td>
+      </tr>
+      <tr>
+        <td><code>Dispatcher</code></td>
+        <td><span class="owner tag-c">C</span></td>
+        <td>Looks at the method and location config, picks the right handler, calls it, returns the response.</td>
+        <td>Reads: <code>HttpRequest</code> + <code>LocationConfig</code>. Returns: <code>HttpResponse</code></td>
+      </tr>
+      <tr>
+        <td><code>GetHandler</code></td>
+        <td><span class="owner tag-c">C</span></td>
+        <td>Serves a static file or triggers directory listing. Returns 404/403 if file is missing or unreadable.</td>
+        <td>Reads: URI path + location root. Returns: <code>HttpResponse</code> with file body</td>
+      </tr>
+      <tr>
+        <td><code>PostHandler</code></td>
+        <td><span class="owner tag-c">C</span></td>
+        <td>Writes uploaded file content (parsed by Member B) to the configured upload directory.</td>
+        <td>Reads: <code>HttpRequest.body</code> + upload dir. Returns: 201 or error response</td>
+      </tr>
+      <tr>
+        <td><code>DeleteHandler</code></td>
+        <td><span class="owner tag-c">C</span></td>
+        <td>Resolves URI to a file path and removes it. Returns 204 on success, 404 if missing.</td>
+        <td>Reads: resolved file path. Returns: 204 / 404 / 403 response</td>
+      </tr>
+      <tr>
+        <td><code>CgiHandler</code></td>
+        <td><span class="owner tag-c">C</span></td>
+        <td>Forks a child process, sets env vars, pipes request body in, returns pipe FD to event loop.</td>
+        <td>Reads: full <code>HttpRequest</code> + CGI path. Produces: pipe FD + child PID (for Member A)</td>
+      </tr>
+      <tr>
+        <td><code>FileUtils</code></td>
+        <td><span class="owner tag-c">C</span></td>
+        <td>Shared helpers used by all handlers: resolve path, check file exists, check permissions, read file.</td>
+        <td>Used by all handlers internally. Not exposed outside Member C's code.</td>
+      </tr>
+      <tr>
+        <td><code>DirectoryLister</code></td>
+        <td><span class="owner tag-c">C</span></td>
+        <td>Reads a directory with <code>opendir/readdir</code> and generates an HTML page listing its contents.</td>
+        <td>Reads: directory path. Returns: HTML string for <code>HttpResponse.body</code></td>
+      </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── RULES ── -->
+  <div class="card">
+    <h2>5 Rules That Keep This Structure Clean</h2>
+    <div class="rules">
+      <div class="rule">
+        <div class="rule-num">1</div>
+        <div class="rule-text"><strong>One class, one file.</strong> <code>Router</code> lives only in <code>Router.hpp</code> and <code>Router.cpp</code>. Never put two classes in one file.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">2</div>
+        <div class="rule-text"><strong>No handler knows about sockets.</strong> Handlers receive an <code>HttpRequest</code> and return an <code>HttpResponse</code>. They never touch a file descriptor directly except in <code>CgiHandler</code>.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">3</div>
+        <div class="rule-text"><strong><code>types.hpp</code> is read-only after Day 1.</strong> Any change to shared structs requires all three members to agree. No exceptions.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">4</div>
+        <div class="rule-text"><strong>Each handler is testable alone.</strong> You can call <code>GetHandler::handle(req, loc)</code> with a fake request and a fake location config in a standalone test binary — no event loop needed.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">5</div>
+        <div class="rule-text"><strong><code>FileUtils</code> is your private toolbox.</strong> Every filesystem operation (path resolution, permission check, file read) goes through <code>FileUtils</code>. Never duplicate that logic inside a handler.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── BUILD ORDER ── -->
+  <div class="card">
+    <h2>Member C — Build Order (what to write first)</h2>
+    <div class="rules">
+      <div class="rule">
+        <div class="rule-num">1</div>
+        <div class="rule-text"><strong>Agree and freeze <code>types.hpp</code></strong> with the team. Nothing else starts before this.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">2</div>
+        <div class="rule-text"><strong>Write <code>Router</code>.</strong> Pure string matching. No filesystem, no HTTP. Testable immediately with a <code>main.cpp</code> test file.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">3</div>
+        <div class="rule-text"><strong>Write <code>FileUtils</code>.</strong> Path resolution, stat, permission checks. Every handler needs this.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">4</div>
+        <div class="rule-text"><strong>Write <code>GetHandler</code>.</strong> The first handler needed for Week 1 integration. Unblocks the team's first browser test.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">5</div>
+        <div class="rule-text"><strong>Write <code>Dispatcher</code>.</strong> Thin glue that calls the right handler. Write after GetHandler so you have something real to dispatch to.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">6</div>
+        <div class="rule-text"><strong>Write <code>DeleteHandler</code>, <code>PostHandler</code>, <code>DirectoryLister</code></strong> in Week 2 once GET is proven stable.</div>
+      </div>
+      <div class="rule">
+        <div class="rule-num">7</div>
+        <div class="rule-text"><strong>Write <code>CgiHandler</code> last</strong> — in Week 3 after a design session with Member A about how the pipe FD re-enters the event loop.</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
