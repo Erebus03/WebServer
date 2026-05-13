@@ -5,9 +5,18 @@
 #include <map>
 #include <vector>
 
-
-// Forward declarations
-struct LocationConfig;
+struct LocationConfig {
+    std::string  path;                              // e.g. "/uploads"
+    std::string  root;                              // filesystem root for this location
+    std::vector<std::string> indexes;               // default index file
+    std::vector<std::string>         methods;       // ["GET", "POST"]
+    std::string  redirect_url;                      // empty if no redirect
+    int          redirect_code;                     // 301 or 302, 0 if none
+    std::string  upload_dir;                        // where POST uploads land
+    bool         dir_listing;                       // directory listing on/off
+    std::map<std::string, std::string> cgi_ext;     // ".py" -> "/usr/bin/python3"
+    size_t       client_max_body_size;              // 0 = inherit from server
+};
 
 // Represents a single server block in the config
 struct ServerConfig {
@@ -21,20 +30,22 @@ struct ServerConfig {
     std::vector<LocationConfig> locations;
 };
 
-
-struct LocationConfig {
-    std::string  path;                              // e.g. "/uploads"
-    std::string  root;                              // filesystem root for this location
-    std::string  index;                             // default index file
-    std::vector<std::string>         methods;       // ["GET", "POST"]
-    std::string  redirect_url;                      // empty if no redirect
-    int          redirect_code;                     // 301 or 302, 0 if none
-    std::string  upload_dir;                        // where POST uploads land
-    bool         dir_listing;                       // directory listing on/off
-    std::map<std::string, std::string> cgi_ext;     // ".py" -> "/usr/bin/python3"
-    size_t       client_max_body_size;              // 0 = inherit from server
+struct HttpRequest {
+    std::string                        method;
+    std::string                        uri;
+    std::string                        query_string;
+    std::string                        version;
+    std::map<std::string, std::string> headers;
+    std::string                        body;
+    bool                               is_complete;
 };
 
+struct HttpResponse {
+    int                                status_code;
+    std::string                        status_message;
+    std::map<std::string, std::string> headers;
+    std::string                        body;
+};
 
 // Represents the entire parsed configuration
 typedef std::vector<ServerConfig> Config;
