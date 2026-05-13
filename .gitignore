@@ -1,0 +1,9 @@
+webserv
+a.out
+*.out
+*.o
+.vscode/
+*.pdf
+*.swp
+*.swo
+*~
