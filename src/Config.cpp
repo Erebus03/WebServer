@@ -78,6 +78,7 @@ Config ConfigParser::parse(const std::string& config_file) {
             // Inherit from server
             current_location.root = current_server.root;
             current_location.client_max_body_size = current_server.client_max_body_size;
+            current_location.index_files = current_server.index_files;
         }
         // Handle closing braces
         else if (close_brace != std::string::npos) {
@@ -178,7 +179,7 @@ void ConfigParser::parseLocationLine(const std::string& line, LocationConfig& lo
     std::string directive;
     iss >> directive;
     
-    if (directive == "methods") {
+    if (directive == "allowed_methods") {
         std::string method;
         while (iss >> method) {
             location.methods.push_back(method);
@@ -193,16 +194,25 @@ void ConfigParser::parseLocationLine(const std::string& line, LocationConfig& lo
         std::string ext, handler;
         iss >> ext >> handler;
         location.cgi_ext[ext] = handler;
+    } else if (directive == "redirect") {
+        std::string value;
+        iss >> value;
+        location.redirect_url = value;
+        int code = 0;
+        if (iss >> code) {
+            location.redirect_code = code;
+        }
     } else if (directive == "root") {
         iss >> location.root;
     } else if (directive == "index") {
-        iss >> location.index;
+        std::string file;
+        while (iss >> file) {
+            location.index_files.push_back(file);
+        }
     } else if (directive == "client_max_body_size") {
         std::string size_str;
         iss >> size_str;
         parseSize(size_str, location.client_max_body_size);
-    } else if (directive == "redirect") {
-        iss >> location.redirect;
     }
 }
 
