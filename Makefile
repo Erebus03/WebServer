@@ -4,13 +4,16 @@ CXX = c++
 CXXFLAGS = -Wall -Wextra -Werror -std=c++98
 
 SRCS = \
-	src/main.cpp
+	src/main.cpp \
+	src/Router.cpp \
+	src/Config.cpp \
+	tests/test_router.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
 INCLUDES = \
 	includes/types.hpp \
-	includes/Router.hpp
+	includes/Router.hpp \
 
 all: $(NAME)
 
