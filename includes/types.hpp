@@ -30,6 +30,9 @@ struct ServerConfig {
     std::vector<LocationConfig> locations;
 };
 
+// Represents the entire parsed configuration
+typedef std::vector<ServerConfig> Config;
+
 struct HttpRequest {
     std::string                        method;
     std::string                        uri;
@@ -47,8 +50,7 @@ struct HttpResponse {
     std::string                        body;
 };
 
-// Represents the entire parsed configuration
-typedef std::vector<ServerConfig> Config;
+
 
 
 #endif
