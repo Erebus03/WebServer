@@ -8,7 +8,7 @@
 struct LocationConfig {
     std::string  path;                              // e.g. "/uploads"
     std::string  root;                              // filesystem root for this location
-    std::vector<std::string> indexes;               // default index file
+    std::vector<std::string> index_files;               // default index file
     std::vector<std::string>         methods;       // ["GET", "POST"]
     std::string  redirect_url;                      // empty if no redirect
     int          redirect_code;                     // 301 or 302, 0 if none
