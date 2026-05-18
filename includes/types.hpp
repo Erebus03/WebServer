@@ -41,6 +41,7 @@ struct HttpRequest {
     std::map<std::string, std::string> headers;
     std::string                        body;
     bool                               is_complete;
+    ParseState                          state;
 };
 
 struct HttpResponse {
@@ -50,6 +51,13 @@ struct HttpResponse {
     std::string                        body;
 };
 
+enum ParseState {
+    READING_REQUEST_LINE,
+    READING_HEADERS,
+    READING_BODY,
+    COMPLETE,
+    ERROR
+};
 
 
 
