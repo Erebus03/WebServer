@@ -33,7 +33,16 @@ struct ServerConfig {
 // Represents the entire parsed configuration
 typedef std::vector<ServerConfig> Config;
 
+enum ParseState {
+    READING_REQUEST_LINE,
+    READING_HEADERS,
+    READING_BODY,
+    COMPLETE,
+    ERROR
+};
+
 struct HttpRequest {
+    ParseState                          state;
     std::string                        method;
     std::string                        uri;
     std::string                        query_string;
@@ -41,7 +50,6 @@ struct HttpRequest {
     std::map<std::string, std::string> headers;
     std::string                        body;
     bool                               is_complete;
-    ParseState                          state;
 };
 
 struct HttpResponse {
@@ -49,14 +57,6 @@ struct HttpResponse {
     std::string                        status_message;
     std::map<std::string, std::string> headers;
     std::string                        body;
-};
-
-enum ParseState {
-    READING_REQUEST_LINE,
-    READING_HEADERS,
-    READING_BODY,
-    COMPLETE,
-    ERROR
 };
 
 
