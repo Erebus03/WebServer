@@ -30,7 +30,7 @@ struct ServerConfig {
     std::vector<LocationConfig> locations;
 };
 
-// Represents the entire parsed configuration
+// Represents the entire parsed configurationecv() reads raw bytes into a buffer.
 typedef std::vector<ServerConfig> Config;
 
 enum ParseState {
