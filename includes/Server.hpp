@@ -16,33 +16,29 @@ public:
     Server();
     ~Server();
     
-    // Load configuration and start the server
     int initialize(const std::string& config_file);
-    
-    // Run the main event loop (infinite until stop() called)
     void run();
-    
-    // Stop the server
     void stop();
     
 private:
     Config config;
     bool running;
     
-    // Listening sockets: one per (host, port) pair from config
-    std::vector<int> listening_sockets;              // list of listen fd's
     //sockets the server is actively listening on
+    std::vector<int> listening_sockets;
     
 
-    /*
+    /*  WILL DO LATER AFTER THE MERGE
+
         Important behavioral note about the current design:
         Because listen_fd_to_server_idx maps a listen fd to a single ServerConfig index,
         the current code assumes each listening socket is owned by exactly one ServerConfig.
         That works if we create a distinct socket per server block/listen directive,
         but it’s limiting when multiple server blocks should share the same port and be
         selected at request-time via the Host header.
-
     */
+
+
     std::map<int, int> listen_fd_to_server_idx;     // listen_fd -> ServerConfig index
     //mapping a single listening socket fd to a single ServerConfig index
 

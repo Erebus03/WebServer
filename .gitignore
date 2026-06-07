@@ -1,5 +1,4 @@
 webserv
-a.out
 *.out
 *.o
 .vscode/
@@ -7,3 +6,4 @@ a.out
 *.swp
 *.swo
 *~
+tests/*
