@@ -9,6 +9,7 @@ SRCS = \
 	src/Dispatcher.cpp \
 	src/Config.cpp \
 	src/HttpParser.cpp \
+<<<<<<< HEAD
 	src/Client.cpp \
 	src/Server.cpp \
 	src/GetHandler.cpp \
@@ -17,6 +18,10 @@ SRCS = \
 	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
+=======
+	src/Server.cpp \
+	src/Client.cpp \
+>>>>>>> ba2f9b7 (Add Server and Client sources to Makefile)
 	tests/test_router.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
