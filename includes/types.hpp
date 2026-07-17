@@ -1,36 +1,34 @@
 #ifndef WEBSERVER_TYPES_HPP
 #define WEBSERVER_TYPES_HPP
 
-#include <string>
 #include <map>
+#include <string>
 #include <vector>
 
 struct LocationConfig {
-    std::string  path;                              // e.g. "/uploads"
-    std::string  root;                              // filesystem root for this location
-    std::vector<std::string> index_files;               // default index file
-    std::vector<std::string>         methods;       // ["GET", "POST"]
-    std::string  redirect_url;                      // empty if no redirect
-    int          redirect_code;                     // 301 or 302, 0 if none
-    std::string  upload_dir;                        // where POST uploads land
-    bool         dir_listing;                       // directory listing on/off
-    std::map<std::string, std::string> cgi_ext;     // ".py" -> "/usr/bin/python3"
-    size_t       client_max_body_size;              // 0 = inherit from server
+    std::string                        path;
+    std::string                        root;
+    std::vector<std::string>           index_files;
+    std::vector<std::string>           methods;
+    std::string                        redirect_url;
+    int                                redirect_code;
+    std::string                        upload_dir;
+    bool                               dir_listing;
+    std::map<std::string, std::string> cgi_ext;
+    size_t                             client_max_body_size;
 };
 
-// Represents a single server block in the config
 struct ServerConfig {
-    std::string host;                       // listen address (0.0.0.0, 127.0.0.1, etc.)
-    int port;                               // listen port
-    std::vector<std::string> server_names;  // multiple server names
-    std::string root;                       // default root directory
-    std::vector<std::string> index_files;   // default index file (index.html)
-    size_t client_max_body_size;            // max request body size in bytes
-    std::map<int, std::string> error_pages; // status_code -> error_page_path
+    std::string                 host;
+    int                         port;
+    std::vector<std::string>    server_names;
+    std::string                 root;
+    std::vector<std::string>    index_files;
+    size_t                      client_max_body_size;
+    std::map<int, std::string>  error_pages;
     std::vector<LocationConfig> locations;
 };
 
-// Represents the entire parsed configurationecv() reads raw bytes into a buffer.
 typedef std::vector<ServerConfig> Config;
 
 enum ParseState {
@@ -42,7 +40,7 @@ enum ParseState {
 };
 
 struct HttpRequest {
-    ParseState                          state;
+    ParseState                         state;
     std::string                        method;
     std::string                        uri;
     std::string                        query_string;

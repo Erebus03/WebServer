@@ -5,15 +5,17 @@ const LocationConfig *Router::match(const std::string &uri, const ServerConfig &
     size_t best_length = 0;
 
     for (size_t i = 0; i < server.locations.size(); i++) {
-        if (uri.compare(0, server.locations[i].path.length(), server.locations[i].path) != 0)
+        if (uri.compare(0, server.locations[i].path.length(), server.locations[i].path) != 0) {
             continue;
+        }
 
         if (server.locations[i].path != "/") {
             const size_t pos = server.locations[i].path.length();
             if (pos < uri.length()) {
                 const char next_char = uri[pos];
-                if (next_char != '/')
+                if (next_char != '/') {
                     continue;
+                }
             }
         }
 
