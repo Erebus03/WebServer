@@ -9,7 +9,6 @@ SRCS = \
 	src/Dispatcher.cpp \
 	src/Config.cpp \
 	src/HttpParser.cpp \
-<<<<<<< HEAD
 	src/Client.cpp \
 	src/Server.cpp \
 	src/GetHandler.cpp \
