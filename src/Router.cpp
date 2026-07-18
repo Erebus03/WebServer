@@ -1,27 +1,31 @@
 #include "../includes/Router.hpp"
 
+static bool locationMatches(const std::string &uri, const std::string &path) {
+    if (uri.compare(0, path.length(), path) != 0)
+        return false;
+
+    if (path == "/")
+        return true;
+
+    if (uri.length() == path.length())
+        return true;
+
+    return uri[path.length()] == '/';
+}
+
 const LocationConfig *Router::match(const std::string &uri, const ServerConfig &server) {
     const LocationConfig *best = NULL;
     size_t best_length = 0;
 
     for (size_t i = 0; i < server.locations.size(); i++) {
-        if (uri.compare(0, server.locations[i].path.length(), server.locations[i].path) != 0) {
+        const std::string &path = server.locations[i].path;
+
+        if (!locationMatches(uri, path))
             continue;
-        }
 
-        if (server.locations[i].path != "/") {
-            const size_t pos = server.locations[i].path.length();
-            if (pos < uri.length()) {
-                const char next_char = uri[pos];
-                if (next_char != '/') {
-                    continue;
-                }
-            }
-        }
-
-        if (server.locations[i].path.length() > best_length) {
+        if (path.length() > best_length) {
             best = &server.locations[i];
-            best_length = server.locations[i].path.length();
+            best_length = path.length();
         }
     }
     return best;

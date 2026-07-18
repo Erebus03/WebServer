@@ -6,8 +6,8 @@
 #include <poll.h>
 #include "Config.hpp"
 #include "Client.hpp"
-#include "Request.hpp"
-#include "Response.hpp"
+// #include "Request.hpp"
+// #include "Response.hpp"
 
 // Main server class - owns the event loop and all connections
 // Single poll() watches: all listen sockets + all client sockets + all CGI pipes
