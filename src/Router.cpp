@@ -1,5 +1,7 @@
 #include "../includes/Router.hpp"
 
+// The whole job of this file is: "Which folder's rules apply to this address?"
+
 static bool locationMatches(const std::string &uri, const std::string &path) {
     if (uri.compare(0, path.length(), path) != 0)
         return false;
