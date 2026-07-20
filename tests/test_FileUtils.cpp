@@ -1,4 +1,5 @@
 #include "../includes/FileUtils.hpp"
+#include <fstream>
 
 int main ()
 
@@ -56,6 +57,86 @@ int main ()
                   << (fils.is_path_safe(tests[i]) ? "SAFE" : "UNSAFE")
                   << "\n\n";
     }
+
+    std::cout << "---------- file exist && is directory ----------\n\n";
+
+    std::cout << "Case 1 (existing file):\n";
+    std::cout << "exists(./www/index.html): "
+              << (fils.file_exists("./www/index.html") ? "YES" : "NO") << std::endl;
+    std::cout << "Expected: YES\n\n";
+
+    std::cout << "Case 2 (missing file):\n";
+    std::cout << "exists(./www/nope.html): "
+              << (fils.file_exists("./www/nope.html") ? "YES" : "NO") << std::endl;
+    std::cout << "Expected: NO\n\n";
+
+    std::cout << "Case 3 (directory):\n";
+    std::cout << "exists(./www): "
+              << (fils.file_exists("./www") ? "YES" : "NO")
+              << " | is_directory(./www): "
+              << (fils.is_directory("./www") ? "YES" : "NO") << std::endl;
+    std::cout << "Expected: YES | YES\n\n";
+
+    std::cout << "Case 4 (file is not a directory):\n";
+    std::cout << "is_directory(./www/index.html): "
+              << (fils.is_directory("./www/index.html") ? "YES" : "NO") << std::endl;
+    std::cout << "Expected: NO\n\n";
+
+    std::cout << "Case 5 (missing path is not a directory):\n";
+    std::cout << "is_directory(./www/nope): "
+              << (fils.is_directory("./www/nope") ? "YES" : "NO") << std::endl;
+    std::cout << "Expected: NO\n\n";
+
+    std::cout << "********** readable && writable **********\n\n";
+
+    std::cout << "Case 1:\n";
+    std::cout << "is_readable(./www/index.html): "
+              << (fils.is_readable("./www/index.html") ? "YES" : "NO") << std::endl;
+    std::cout << "Expected: YES\n\n";
+
+    std::cout << "Case 2:\n";
+    std::cout << "is_writable(./www/index.html): "
+              << (fils.is_writable("./www/index.html") ? "YES" : "NO") << std::endl;
+    std::cout << "Expected: YES (in your own repo)\n\n";
+
+    std::cout << "Case 3 (missing file):\n";
+    std::cout << "is_readable(./www/nope.html): "
+              << (fils.is_readable("./www/nope.html") ? "YES" : "NO") << std::endl;
+    std::cout << "Expected: NO\n\n";
+
+    std::cout << "---------- read_file ----------\n\n";
+
+    std::string content;
+
+    std::cout << "Case 1 (existing text file):\n";
+    if (fils.read_file("./www/index.html", content))
+        std::cout << "OK, " << content.size() << " bytes:\n" << content << std::endl;
+    else
+        std::cout << "FAILED to read\n";
+    std::cout << "Expected: OK + the file's content\n\n";
+
+    std::cout << "Case 2 (missing file):\n";
+    content = "should stay untouched? no matter, return value is what counts";
+    std::cout << "read_file(./www/nope.html): "
+              << (fils.read_file("./www/nope.html", content) ? "true" : "false")
+              << std::endl;
+    std::cout << "Expected: false\n\n";
+
+    std::cout << "Case 3 (binary data with a '\\0' byte inside):\n";
+    {
+        std::ofstream bin("./www/tiny.bin", std::ios::out | std::ios::binary);
+        const char bytes[] = { 'A', 'B', '\0', 'C', 'D' };
+        bin.write(bytes, 5);
+    }
+    if (fils.read_file("./www/tiny.bin", content))
+    {
+        std::cout << "read " << content.size() << " bytes | ";
+        std::cout << (content.size() == 5 ? "BYTE-PERFECT" : "TRUNCATED/CORRUPTED")
+                  << std::endl;
+    }
+    else
+        std::cout << "FAILED to read\n";
+    std::cout << "Expected: 5 bytes | BYTE-PERFECT\n";
 
     return 0;
 }
