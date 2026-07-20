@@ -18,6 +18,7 @@ SRCS = \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
 	tests/test_router.cpp \
+	tests/test_FileUtils.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
