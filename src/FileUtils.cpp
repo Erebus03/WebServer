@@ -1,4 +1,5 @@
 #include "../includes/FileUtils.hpp"
+#include <sstream>
 
 //"Where on MY disk does this URL actually point?"
 //"Does that file exist? Is it a folder? Am I allowed to read it?"
@@ -25,10 +26,15 @@ std::string FileUtils::resolve_path(const std::string& root, const std::string& 
 
 bool FileUtils::is_path_safe(const std::string& uri)
 {
-    std::string two_dots = "..";
-    size_t foundPos = uri.find(two_dots);
+    std::stringstream pathStream(uri);
+    std::string component;
 
-    if (foundPos != std::string::npos)
-        return false;
+    while (std::getline(pathStream, component, '/'))
+    {
+        if (component.empty())
+            continue;
+        if (component == "..")
+            return false;
+    }
     return true;
 }
