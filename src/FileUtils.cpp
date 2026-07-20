@@ -29,7 +29,6 @@ bool FileUtils::is_path_safe(const std::string& uri)
     size_t foundPos = uri.find(two_dots);
 
     if (foundPos != std::string::npos)
-        return true;
-    return false;
+        return false;
+    return true;
 }
-
