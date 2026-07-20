@@ -1,4 +1,5 @@
 #include "../includes/FileUtils.hpp"
+#include "sys/stat.h"
 #include <sstream>
 
 //"Where on MY disk does this URL actually point?"
@@ -37,4 +38,14 @@ bool FileUtils::is_path_safe(const std::string& uri)
             return false;
     }
     return true;
+}
+
+bool FileUtils::file_exists(const std::string& path)
+{
+    
+}
+
+bool FileUtils::is_directory(const std::string& path)
+{
+
 }
