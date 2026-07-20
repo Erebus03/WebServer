@@ -43,6 +43,8 @@ int main ()
         "/one//two",
         "/",
         "",
+        "/foo/..",
+        "/../"
     };
 
     const size_t size = sizeof(tests) / sizeof(tests[0]);
