@@ -11,7 +11,7 @@ bool FileUtils::resolve_path(const std::string& root, const std::string& uri, st
         outPath.clear();
         return false;
     }
-    
+
     const bool rootEndsWithSlash = root[root.size() - 1] == '/';
     const bool uriStartWithSlash = uri[0] == '/';
 
@@ -27,6 +27,8 @@ bool FileUtils::resolve_path(const std::string& root, const std::string& uri, st
     return true;
 }
 
+// Precondition:
+// uri must already be URL-decoded.
 bool FileUtils::is_path_safe(const std::string& uri)
 {
     std::stringstream pathStream(uri);
@@ -45,9 +47,7 @@ bool FileUtils::is_path_safe(const std::string& uri)
 bool FileUtils::file_exists(const std::string& path)
 {
     struct stat fileInfo = {};
-    if (stat(path.c_str(), &fileInfo) != 0)
-        return false;
-    return true;
+    return stat(path.c_str(), &fileInfo) == 0;
 }
 
 bool FileUtils::is_directory(const std::string& path)
@@ -59,18 +59,18 @@ bool FileUtils::is_directory(const std::string& path)
     return S_ISDIR(fileInfo.st_mode) != 0;
 }
 
+// Precondition:
+// Caller must verify file_exists(path) before calling is_readable().
 bool FileUtils::is_readable(const std::string& path)
 {
-    if (access(path.c_str(), R_OK) != 0)
-        return false;
-    return true;
+    return access(path.c_str(), R_OK) == 0;
 }
 
+// Precondition:
+// Caller must verify file_exists(path) before calling is_writable().
 bool FileUtils::is_writable(const std::string& path)
 {
-    if (access(path.c_str(), W_OK) != 0)
-        return false;
-    return true;
+    return access(path.c_str(), W_OK) == 0;
 }
 
 bool FileUtils::read_file(const std::string& path, std::string& out)
