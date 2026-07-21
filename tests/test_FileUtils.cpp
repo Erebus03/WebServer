@@ -1,33 +1,42 @@
 #include "../includes/FileUtils.hpp"
+#include <iostream>
 #include <fstream>
 
 int main ()
 
 {
     std::cout << "---------- Resolve the path ----------\n\n";
-    std::cout << "Case 1:\n";
-    std::cout << FileUtils::resolve_path("./www", "/index.html") << std::endl;
-    std::cout << "Expected: ./www/index.html\n\n";
+    std::string path;
 
-    std::cout << "Case 2:\n";
-    std::cout << FileUtils::resolve_path("./www/", "/index.html") << std::endl;
-    std::cout << "Expected: ./www/index.html\n\n";
+    if (FileUtils::resolve_path("./www", "/index.html", path))
+        std::cout << "Case 1: " << path << std::endl;
+    else
+        std::cout << "Case 1: FAILED" << std::endl;
 
-    std::cout << "Case 3:\n";
-    std::cout << FileUtils::resolve_path("./www", "index.html") << std::endl;
-    std::cout << "Expected: ./www/index.html\n\n";
+    if (FileUtils::resolve_path("./www/", "/index.html", path))
+        std::cout << "Case 2: " << path << std::endl;
+    else
+        std::cout << "Case 2: FAILED" << std::endl;
 
-    std::cout << "Case 4:\n";
-    std::cout << FileUtils::resolve_path("./www/", "index.html") << std::endl;
-    std::cout << "Expected: ./www/index.html\n\n";
+    if (FileUtils::resolve_path("./www", "index.html", path))
+        std::cout << "Case 3: " << path << std::endl;
+    else
+        std::cout << "Case 3: FAILED" << std::endl;
 
-    std::cout << "Case 5:\n";
-    std::cout << FileUtils::resolve_path("", "/index.html") << std::endl;
-    std::cout << "Expected: /index.html\n\n";
+    if (FileUtils::resolve_path("./www/", "index.html", path))
+        std::cout << "Case 4: " << path << std::endl;
+    else
+        std::cout << "Case 4: FAILED" << std::endl;
 
-    std::cout << "Case 6:\n";
-    std::cout << FileUtils::resolve_path("./www", "/") << std::endl;
-    std::cout << "Expected: ./www/\n\n";
+    if (FileUtils::resolve_path("", "/index.html", path))
+        std::cout << "Case 5: " << path << std::endl;
+    else
+        std::cout << "Case 5: FAILED" << std::endl;
+
+    if (FileUtils::resolve_path("./www", "", path))
+        std::cout << "Case 6: " << path << std::endl;
+    else
+        std::cout << "Case 6: FAILED" << std::endl;
 
     std::cout << "********** Path safety **********\n\n";
     const std::string tests[] = {
