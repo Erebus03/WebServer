@@ -5,29 +5,28 @@ int main ()
 
 {
     std::cout << "---------- Resolve the path ----------\n\n";
-    FileUtils fils;
     std::cout << "Case 1:\n";
-    std::cout << fils.resolve_path("./www", "/index.html") << std::endl;
+    std::cout << FileUtils::resolve_path("./www", "/index.html") << std::endl;
     std::cout << "Expected: ./www/index.html\n\n";
 
     std::cout << "Case 2:\n";
-    std::cout << fils.resolve_path("./www/", "/index.html") << std::endl;
+    std::cout << FileUtils::resolve_path("./www/", "/index.html") << std::endl;
     std::cout << "Expected: ./www/index.html\n\n";
 
     std::cout << "Case 3:\n";
-    std::cout << fils.resolve_path("./www", "index.html") << std::endl;
+    std::cout << FileUtils::resolve_path("./www", "index.html") << std::endl;
     std::cout << "Expected: ./www/index.html\n\n";
 
     std::cout << "Case 4:\n";
-    std::cout << fils.resolve_path("./www/", "index.html") << std::endl;
+    std::cout << FileUtils::resolve_path("./www/", "index.html") << std::endl;
     std::cout << "Expected: ./www/index.html\n\n";
 
     std::cout << "Case 5:\n";
-    std::cout << fils.resolve_path("", "/index.html") << std::endl;
+    std::cout << FileUtils::resolve_path("", "/index.html") << std::endl;
     std::cout << "Expected: /index.html\n\n";
 
     std::cout << "Case 6:\n";
-    std::cout << fils.resolve_path("./www", "/") << std::endl;
+    std::cout << FileUtils::resolve_path("./www", "/") << std::endl;
     std::cout << "Expected: ./www/\n\n";
 
     std::cout << "********** Path safety **********\n\n";
@@ -54,7 +53,7 @@ int main ()
     {
         std::cout << "URI: " << tests[i] << '\n';
         std::cout << "Result: "
-                  << (fils.is_path_safe(tests[i]) ? "SAFE" : "UNSAFE")
+                  << (FileUtils::is_path_safe(tests[i]) ? "SAFE" : "UNSAFE")
                   << "\n\n";
     }
 
@@ -62,46 +61,46 @@ int main ()
 
     std::cout << "Case 1 (existing file):\n";
     std::cout << "exists(./www/index.html): "
-              << (fils.file_exists("./www/index.html") ? "YES" : "NO") << std::endl;
+              << (FileUtils::file_exists("./www/index.html") ? "YES" : "NO") << std::endl;
     std::cout << "Expected: YES\n\n";
 
     std::cout << "Case 2 (missing file):\n";
     std::cout << "exists(./www/nope.html): "
-              << (fils.file_exists("./www/nope.html") ? "YES" : "NO") << std::endl;
+              << (FileUtils::file_exists("./www/nope.html") ? "YES" : "NO") << std::endl;
     std::cout << "Expected: NO\n\n";
 
     std::cout << "Case 3 (directory):\n";
     std::cout << "exists(./www): "
-              << (fils.file_exists("./www") ? "YES" : "NO")
+              << (FileUtils::file_exists("./www") ? "YES" : "NO")
               << " | is_directory(./www): "
-              << (fils.is_directory("./www") ? "YES" : "NO") << std::endl;
+              << (FileUtils::is_directory("./www") ? "YES" : "NO") << std::endl;
     std::cout << "Expected: YES | YES\n\n";
 
     std::cout << "Case 4 (file is not a directory):\n";
     std::cout << "is_directory(./www/index.html): "
-              << (fils.is_directory("./www/index.html") ? "YES" : "NO") << std::endl;
+              << (FileUtils::is_directory("./www/index.html") ? "YES" : "NO") << std::endl;
     std::cout << "Expected: NO\n\n";
 
     std::cout << "Case 5 (missing path is not a directory):\n";
     std::cout << "is_directory(./www/nope): "
-              << (fils.is_directory("./www/nope") ? "YES" : "NO") << std::endl;
+              << (FileUtils::is_directory("./www/nope") ? "YES" : "NO") << std::endl;
     std::cout << "Expected: NO\n\n";
 
     std::cout << "********** readable && writable **********\n\n";
 
     std::cout << "Case 1:\n";
     std::cout << "is_readable(./www/index.html): "
-              << (fils.is_readable("./www/index.html") ? "YES" : "NO") << std::endl;
+              << (FileUtils::is_readable("./www/index.html") ? "YES" : "NO") << std::endl;
     std::cout << "Expected: YES\n\n";
 
     std::cout << "Case 2:\n";
     std::cout << "is_writable(./www/index.html): "
-              << (fils.is_writable("./www/index.html") ? "YES" : "NO") << std::endl;
+              << (FileUtils::is_writable("./www/index.html") ? "YES" : "NO") << std::endl;
     std::cout << "Expected: YES (in your own repo)\n\n";
 
     std::cout << "Case 3 (missing file):\n";
     std::cout << "is_readable(./www/nope.html): "
-              << (fils.is_readable("./www/nope.html") ? "YES" : "NO") << std::endl;
+              << (FileUtils::is_readable("./www/nope.html") ? "YES" : "NO") << std::endl;
     std::cout << "Expected: NO\n\n";
 
     std::cout << "---------- read_file ----------\n\n";
@@ -109,7 +108,7 @@ int main ()
     std::string content;
 
     std::cout << "Case 1 (existing text file):\n";
-    if (fils.read_file("./www/index.html", content))
+    if (FileUtils::read_file("./www/index.html", content))
         std::cout << "OK, " << content.size() << " bytes:\n" << content << std::endl;
     else
         std::cout << "FAILED to read\n";
@@ -118,7 +117,7 @@ int main ()
     std::cout << "Case 2 (missing file):\n";
     content = "should stay untouched? no matter, return value is what counts";
     std::cout << "read_file(./www/nope.html): "
-              << (fils.read_file("./www/nope.html", content) ? "true" : "false")
+              << (FileUtils::read_file("./www/nope.html", content) ? "true" : "false")
               << std::endl;
     std::cout << "Expected: false\n\n";
 
@@ -128,7 +127,7 @@ int main ()
         const char bytes[] = { 'A', 'B', '\0', 'C', 'D' };
         bin.write(bytes, 5);
     }
-    if (fils.read_file("./www/tiny.bin", content))
+    if (FileUtils::read_file("./www/tiny.bin", content))
     {
         std::cout << "read " << content.size() << " bytes | ";
         std::cout << (content.size() == 5 ? "BYTE-PERFECT" : "TRUNCATED/CORRUPTED")
