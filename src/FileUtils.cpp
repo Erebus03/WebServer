@@ -1,14 +1,8 @@
 #include "../includes/FileUtils.hpp"
-
 #include <fstream>
 #include "sys/stat.h"
 #include <sstream>
 #include <unistd.h>
-
-//"Where on MY disk does this URL actually point?"
-//"Does that file exist? Is it a folder? Am I allowed to read it?"
-//"Give me its contents."
-
 
 std::string FileUtils::resolve_path(const std::string& root, const std::string& uri)
 {
