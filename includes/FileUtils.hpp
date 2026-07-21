@@ -2,13 +2,12 @@
 #define WEBSERVER_FILEUTILS_HPP
 
 #include <string>
-#include <iostream>
 
 class FileUtils {
 private:
     FileUtils();
 public:
-    static std::string resolve_path(const std::string &root, const std::string &uri);
+    static bool resolve_path(const std::string& root,const std::string& uri,std::string& outPath);
     static bool is_path_safe(const std::string &uri);
     static bool file_exists(const std::string &path);
     static bool is_directory(const std::string &path);

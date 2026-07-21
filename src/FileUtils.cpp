@@ -1,25 +1,30 @@
 #include "../includes/FileUtils.hpp"
 #include <fstream>
-#include "sys/stat.h"
+#include <sys/stat.h>
 #include <sstream>
 #include <unistd.h>
 
-std::string FileUtils::resolve_path(const std::string& root, const std::string& uri)
+bool FileUtils::resolve_path(const std::string& root, const std::string& uri, std::string& outPath)
 {
-
-    if (root.empty())
-        return uri;
-
+    if (root.empty() || uri.empty())
+    {
+        outPath.clear();
+        return false;
+    }
+    
     const bool rootEndsWithSlash = root[root.size() - 1] == '/';
-    const bool uriStartWithSlash = !uri.empty() && uri[0] == '/';
+    const bool uriStartWithSlash = uri[0] == '/';
 
     if (rootEndsWithSlash && uriStartWithSlash)
-        return root + uri.substr(1);
+        outPath =  root + uri.substr(1);
 
-    if (!rootEndsWithSlash && !uriStartWithSlash)
-        return root + "/" + uri;
+    else if (!rootEndsWithSlash && !uriStartWithSlash)
+        outPath =  root + "/" + uri;
 
-    return root + uri;
+    else
+        outPath = root + uri;
+
+    return true;
 }
 
 bool FileUtils::is_path_safe(const std::string& uri)
