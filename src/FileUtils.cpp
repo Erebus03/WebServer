@@ -27,10 +27,11 @@ bool FileUtils::resolve_path(const std::string& root, const std::string& uri, st
     return true;
 }
 
-// Precondition:
-// uri must already be URL-decoded.
 bool FileUtils::is_path_safe(const std::string& uri)
 {
+    if  (uri.empty())
+        return false;
+
     std::stringstream pathStream(uri);
     std::string component;
 
@@ -59,15 +60,11 @@ bool FileUtils::is_directory(const std::string& path)
     return S_ISDIR(fileInfo.st_mode) != 0;
 }
 
-// Precondition:
-// Caller must verify file_exists(path) before calling is_readable().
 bool FileUtils::is_readable(const std::string& path)
 {
     return access(path.c_str(), R_OK) == 0;
 }
 
-// Precondition:
-// Caller must verify file_exists(path) before calling is_writable().
 bool FileUtils::is_writable(const std::string& path)
 {
     return access(path.c_str(), W_OK) == 0;
