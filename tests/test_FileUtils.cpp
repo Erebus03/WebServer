@@ -1,150 +1,138 @@
+#undef NDEBUG               // make sure assert() is never compiled out
 #include "../includes/FileUtils.hpp"
+#include <cassert>
 #include <iostream>
 #include <fstream>
+#include <string>
+#include <sys/stat.h>
+#include <cstdio>
 
-int main ()
-
+static void setup_fixtures()
 {
-    std::cout << "---------- Resolve the path ----------\n\n";
+    mkdir("./www", 0755);
+
+    std::ofstream f("./www/index.html", std::ios::out | std::ios::binary);
+    f << "<html>hello</html>";
+    f.close();
+
+    std::ofstream bin("./www/tiny.bin", std::ios::out | std::ios::binary);
+    const char bytes[] = { 'A', 'B', '\0', 'C', 'D' };
+    bin.write(bytes, 5);
+    bin.close();
+}
+
+static void teardown_fixtures()
+{
+    std::remove("./www/tiny.bin");
+}
+
+// ---------- resolve_path ----------
+static void test_resolve_path()
+{
     std::string path;
 
-    if (FileUtils::resolve_path("./www", "/index.html", path))
-        std::cout << "Case 1: " << path << std::endl;
-    else
-        std::cout << "Case 1: FAILED" << std::endl;
+    assert(FileUtils::resolve_path("./www", "/index.html", path));
+    assert(path == "./www/index.html");
 
-    if (FileUtils::resolve_path("./www/", "/index.html", path))
-        std::cout << "Case 2: " << path << std::endl;
-    else
-        std::cout << "Case 2: FAILED" << std::endl;
+    assert(FileUtils::resolve_path("./www/", "/index.html", path));
+    assert(path == "./www/index.html");
 
-    if (FileUtils::resolve_path("./www", "index.html", path))
-        std::cout << "Case 3: " << path << std::endl;
-    else
-        std::cout << "Case 3: FAILED" << std::endl;
+    assert(FileUtils::resolve_path("./www", "index.html", path));
+    assert(path == "./www/index.html");
 
-    if (FileUtils::resolve_path("./www/", "index.html", path))
-        std::cout << "Case 4: " << path << std::endl;
-    else
-        std::cout << "Case 4: FAILED" << std::endl;
+    assert(FileUtils::resolve_path("./www/", "index.html", path));
+    assert(path == "./www/index.html");
 
-    if (FileUtils::resolve_path("", "/index.html", path))
-        std::cout << "Case 5: " << path << std::endl;
-    else
-        std::cout << "Case 5: FAILED" << std::endl;
+    assert(!FileUtils::resolve_path("", "/index.html", path));
 
-    if (FileUtils::resolve_path("./www", "", path))
-        std::cout << "Case 6: " << path << std::endl;
-    else
-        std::cout << "Case 6: FAILED" << std::endl;
+    assert(FileUtils::resolve_path("./www", "/", path));
+    assert(path == "./www/");
 
-    std::cout << "********** Path safety **********\n\n";
-    const std::string tests[] = {
-        "/index.html",
-        "/images/cat.png",
-        "/../etc/passwd",
-        "/uploads/../../x",
-        "/uploads/../cat.png",
-        "/notes..backup.txt",
-        "/.../file",
-        "/..hidden/file",
-        "/./index.html",
-        "/one//two",
-        "/",
-        "",
-        "/foo/..",
-        "/../"
-    };
+    assert(!FileUtils::resolve_path("./www", "", path));
 
-    const size_t size = sizeof(tests) / sizeof(tests[0]);
+    std::cout << "[OK] resolve_path" << std::endl;
+}
 
-    for (size_t i = 0; i < size; ++i)
-    {
-        std::cout << "URI: " << tests[i] << '\n';
-        std::cout << "Result: "
-                  << (FileUtils::is_path_safe(tests[i]) ? "SAFE" : "UNSAFE")
-                  << "\n\n";
-    }
+static void test_is_path_safe()
+{
+    assert( FileUtils::is_path_safe("/index.html"));
+    assert( FileUtils::is_path_safe("/images/cat.png"));
+    assert( FileUtils::is_path_safe("/notes..backup.txt"));
+    assert( FileUtils::is_path_safe("/.../file"));
+    assert( FileUtils::is_path_safe("/..hidden/file"));
+    assert( FileUtils::is_path_safe("/./index.html"));
+    assert( FileUtils::is_path_safe("/one//two"));
+    assert( FileUtils::is_path_safe("/"));
 
-    std::cout << "---------- file exist && is directory ----------\n\n";
 
-    std::cout << "Case 1 (existing file):\n";
-    std::cout << "exists(./www/index.html): "
-              << (FileUtils::file_exists("./www/index.html") ? "YES" : "NO") << std::endl;
-    std::cout << "Expected: YES\n\n";
+    assert(!FileUtils::is_path_safe("/../etc/passwd"));
+    assert(!FileUtils::is_path_safe("/uploads/../../x"));
+    assert(!FileUtils::is_path_safe("/uploads/../cat.png"));
+    assert(!FileUtils::is_path_safe("/foo/.."));
+    assert(!FileUtils::is_path_safe("/../"));
+    assert(!FileUtils::is_path_safe(""));
 
-    std::cout << "Case 2 (missing file):\n";
-    std::cout << "exists(./www/nope.html): "
-              << (FileUtils::file_exists("./www/nope.html") ? "YES" : "NO") << std::endl;
-    std::cout << "Expected: NO\n\n";
+    std::cout << "[OK] is_path_safe" << std::endl;
+}
 
-    std::cout << "Case 3 (directory):\n";
-    std::cout << "exists(./www): "
-              << (FileUtils::file_exists("./www") ? "YES" : "NO")
-              << " | is_directory(./www): "
-              << (FileUtils::is_directory("./www") ? "YES" : "NO") << std::endl;
-    std::cout << "Expected: YES | YES\n\n";
+static void test_exists_and_is_directory()
+{
+    assert( FileUtils::file_exists("./www/index.html"));
+    assert(!FileUtils::file_exists("./www/nope.html"));
 
-    std::cout << "Case 4 (file is not a directory):\n";
-    std::cout << "is_directory(./www/index.html): "
-              << (FileUtils::is_directory("./www/index.html") ? "YES" : "NO") << std::endl;
-    std::cout << "Expected: NO\n\n";
+    assert( FileUtils::file_exists("./www"));
+    assert( FileUtils::is_directory("./www"));
 
-    std::cout << "Case 5 (missing path is not a directory):\n";
-    std::cout << "is_directory(./www/nope): "
-              << (FileUtils::is_directory("./www/nope") ? "YES" : "NO") << std::endl;
-    std::cout << "Expected: NO\n\n";
+    assert(!FileUtils::is_directory("./www/index.html"));
+    assert(!FileUtils::is_directory("./www/nope"));
 
-    std::cout << "********** readable && writable **********\n\n";
+    std::cout << "[OK] file_exists / is_directory" << std::endl;
+}
 
-    std::cout << "Case 1:\n";
-    std::cout << "is_readable(./www/index.html): "
-              << (FileUtils::is_readable("./www/index.html") ? "YES" : "NO") << std::endl;
-    std::cout << "Expected: YES\n\n";
+static void test_readable_writable()
+{
+    assert( FileUtils::is_readable("./www/index.html"));
+    assert( FileUtils::is_writable("./www/index.html"));
 
-    std::cout << "Case 2:\n";
-    std::cout << "is_writable(./www/index.html): "
-              << (FileUtils::is_writable("./www/index.html") ? "YES" : "NO") << std::endl;
-    std::cout << "Expected: YES (in your own repo)\n\n";
+    assert(!FileUtils::is_readable("./www/nope.html"));
+    assert(!FileUtils::is_writable("./www/nope.html"));
 
-    std::cout << "Case 3 (missing file):\n";
-    std::cout << "is_readable(./www/nope.html): "
-              << (FileUtils::is_readable("./www/nope.html") ? "YES" : "NO") << std::endl;
-    std::cout << "Expected: NO\n\n";
+    std::cout << "[OK] is_readable / is_writable" << std::endl;
+}
 
-    std::cout << "---------- read_file ----------\n\n";
-
+static void test_read_file()
+{
     std::string content;
 
-    std::cout << "Case 1 (existing text file):\n";
-    if (FileUtils::read_file("./www/index.html", content))
-        std::cout << "OK, " << content.size() << " bytes:\n" << content << std::endl;
-    else
-        std::cout << "FAILED to read\n";
-    std::cout << "Expected: OK + the file's content\n\n";
+    assert(FileUtils::read_file("./www/index.html", content));
+    assert(content == "<html>hello</html>");
 
-    std::cout << "Case 2 (missing file):\n";
-    content = "should stay untouched? no matter, return value is what counts";
-    std::cout << "read_file(./www/nope.html): "
-              << (FileUtils::read_file("./www/nope.html", content) ? "true" : "false")
-              << std::endl;
-    std::cout << "Expected: false\n\n";
+    content = "sentinel";
+    assert(!FileUtils::read_file("./www/nope.html", content));
 
-    std::cout << "Case 3 (binary data with a '\\0' byte inside):\n";
-    {
-        std::ofstream bin("./www/tiny.bin", std::ios::out | std::ios::binary);
-        const char bytes[] = { 'A', 'B', '\0', 'C', 'D' };
-        bin.write(bytes, 5);
-    }
-    if (FileUtils::read_file("./www/tiny.bin", content))
-    {
-        std::cout << "read " << content.size() << " bytes | ";
-        std::cout << (content.size() == 5 ? "BYTE-PERFECT" : "TRUNCATED/CORRUPTED")
-                  << std::endl;
-    }
-    else
-        std::cout << "FAILED to read\n";
-    std::cout << "Expected: 5 bytes | BYTE-PERFECT\n";
+    assert(FileUtils::read_file("./www/tiny.bin", content));
+    assert(content.size() == 5);
+    assert(content[0] == 'A');
+    assert(content[1] == 'B');
+    assert(content[2] == '\0');
+    assert(content[3] == 'C');
+    assert(content[4] == 'D');
 
+    std::cout << "[OK] read_file" << std::endl;
+}
+
+int main()
+{
+    setup_fixtures();
+
+    test_resolve_path();
+    test_is_path_safe();
+    test_exists_and_is_directory();
+    test_readable_writable();
+    test_read_file();
+
+    teardown_fixtures();
+
+    std::cout << "\nALL TESTS PASSED" << std::endl;
     return 0;
 }
