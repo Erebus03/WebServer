@@ -1,4 +1,4 @@
-#undef NDEBUG               // make sure assert() is never compiled out
+#undef NDEBUG
 #include "../includes/FileUtils.hpp"
 #include <cassert>
 #include <iostream>
@@ -26,7 +26,6 @@ static void teardown_fixtures()
     std::remove("./www/tiny.bin");
 }
 
-// ---------- resolve_path ----------
 static void test_resolve_path()
 {
     std::string path;
