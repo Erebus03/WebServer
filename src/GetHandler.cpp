@@ -3,8 +3,10 @@
 
 HttpResponse GetHandler::make_response(int statusCode)
 {
-    HttpResponse response = {};
+    HttpResponse response;
+
     response.status_code = statusCode;
+
     switch (statusCode)
     {
     case 200:
@@ -24,7 +26,9 @@ HttpResponse GetHandler::make_response(int statusCode)
         break;
     default:
         response.status_message = "Unknown Status";
+        break;
     }
+
     return response;
 }
 
@@ -34,9 +38,11 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
 
     if (!FileUtils::is_path_safe(request.uri))
         return make_response(403);
+
     if (!FileUtils::resolve_path(location.root, request.uri, diskPath))
         return make_response(500);
-    if (!FileUtils::file_exists(request.uri))
+
+    if (!FileUtils::file_exists(diskPath))
         return make_response(404);
 
     return make_response(200);
