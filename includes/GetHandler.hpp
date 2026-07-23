@@ -3,10 +3,11 @@
 
 #include "types.hpp"
 
+// PRECONDITION 1: request.uri is percent-decoded exactly once (HttpParser contract).
+// PRECONDITION 2: the request method is GET, already verified by the Dispatcher.
 class GetHandler {
 private:
     GetHandler();
-    static HttpResponse make_response(int statusCode);
 public:
     static HttpResponse handle(const HttpRequest& request, const LocationConfig& location);
 };
