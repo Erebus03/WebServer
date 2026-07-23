@@ -2,6 +2,11 @@
   <dictionary name="project">
     <words>
       <w>POSTHANDLER</w>
+      <w>Webserv</w>
+      <w>cassert</w>
+      <w>cout</w>
+      <w>cstdio</w>
+      <w>endl</w>
     </words>
   </dictionary>
 </component>
