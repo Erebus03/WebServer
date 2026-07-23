@@ -18,4 +18,3 @@ Client::Client(int socket_fd, const std::string& remote_addr)
 bool Client::isTimedOut(time_t timeout_seconds) const {
     return (std::time(NULL) - last_activity) >= timeout_seconds;
 }
-

@@ -9,6 +9,7 @@ SRCS = \
 	src/Config.cpp \
 	src/HttpParser.cpp \
 	tests/test_router.cpp \
+	tests/test_http_parser.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
