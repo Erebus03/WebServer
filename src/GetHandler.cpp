@@ -48,8 +48,21 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
     if (FileUtils::is_directory(diskPath))
     {
         if (request.uri[request.uri.length() - 1] != '/')
-            return make_response(301);
-    }
+        {
+            HttpResponse response = make_response(301);
+            response.headers["Location"] = request.uri + "/";
+            return response;
+        }
 
+        for (std::vector<std::string>::const_iterator filename = location.index_files.begin(); filename != location.index_files.end(); ++filename)
+        {
+            std::string candidate = diskPath + *filename;
+            if (FileUtils::file_exists(candidate) && !FileUtils::is_directory(candidate))
+            {
+                diskPath = candidate;
+                break;
+            }
+        }
+    }
     return make_response(200);
 }
