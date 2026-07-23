@@ -45,5 +45,11 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
     if (!FileUtils::file_exists(diskPath))
         return make_response(404);
 
+    if (FileUtils::is_directory(diskPath))
+    {
+        if (request.uri[request.uri.length() - 1] != '/')
+            return make_response(301);
+    }
+
     return make_response(200);
 }
