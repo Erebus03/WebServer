@@ -47,6 +47,7 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
 
     if (FileUtils::is_directory(diskPath))
     {
+        bool foundIndex = false;
         if (request.uri[request.uri.length() - 1] != '/')
         {
             HttpResponse response = make_response(301);
@@ -56,13 +57,35 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
 
         for (std::vector<std::string>::const_iterator filename = location.index_files.begin(); filename != location.index_files.end(); ++filename)
         {
+            //TODO:THis job should be done by resolve_path, but resolve_path() refuses an empty root.
             std::string candidate = diskPath + *filename;
             if (FileUtils::file_exists(candidate) && !FileUtils::is_directory(candidate))
             {
                 diskPath = candidate;
+                foundIndex = true;
                 break;
             }
         }
+
+        if (!foundIndex)
+        {
+            if (!location.dir_listing)
+                return make_response(403);
+
+            HttpResponse response = make_response(200);
+            response.body = "<html>Directory listing placeholder</html>";
+            return response;
+
+        }
     }
-    return make_response(200);
+
+    std::string out;
+    if (!FileUtils::is_readable(diskPath))
+        return make_response(403);
+
+    if (!FileUtils::read_file(diskPath, out))
+        return make_response(500);
+    HttpResponse response = make_response(200);
+    response.body = out;
+    return response;
 }
