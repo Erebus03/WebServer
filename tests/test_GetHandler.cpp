@@ -11,7 +11,7 @@ int main()
     file << "Hello Webserv";
     file.close();
 
-    LocationConfig location;
+    LocationConfig location = {};
     HttpRequest request;
     HttpResponse response;
 
