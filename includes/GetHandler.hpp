@@ -9,7 +9,8 @@ class GetHandler {
 private:
     GetHandler();
 public:
-    static HttpResponse handle(const HttpRequest& request, const LocationConfig& location);
+    static HttpResponse handle(const HttpRequest& request,
+                               const LocationConfig& location);
 };
-
 #endif
+

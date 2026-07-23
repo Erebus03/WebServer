@@ -1,7 +1,8 @@
 #include "../includes/GetHandler.hpp"
 #include "../includes/FileUtils.hpp"
+#include <vector>
 
-HttpResponse GetHandler::make_response(int statusCode)
+static HttpResponse make_response(int statusCode)
 {
     HttpResponse response;
 
