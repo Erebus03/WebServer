@@ -4,13 +4,55 @@
 #include <fcntl.h>
 #include <iostream>
 #include <cstring>
+#include <cctype>
 #include <ctime>
 #include <cerrno>
-#include <cstdio>
+#include <stdint.h>
 #include <sstream>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+// ── Allowed-function-safe IPv4 helpers ───────────────────────────────────────
+// The webserv subject does not permit inet_pton/inet_ntop/inet_addr/inet_ntoa,
+// so we convert between dotted-quad strings and 32-bit addresses by hand.
+
+// "a.b.c.d" -> host-order 32-bit value. Returns false on any malformed input.
+static bool parseIPv4(const std::string& s, uint32_t& outHost) {
+    unsigned int parts[4];
+    int count = 0;
+    size_t i = 0;
+    while (count < 4) {
+        if (i >= s.size() || !std::isdigit(static_cast<unsigned char>(s[i])))
+            return false;
+        unsigned int val = 0;
+        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+            val = val * 10 + static_cast<unsigned int>(s[i] - '0');
+            if (val > 255)
+                return false;
+            ++i;
+        }
+        parts[count++] = val;
+        if (count < 4) {
+            if (i >= s.size() || s[i] != '.')
+                return false;
+            ++i;
+        }
+    }
+    if (i != s.size())
+        return false; // trailing garbage
+    outHost = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+    return true;
+}
+
+// network-order s_addr -> "a.b.c.d"
+static std::string ipv4ToString(uint32_t netAddr) {
+    uint32_t h = ntohl(netAddr);
+    std::ostringstream os;
+    os << ((h >> 24) & 0xFF) << "." << ((h >> 16) & 0xFF) << "."
+       << ((h >> 8) & 0xFF) << "." << (h & 0xFF);
+    return os.str();
+}
 
 Server::Server() : running(false) {
 }
@@ -63,7 +105,7 @@ void Server::run() {
         
         if (nready < 0) {
             if (errno == EINTR) continue; // Interrupted by signal
-            perror("poll");
+            std::cerr << "poll: " << strerror(errno) << std::endl;
             break;
         }
         
@@ -101,7 +143,7 @@ int Server::_createListeningSocket(const std::string& host, int port) {
     // Create socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
-        perror("socket");
+        std::cerr << "socket: " << strerror(errno) << std::endl;
         return -1;
     }
     
@@ -109,7 +151,7 @@ int Server::_createListeningSocket(const std::string& host, int port) {
     // fehm
     int opt = 1;
     if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
+        std::cerr << "setsockopt: " << strerror(errno) << std::endl;
         close(sock);
         return -1;
     }
@@ -120,21 +162,23 @@ int Server::_createListeningSocket(const std::string& host, int port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     
-    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-        perror("inet_pton");
+    uint32_t host_order = 0;
+    if (!parseIPv4(host, host_order)) {
+        std::cerr << "invalid listen host '" << host << "' (expected IPv4)" << std::endl;
         close(sock);
         return -1;
     }
+    addr.sin_addr.s_addr = htonl(host_order);
     
     if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
+        std::cerr << "bind: " << strerror(errno) << std::endl;
         close(sock);
         return -1;
     }
     
     // Listen
     if (listen(sock, SOMAXCONN) < 0) {
-        perror("listen");
+        std::cerr << "listen: " << strerror(errno) << std::endl;
         close(sock);
         return -1;
     }
@@ -220,11 +264,9 @@ void Server::_acceptNewClient(int listen_fd) {
     _setNonBlocking(client_fd);
     
     // Create client object
-    char client_ip[INET_ADDRSTRLEN]; //definde on #inc <netinet/in.h> as 16
-    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
     std::stringstream ss;
-    ss << ntohs(client_addr.sin_port);
-    std::string remote_addr = std::string(client_ip) + ":" + ss.str();
+    ss << ipv4ToString(client_addr.sin_addr.s_addr) << ":" << ntohs(client_addr.sin_port);
+    std::string remote_addr = ss.str();
     
     Client* client = new Client(client_fd, remote_addr);
     clients[client_fd] = client;
