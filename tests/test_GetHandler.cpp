@@ -118,7 +118,6 @@ static HttpRequest make_request(const std::string& uri, const std::string& query
 
 static bool has_header(const HttpResponse& response, const std::string& name)
 {
-    // find(), never operator[] -- see the CONTRACT comment in GetHandler.hpp.
     return response.headers.find(name) != response.headers.end();
 }
 
@@ -238,7 +237,6 @@ static void test_index_first_match_wins()
     assert(second.status_code == 200);
     assert(second.body == "B page");
 
-    // Names that do not exist are skipped, not fatal.
     location.index_files.clear();
     location.index_files.push_back("missing.html");
     location.index_files.push_back("a.html");
