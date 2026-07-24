@@ -1,7 +1,18 @@
 #include "../includes/GetHandler.hpp"
 #include "../includes/FileUtils.hpp"
 #include <vector>
+#include <string>
 
+// TODO(team): C1 -- this status-code -> reason-phrase table will be needed by
+// PostHandler (201), DeleteHandler (204), Dispatcher (405, 301) and CgiHandler.
+// Four copies = four chances to disagree. Decide who owns it: ResponseBuilder is
+// the last component that needs the mapping, so handlers could carry only the int
+// and HttpResponse::status_message could disappear from handler code entirely.
+//
+// TODO(team): C2 -- the default case is a silent fallback. An unmapped code ships
+// "HTTP/1.1 405 Unknown Status" and looks plausible enough to survive to the demo.
+// Dissolved by C1: a single owned table can be complete once. Until then, decide
+// whether the default should assert in debug builds.
 static HttpResponse make_response(int statusCode)
 {
     HttpResponse response;
@@ -37,6 +48,8 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
 {
     std::string diskPath;
 
+    // Traversal attempt: 403 not 400 -- the request line is well-formed, we simply
+    // refuse it. 404 would hide the refusal but also lie about paths that exist.
     if (!FileUtils::is_path_safe(request.uri))
         return make_response(403);
 
@@ -49,17 +62,21 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
     if (FileUtils::is_directory(diskPath))
     {
         bool foundIndex = false;
-        if (request.uri[request.uri.length() - 1] != '/')
+        if (request.uri.empty() || request.uri[request.uri.length() - 1] != '/')
         {
             HttpResponse response = make_response(301);
-            response.headers["Location"] = request.uri + "/";
+            std::string target = request.uri + "/";
+            if (!request.query_string.empty())
+                target += "?" + request.query_string;
+            response.headers["Location"] = target;
             return response;
         }
 
         for (std::vector<std::string>::const_iterator filename = location.index_files.begin(); filename != location.index_files.end(); ++filename)
         {
-            //TODO:THis job should be done by resolve_path, but resolve_path() refuses an empty root.
-            std::string candidate = diskPath + *filename;
+            std::string candidate;
+            if (!FileUtils::resolve_path(diskPath, *filename, candidate))
+                continue;
             if (FileUtils::file_exists(candidate) && !FileUtils::is_directory(candidate))
             {
                 diskPath = candidate;
@@ -74,19 +91,19 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
                 return make_response(403);
 
             HttpResponse response = make_response(200);
+            response.headers["Content-Type"] = "text/html; charset=UTF-8";
             response.body = "<html>Directory listing placeholder</html>";
             return response;
 
         }
     }
 
-    std::string out;
     if (!FileUtils::is_readable(diskPath))
         return make_response(403);
 
-    if (!FileUtils::read_file(diskPath, out))
-        return make_response(500);
     HttpResponse response = make_response(200);
-    response.body = out;
+    if (!FileUtils::read_file(diskPath, response.body))
+        return make_response(500);
+
     return response;
 }
