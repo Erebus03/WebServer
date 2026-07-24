@@ -289,6 +289,48 @@ conversion and port 8080 (`0x1F90`) becomes port 36895 (`0x901F`) — the server
 international treaty: everyone writes MM/DD on the wire, whatever they use at
 home. `htons` is the translation at the border.
 
+#### Field notes — three real `bind()` lessons (hit live, 2026-07-24)
+
+The first launch of `default.conf` produced all three of these in one run.
+Each is interview-grade.
+
+**1. `bind: Permission denied` on port 80 — privileged ports.**
+Ports **below 1024** can only be bound by root. It's a historical Unix trust
+convention: on a shared machine, only the admin could claim the well-known
+ports, so a remote client connecting to port 80 could trust it was the *real*
+web server and not another user's imposter process. A normal user asking for
+port 80 is refused by the kernel at `bind()` — the config wasn't wrong, the
+*privilege* was missing. Options: use ports ≥1024 in configs (what evaluation
+does), or grant the binary `CAP_NET_BIND_SERVICE`; `sudo` works but runs the
+whole server as root — bad practice. Also note our behavior: `_createListen-
+Sockets` logs the failure and **continues** with the remaining sockets. Nginx
+is stricter — any listen failure aborts startup. Ours is a known, deliberate
+looseness worth mentioning if asked "what would you change?"
+
+**2. `0.0.0.0` is a policy, not a place.**
+As a *listen* address, `0.0.0.0` (aka `INADDR_ANY`) means "accept connections
+on **ALL** of this machine's interfaces." **Analogy:** a restaurant announcing
+"we accept deliveries at every door" — that's a policy, not an address you can
+drive to; you still drive to a specific door. So "Listening on 0.0.0.0:8443"
+is *reachable* at every real address the machine has — you browse to one of
+them: `http://127.0.0.1:8443` or `http://localhost:8443`, never to `0.0.0.0`
+itself. Two traps stacked on top: on WSL2 the browser lives on *Windows*,
+which reaches the server through localhost forwarding and cannot route to
+`0.0.0.0` at all (native Linux quietly redirects it to localhost, which keeps
+the myth that it's "an address" alive); and on port 8443 — conventionally
+HTTPS — browsers may autocomplete `https://`, whose TLS handshake our
+plain-HTTP server can't answer. Check the URL says `http://`.
+
+**3. `Address already in use` from a LIVE server — SO_REUSEADDR's limit.**
+`SO_REUSEADDR` only bypasses the **TIME_WAIT ghost of a dead server**. It does
+NOT let two *running* processes bind the same port — that's a different flag
+(`SO_REUSEPORT`, which kernel-load-balances accepts across processes; we don't
+use it). So `EADDRINUSE` during development almost always means: **your
+previous instance is still running.** Find it with `ss -tlnp`, Ctrl-C it.
+Two waiters can't answer the same doorbell. Bonus observation from the real
+incident: the second instance correctly created zero sockets and refused to
+start — fail-closed behaving in the wild.
+
 #### Step 3½ — `parseIPv4()` — why we wrote our own
 
 The natural call here is `inet_pton("127.0.0.1") → 32-bit address`. **It is not
@@ -796,17 +838,20 @@ Practice answering these out loud, from memory, then check against the section.
 
 **Setup & config**
 15. What does SO_REUSEADDR actually do? What's TIME_WAIT? *(the haunted apartment)*
-16. What is htons and what breaks without it? *(endianness, port 36895)*
-17. Why did you write your own IP parser? *(banned inet_pton; shifts + validation)*
-18. Your config parser sees garbage — what happens? Why "fail closed"? *(the pharmacist)*
-19. How does a location inherit values from its server block? *(presence-tracking, not value-tracking)*
+16. Why does binding port 80 fail for a normal user, and what are your options? *(privileged ports — §5.1 field notes)*
+17. Your log says "Listening on 0.0.0.0:8443" — what does 0.0.0.0 mean, and why can't I browse to it? *(a policy, not a place)*
+18. You get "Address already in use" but there's no TIME_WAIT — what's happening, and why doesn't SO_REUSEADDR help? *(a live instance; REUSEADDR ≠ REUSEPORT)*
+19. What is htons and what breaks without it? *(endianness, port 36895)*
+20. Why did you write your own IP parser? *(banned inet_pton; shifts + validation)*
+21. Your config parser sees garbage — what happens? Why "fail closed"? *(the pharmacist)*
+22. How does a location inherit values from its server block? *(presence-tracking, not value-tracking)*
 
 **Design & honesty** *(the differentiators)*
-20. How would you scale this to 100k connections? *("swap poll for epoll behind the same seam; then sharded event loops per core — the nginx model")*
-21. What would you do differently in modern C++? *(unique_ptr in the client map, std::atomic for the signal flag, string_view in the parser, std::expected instead of throw-a-string)*
-22. What's the weakest part of your current code? *(honest options: plain bool vs sig_atomic_t; connection-close after every response — no keep-alive yet; timeout constant not yet configurable)*
+23. How would you scale this to 100k connections? *("swap poll for epoll behind the same seam; then sharded event loops per core — the nginx model")*
+24. What would you do differently in modern C++? *(unique_ptr in the client map, std::atomic for the signal flag, string_view in the parser, std::expected instead of throw-a-string)*
+25. What's the weakest part of your current code? *(honest options: plain bool vs sig_atomic_t; connection-close after every response — no keep-alive yet; timeout constant not yet configurable; a failed listen doesn't abort startup)*
 
-Question 22 matters most. Interviewers trust people who know their own
+Question 25 matters most. Interviewers trust people who know their own
 code's limits far more than people who claim it's perfect.
 
 ---
@@ -821,6 +866,9 @@ code's limits far more than people who claim it's perfect.
 | **level-triggered** | poll re-reports a condition as long as it holds (vs edge-triggered: only on change). Ours is level — which is why accepting one connection per event is safe |
 | **backlog** | kernel queue of completed TCP connections waiting for accept() |
 | **TIME_WAIT** | post-close TCP state (~1 min) holding the address to absorb stray packets; the reason for SO_REUSEADDR |
+| **privileged port** | port < 1024; only root may bind it — historical trust convention for well-known services (why port 80 fails without sudo) |
+| **wildcard address (0.0.0.0 / INADDR_ANY)** | listen-side "all interfaces" policy; NOT a destination — browse to 127.0.0.1/localhost instead |
+| **SO_REUSEPORT** | the flag that WOULD let multiple live sockets share one port (we don't use it); not to be confused with SO_REUSEADDR |
 | **FIN / orderly shutdown** | TCP's polite hang-up; surfaces to us as recv() == 0 |
 | **endianness / network byte order** | byte ordering of multi-byte numbers; network standard is big-endian; htons/htonl translate |
 | **partial read/write** | TCP streams fragment arbitrarily; one recv/send rarely moves a complete message; buffers + cursors compensate |
