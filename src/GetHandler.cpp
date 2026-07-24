@@ -46,13 +46,12 @@ static HttpResponse make_response(int statusCode)
 
 HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig& location)
 {
-    std::string diskPath;
-
     // Traversal attempt: 403 not 400 -- the request line is well-formed, we simply
     // refuse it. 404 would hide the refusal but also lie about paths that exist.
     if (!FileUtils::is_path_safe(request.uri))
         return make_response(403);
 
+    std::string diskPath;
     if (!FileUtils::resolve_path(location.root, request.uri, diskPath))
         return make_response(500);
 
@@ -61,7 +60,6 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
 
     if (FileUtils::is_directory(diskPath))
     {
-        bool foundIndex = false;
         if (request.uri.empty() || request.uri[request.uri.length() - 1] != '/')
         {
             HttpResponse response = make_response(301);
@@ -72,6 +70,7 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
             return response;
         }
 
+        bool foundIndex = false;
         for (std::vector<std::string>::const_iterator filename = location.index_files.begin(); filename != location.index_files.end(); ++filename)
         {
             std::string candidate;
