@@ -1,0 +1,143 @@
+===============================================================================
+ WEBSERV — SUBJECT RULES & ALLOWED FUNCTIONS  (quick reference)
+ Last updated: 2026-07-24
+ Purpose: single source of truth for what we may/may not use, and the hard
+          architectural rules the evaluator checks. Keep this current.
+===============================================================================
+
+-------------------------------------------------------------------------------
+ 0. HARD RULES (instant-fail if broken)
+-------------------------------------------------------------------------------
+[*] Language: C++ 98 ONLY. Compile with -Wall -Wextra -Werror -std=c++98.
+    No C++11+ (auto, nullptr, range-for, <thread>, lambdas, unordered_map, ...).
+[*] No external libraries. No Boost. Standard C++98 lib + POSIX only.
+[*] The server must NEVER block. All fds are non-blocking.
+[*] ONE and only ONE poll() (or select/epoll/kqueue) for ALL I/O — listen
+    sockets + client sockets + CGI pipes — both read AND write readiness.
+[*] You may NEVER read/recv or write/send on any fd without it first being
+    reported ready by poll(). Doing so = grade 0.
+[*] Checking errno AFTER a read/recv OR write/send is STRICTLY FORBIDDEN.
+    (Decide what to do from the return value alone: >0 data, 0 = peer closed,
+     <0 = treat as error and drop the client — do NOT inspect errno.)
+[*] fork() is allowed ONLY for CGI. Nowhere else.
+[*] The server must never crash — not on malformed input, not under stress,
+    not on client disconnect mid-request. No memory leaks.
+[*] A request to a nonexistent CGI / a hanging CGI must not hang the server.
+
+-------------------------------------------------------------------------------
+ 1. ALLOWED EXTERNAL FUNCTIONS  (the ONLY syscalls/libc we may use)
+-------------------------------------------------------------------------------
+Process / exec:
+    execve, fork, waitpid, kill, signal, chdir, access
+
+Pipes / fds:
+    pipe, dup, dup2, close, read, write, fcntl (RESTRICTED — see below)
+
+Sockets / network:
+    socket, socketpair, accept, listen, bind, connect,
+    send, recv, setsockopt, getsockname, getprotobyname,
+    getaddrinfo, freeaddrinfo
+
+Byte order:
+    htons, htonl, ntohs, ntohl
+
+Multiplexing (pick ONE family):
+    select  (+ FD_SET, FD_CLR, FD_ISSET, FD_ZERO)
+    poll
+    epoll_create, epoll_ctl, epoll_wait
+    kqueue, kevent
+
+Filesystem / dirs:
+    open, stat, opendir, readdir, closedir
+
+Errors / strings:
+    errno (use OK — but NOT to be checked after read/write), strerror,
+    gai_strerror
+
+NOTE on fcntl: in this project it may be used in EXACTLY one way:
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+    Any other flag / any other use of fcntl is forbidden.
+
+Standard C++98 library (iostream, string, vector, map, sstream, fstream,
+algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
+"external library".
+
+-------------------------------------------------------------------------------
+ 2. FORBIDDEN / NOT-ON-THE-LIST  (common traps — do NOT use)
+-------------------------------------------------------------------------------
+[X] inet_pton / inet_ntop / inet_addr / inet_ntoa
+        -> NOT allowed. To fill a sockaddr_in:
+             - bind-all:   addr.sin_addr.s_addr = htonl(INADDR_ANY);   // 0.0.0.0
+             - specific IP: use getaddrinfo() (allowed) and copy the result,
+               OR parse the dotted quad yourself and build the 32-bit value.
+        -> To print a client IP: derive it from the sockaddr you already have
+           (getpeername/getsockname are NOT both listed — getsockname is;
+            getpeername is NOT) or skip printing the IP. Simplest: don't
+           pretty-print the peer IP, or reconstruct it manually from
+           ntohl(addr.sin_addr.s_addr).
+[X] perror            -> NOT listed. Use: std::cerr << msg << ": "
+                                       << strerror(errno) << std::endl;
+                         (only after non-read/write calls, e.g. socket/bind).
+[X] bzero             -> use memset (memset is std C, accepted) or value-init.
+[X] gethostbyname     -> use getaddrinfo.
+[X] sprintf/snprintf for building responses -> use std::ostringstream.
+[X] malloc/free/new-without-delete leaks    -> RAII / clean up in destructors.
+[X] Any check of errno after recv/send/read/write.
+[X] Multiple poll()/select() loops. Threads.
+
+-------------------------------------------------------------------------------
+ 3. ARCHITECTURE RULES THE EVALUATOR CHECKS
+-------------------------------------------------------------------------------
+- Single-threaded, single event loop.
+- Every socket/pipe set non-blocking with fcntl(fd, F_SETFL, O_NONBLOCK).
+- SO_REUSEADDR on listen sockets (setsockopt) so restart doesn't fail.
+- Partial reads: accumulate into a per-client input buffer; the parser is a
+  re-entrant state machine (picks up where it left off).
+- Partial writes: track bytes_sent; register POLLOUT; keep draining.
+- Client closes (recv == 0): clean up state, close fd, remove from poll set,
+  never crash.
+- POLLHUP / POLLERR / POLLNVAL handled -> drop that client.
+- CGI: child stdout pipe is ALSO a poll()-managed non-blocking fd. Body piped
+  to child stdin. waitpid(WNOHANG) to reap. chdir() to script dir before
+  execve(). Only fork() here.
+- Config: define the grammar precisely; a missing/invalid field must fail
+  closed (reject the config), not silently corrupt.
+
+-------------------------------------------------------------------------------
+ 4. STATUS CODES TO COVER
+-------------------------------------------------------------------------------
+200 OK, 201 Created, 204 No Content,
+301 Moved Permanently, 302 Found,
+400 Bad Request, 403 Forbidden, 404 Not Found, 405 Method Not Allowed,
+408 Request Timeout, 413 Content Too Large / Payload Too Large,
+500 Internal Server Error, 501 Not Implemented.
+
+-------------------------------------------------------------------------------
+ 5. CURRENT-CODE COMPLIANCE (audit 2026-07-24, branch Anouar)
+-------------------------------------------------------------------------------
+RESOLVED (fixed 2026-07-24):
+  - inet_pton  -> replaced by static parseIPv4() (dotted-quad -> host order,
+                  then htonl) in src/Server.cpp. Runtime-verified: binds
+                  0.0.0.0:8080/8081.
+  - inet_ntop  -> replaced by static ipv4ToString() (ntohl -> "a.b.c.d") for
+                  the accept-path client-IP log line.
+  - perror x6  -> all replaced with `std::cerr << "..." << strerror(errno)`.
+  Verified: grep finds no inet_*/perror CALLS (only a comment), and
+  `make re` is clean with -Wall -Wextra -Werror -std=c++98.
+
+BORDERLINE (allowed, but be aware):
+  - src/Server.cpp:65  `if (errno == EINTR)` after poll(): permitted (ban is
+    only after read/write), but keep it OUT of the recv/send paths.
+
+COMPLIANT (good):
+  - fcntl(fd, F_SETFL, O_NONBLOCK)         (Server.cpp:377) — exact allowed form
+  - single poll() over listen+client fds   (Server.cpp:62)
+  - recv()/send() never inspect errno      (Server.cpp:242,311)
+  - setsockopt SO_REUSEADDR                 (Server.cpp:111)
+  - partial writes tracked via bytes_sent  (Server.cpp:308-323)
+  - signal / waitpid available for shutdown + CGI reaping
+
+===============================================================================
+ Source of truth: the official 42 "Webserv" subject PDF. If the evaluation
+ machine's subject differs from this file, the PDF wins — update this file.
+===============================================================================
