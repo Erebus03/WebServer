@@ -7,6 +7,8 @@
       <w>cout</w>
       <w>cstdio</w>
       <w>endl</w>
+      <w>gethandler</w>
+      <w>noread</w>
     </words>
   </dictionary>
 </component>
