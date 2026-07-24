@@ -20,6 +20,7 @@ SRCS = \
 	tests/test_router.cpp \
 	tests/test_FileUtils.cpp \
 	tests/test_GetHandler.cpp \
+	tests/test_Dispatcher.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
