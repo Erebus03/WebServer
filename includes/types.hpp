@@ -43,7 +43,9 @@ struct HttpRequest {
     ParseState                         state;
     std::string                        method;
     std::string                        uri;
-    std::string                        query_string;
+    std::string                        query_string;    // WITHOUT the leading '?' (RFC 3986 query
+                                                        // component; matches CGI QUERY_STRING).
+                                                        // TODO: confirm with B when the parser lands.
     std::string                        version;
     std::map<std::string, std::string> headers;
     std::string                        body;
