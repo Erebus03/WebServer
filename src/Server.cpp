@@ -294,6 +294,7 @@ void Server::_handleClientRead(int client_fd) {
     }
 
     client->input_buf.insert(client->input_buf.end(), buffer, buffer + n);
+    client->last_activity = std::time(NULL); // keep the connection alive
 
     // Placeholder echo — replaced by B's parser + C's router on Day 5.
     std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nHello World!\n";
@@ -412,7 +413,22 @@ void Server::_removeClient(int client_fd) {
 }
 
 void Server::_checkTimeouts() {
-    // TODO: Check for timed out clients
+    // Drop connections that have been silent for too long (guards against
+    // slow-loris style clients that connect and never finish a request).
+    const time_t timeout_seconds = 60;
+
+    // Collect first, then remove: _removeClient() erases from `clients`, which
+    // would invalidate the iterator if done inside the loop.
+    std::vector<int> expired;
+    for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
+        if (it->second->isTimedOut(timeout_seconds))
+            expired.push_back(it->first);
+    }
+
+    for (size_t i = 0; i < expired.size(); ++i) {
+        std::cout << "Client " << expired[i] << " timed out, closing connection" << std::endl;
+        _removeClient(expired[i]);
+    }
 }
 
 void Server::_setNonBlocking(int fd) {
