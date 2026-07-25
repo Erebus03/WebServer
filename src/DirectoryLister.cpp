@@ -2,7 +2,6 @@
 #include "../includes/FileUtils.hpp"
 #include <dirent.h>
 #include <sys/stat.h>
-#include <iostream>
 #include <sstream>
 #include <algorithm>
 
