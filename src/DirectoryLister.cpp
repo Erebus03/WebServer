@@ -40,7 +40,11 @@ bool DirectoryLister::read_entries(const std::string& diskPath, std::vector<std:
     return true;
 }
 
+// TODO(abdo): build the HTML index page from sortedNames
 std::string DirectoryLister::render(const std::string& disPath, const std::string& uri, const std::vector<std::string>& sortedNames)
 {
-    
+    (void)disPath;
+    (void)uri;
+    (void)sortedNames;
+    return "";
 }
