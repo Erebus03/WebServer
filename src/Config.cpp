@@ -5,21 +5,6 @@
 #include <cctype>
 #include <cstdlib>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Design
-// ─────────────────────────────────────────────────────────────────────────────
-// Two phases:
-//   1) tokenize()  — split the whole file into tokens. '{', '}' and ';' are
-//      always their own tokens even when glued to text ("server{" -> server, {),
-//      comments (#..EOL) are stripped, everything else splits on whitespace.
-//      Each token carries its source line for diagnostics.
-//   2) parse the flat token stream with a tiny recursive descent.
-//
-// Any structural or value error throws a std::string (a formatted message with a
-// line number). ConfigParser::parse() catches it, reports it, and returns an
-// empty Config. This makes the parser fail-closed: a bad config yields zero
-// servers rather than a silently corrupt one.
-
 namespace { 
 
 struct Token {
@@ -384,9 +369,7 @@ Config parseTokens(const std::vector<Token>& toks) {
     return config;
 }
 
-} // anonymous namespace
-
-// ─────────────────────────────────────────────────────────────────────────────
+}
 
 ConfigParser::ConfigParser() {}
 

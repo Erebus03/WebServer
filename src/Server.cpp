@@ -1,4 +1,5 @@
 #include "../includes/Server.hpp"
+#include "../includes/FileUtils.hpp"
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -12,6 +13,11 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+
+// MAIN CHAT claude --resume d6b4be4d-bbf2-4223-9ce9-c9518d681475
+
+
 
 // ── Allowed-function-safe IPv4 helpers ───────────────────────────────────────
 // The webserv subject does not permit inet_pton/inet_ntop/inet_addr/inet_ntoa,
@@ -269,21 +275,132 @@ void Server::_acceptNewClient(int listen_fd) {
     std::string remote_addr = ss.str();
     
     Client* client = new Client(client_fd, remote_addr);
+
+    // Bind the client to the server block that owns this listening socket, so
+    // per-server settings (client_max_body_size, error_pages) are available
+    // from the very first byte instead of being hard-coded in the read path.
+    // `config` is filled once in initialize() and never resized afterwards, so
+    // taking a pointer into it is safe for the client's lifetime.
+    std::map<int, int>::iterator sit = listen_fd_to_server_idx.find(listen_fd);
+    if (sit != listen_fd_to_server_idx.end() &&
+        sit->second >= 0 && static_cast<size_t>(sit->second) < config.size())
+        client->server_cfg = &config[sit->second];
+
     clients[client_fd] = client;
     
     std::cout << "Accepted connection from " << remote_addr << " (fd: " << client_fd << ")" << std::endl;
 }
 
 
+// ── Read-side limits ─────────────────────────────────────────────────────────
+// Bytes per recv(). One recv per POLLIN, so this is a throughput knob only.
+static const size_t READ_CHUNK = 4096;
+// Cap on request line + headers. Deliberately NOT config-driven: the config
+// grammar (see types.hpp) has a directive for body size and none for header
+// size, so inventing one here would put a knob in the code that no config file
+// can reach. Raise it if a real client ever legitimately exceeds it.
+static const size_t MAX_HEADER_BYTES = 8192;
+
+static std::string reasonPhrase(int code) {
+    switch (code) {
+        case 400: return "Bad Request";
+        case 413: return "Content Too Large";
+        case 431: return "Request Header Fields Too Large";
+        case 501: return "Not Implemented";
+        default:  return "Error";
+    }
+}
+
+void Server::_startErrorResponse(Client* client, int status_code) {
+    const std::string reason = reasonPhrase(status_code);
+
+    std::string body;
+    // Prefer the operator's page when the config names one for this code.
+    if (client->server_cfg) {
+        std::map<int, std::string>::const_iterator it =
+            client->server_cfg->error_pages.find(status_code);
+        if (it != client->server_cfg->error_pages.end()) {
+            std::string page;
+            if (FileUtils::read_file(it->second, page))
+                body = page;   // on failure we fall through to the generated one
+        }
+    }
+    if (body.empty()) {
+        std::stringstream gen;
+        gen << "<html><head><title>" << status_code << " " << reason << "</title></head>"
+            << "<body><h1>" << status_code << " " << reason << "</h1></body></html>\r\n";
+        body = gen.str();
+    }
+
+    std::stringstream head;
+    head << "HTTP/1.1 " << status_code << " " << reason << "\r\n"
+         << "Content-Type: text/html\r\n"
+         << "Content-Length: " << body.size() << "\r\n"
+         << "Connection: close\r\n"
+         << "\r\n";
+
+    const std::string wire = head.str() + body;
+    client->output_buf.assign(wire.begin(), wire.end());
+    client->bytes_sent = 0;
+    client->state = Client::SENDING;
+}
+
+bool Server::_enforceReadLimits(Client* client) {
+    const size_t received = client->input_buf.size();
+
+    // Still inside the header section and already over the cap: this is a
+    // client that will never finish (slow-loris) or is deliberately oversized.
+    if (client->request.state != READING_BODY &&
+        client->request.state != COMPLETE &&
+        received > MAX_HEADER_BYTES) {
+        _startErrorResponse(client, 431);
+        return false;
+    }
+
+    // Body cap comes from config. server_cfg is bound at accept() time from the
+    // listening socket's server block; once Host-header selection lands this
+    // should be re-resolved before the body is read.
+    if (client->server_cfg) {
+        const size_t max_total =
+            MAX_HEADER_BYTES + client->server_cfg->client_max_body_size;
+        if (received > max_total) {
+            _startErrorResponse(client, 413);
+            return false;
+        }
+    }
+    return true;
+}
+
+void Server::_processRequest(Client* client) {
+    // Integration seam. Reached only for a request the parser called COMPLETE,
+    // exactly once per request. Dispatcher.hpp is still empty, so until it has
+    // an interface this answers honestly rather than faking a 200.
+    // TODO: Router::match() -> Dispatcher -> HttpResponse -> serialise to output_buf.
+    _startErrorResponse(client, 501);
+}
+
+
+
+//side chat claude --resume 9e8a6cfd-9128-499f-ab93-8f1f77ddc798******************************
 void Server::_handleClientRead(int client_fd) {
     std::map<int, Client*>::iterator it = clients.find(client_fd);
     if (it == clients.end()) return;
     Client* client = it->second;
 
-    char buffer[4096];
+    // Only a client in READING may grow input_buf. A peer that pipelines a
+    // second request gets POLLIN while we are still SENDING the first; taking
+    // those bytes now would splice them into the request being served.
+    if (client->state != Client::READING) return;
+
+    // Exactly one recv per POLLIN. Looping until the socket drains would mean
+    // testing errno for EAGAIN, which SUBJECT_RULES.txt:19 forbids after any
+    // read/recv. poll() reports POLLIN again next tick if more is pending.
+    char buffer[READ_CHUNK];
     ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
 
     if (n < 0) {
+        // Treated as fatal without inspecting errno — same rule as above. We
+        // drop the client rather than guess whether the failure was transient.
         _handleError(client_fd);
         return;
     }
@@ -296,49 +413,27 @@ void Server::_handleClientRead(int client_fd) {
     client->input_buf.insert(client->input_buf.end(), buffer, buffer + n);
     client->last_activity = std::time(NULL); // keep the connection alive
 
-    // Placeholder echo — replaced by B's parser + C's router on Day 5.
-    std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nHello World!\n";
-    std::vector<char> response_vec(response.begin(), response.end());
-    client->output_buf.insert(client->output_buf.end(), response_vec.begin(), response_vec.end());
+    if (!_enforceReadLimits(client)) return; // error already framed into output_buf
 
-    std::cout << "Received " << n << " bytes from client " << client_fd << std::endl;
+    // Feed the parser. It owns every framing decision; this handler only
+    // supplies bytes. The parser is currently restartable, so handing it the
+    // whole accumulated buffer each time is idempotent.
+    const std::string bytes(client->input_buf.begin(), client->input_buf.end());
+    client->parser.parse(bytes, client->request);
+
+    if (client->request.state == ERROR) {
+        _startErrorResponse(client, 400);
+        return;
+    }
+
+    // The gate. A partial request stops here and waits for the next POLLIN —
+    // this is what makes a request split across TCP segments produce one
+    // response instead of one per segment.
+    if (client->request.state != COMPLETE) return;
+
+    client->state = Client::PROCESSING;
+    _processRequest(client);
 }
-// void Server::_handleClientRead(int client_fd) {
-//     // Client* client = clients[client_fd];
-//     // if (!client) return;
-//     std::map<int, Client*>::iterator it = clients.find(client_fd);
-//     if (it == clients.end()) return;
-//     Client* client = it->second;
-    
-//     char buffer[4096];
-//     ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
-    
-//     if (n < 0) {
-//         _handleError(client_fd);
-//         return;
-//     }
-    
-//     if (n == 0) {
-//         // Client closed connection
-//         std::cout << "Client " << client_fd << " closed connection" << std::endl;
-//         _removeClient(client_fd);
-//         return;
-//     }
-    
-//     // Append data to client's input buffer
-//     // client->appendToInputBuffer(buffer, n);
-//     client->input_buf.insert(client->input_buf.end(), buffer, buffer + n);
-    
-//     // For now, just echo back what we received
-//     // TODO: Parse HTTP request and route to handler
-//     std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nHello World!\n";
-//     std::vector<char> response_vec(response.begin(), response.end());
-    
-//     // client->appendToOutputBuffer(response_vec);
-//     client->output_buf.insert(client->output_buf.end(), vec.begin(), vec.end()); // hter eis no vec!
-
-//     std::cout << "Received " << n << " bytes from client " << client_fd << std::endl;
-// }
 
 
 

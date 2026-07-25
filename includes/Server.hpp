@@ -67,6 +67,15 @@ private:
     void _handleCgiPipeRead(int cgi_fd);
     void _handleError(int fd);
     
+    // Read-side request pipeline
+    // Caps on how much we accumulate before the parser says COMPLETE. Returns
+    // false when a limit was hit and an error response is already queued.
+    bool _enforceReadLimits(Client* client);
+    // Hand-off seam: runs exactly once per complete request.
+    void _processRequest(Client* client);
+    // Frames a status-only response into output_buf and flips to SENDING.
+    void _startErrorResponse(Client* client, int status_code);
+
     // Client lifecycle
     void _removeClient(int client_fd);
     void _checkTimeouts();

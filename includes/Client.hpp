@@ -44,8 +44,9 @@ public:
     // --- config + parsed data ---
     ServerConfig*  server_cfg;  // server block that accepted this client; never owns
 
-    // waiting for chfoq
-    // Request        request;     // parsed request   (B's type — see header note)
+    // The parser writes here; the router reads here. `state` is the completeness
+    // signal the read handler gates on — see ParseState in types.hpp.
+    HttpRequest    request;
     // Response       response;    // response to send (B's type — see header note)
 
 
