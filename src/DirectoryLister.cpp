@@ -54,33 +54,41 @@ std::string DirectoryLister::render(const std::string& diskPath, const std::stri
 
     for (std::vector<std::string>::const_iterator it = sortedNames.begin(); it != sortedNames.end(); ++it)
     {
+        if (*it == "..")
+            continue;
+
         std::string fullPath;
         FileUtils::resolve_path(diskPath, *it, fullPath);
 
         struct stat st = {};
-        if (stat(fullPath.c_str(), &st) == 0)
+        if (stat(fullPath.c_str(), &st) != 0)
+            continue;
+
+        std::string name = *it;
+        std::string sizeCol;
+        if (S_ISDIR(st.st_mode))
         {
-            const off_t size = st.st_size;
-
-            time_t modTime = st.st_mtime;
-
-            std::string name = *it;
-            std::string sizeCol;
-            if (S_ISDIR(st.st_mode))
-            {
-                name += '/';
-                sizeCol = "-";
-            }
-            else
-            {
-                std::ostringstream ss;
-                ss << st.st_size;
-                sizeCol = ss.str();
-            }
-            std::string safeName = html_escape(name);
-            html += "<a href=\"" + uri + safeName + "\">" + safeName + "</a>  " + sizeCol + "\n";
+            name += '/';
+            sizeCol = "-";
         }
+        else
+        {
+            std::ostringstream ss;
+            ss << st.st_size;
+            sizeCol = ss.str();
+        }
+
+        std::string safeName = html_escape(name);
+        html += "<a href=\"";
+        html += uri;
+        html += safeName;
+        html += "\">";
+        html += safeName;
+        html += "</a>  ";
+        html += sizeCol;
+        html += '\n';
     }
+
     html += "</body>\n</html>\n";
     return html;
 }
