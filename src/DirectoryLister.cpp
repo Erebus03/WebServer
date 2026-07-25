@@ -1,5 +1,9 @@
 #include "../includes/DirectoryLister.hpp"
+#include "../includes/FileUtils.hpp"
 #include <dirent.h>
+#include <sys/stat.h>
+#include <iostream>
+#include <sstream>
 
 std::string DirectoryLister::html_escape(const std::string& raw)
 {
@@ -40,7 +44,43 @@ bool DirectoryLister::read_entries(const std::string& diskPath, std::vector<std:
     return true;
 }
 
-std::string DirectoryLister::render(const std::string& disPath, const std::string& uri, const std::vector<std::string>& sortedNames)
+std::string DirectoryLister::render(const std::string& diskPath, const std::string& uri, const std::vector<std::string>& sortedNames)
 {
-    
+    std::string html = "<html>\n"
+                       "<head><title>Index of " + html_escape(uri) + "</title></head>\n"
+                       "<body>\n"
+                       "<h1>Index of " + html_escape(uri) + "</h1>";
+    html += "<a href=\"../\">../</a>\n";
+
+    for (std::vector<std::string>::const_iterator it = sortedNames.begin(); it != sortedNames.end(); ++it)
+    {
+        std::string fullPath;
+        FileUtils::resolve_path(diskPath, *it, fullPath);
+
+        struct stat st = {};
+        if (stat(fullPath.c_str(), &st) == 0)
+        {
+            const off_t size = st.st_size;
+
+            time_t modTime = st.st_mtime;
+
+            std::string name = *it;
+            std::string sizeCol;
+            if (S_ISDIR(st.st_mode))
+            {
+                name += '/';
+                sizeCol = "-";
+            }
+            else
+            {
+                std::ostringstream ss;
+                ss << st.st_size;
+                sizeCol = ss.str();
+            }
+            std::string safeName = html_escape(name);
+            html += "<a href=\"" + uri + safeName + "\">" + safeName + "</a>  " + sizeCol + "\n";
+        }
+    }
+    html += "</body>\n</html>\n";
+    return html;
 }
