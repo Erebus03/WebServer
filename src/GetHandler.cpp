@@ -1,5 +1,6 @@
 #include "../includes/GetHandler.hpp"
 #include "../includes/FileUtils.hpp"
+#include "../includes/DirectoryLister.hpp"
 #include <vector>
 #include <string>
 
@@ -89,11 +90,16 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
             if (!location.dir_listing)
                 return make_response(403);
 
+            std::string listing;
+            // generate() fails only if opendir dies on a directory we already
+            // confirmed exists (TOCTOU / FD exhaustion) -- that's a 500, not a 200.
+            if (!DirectoryLister::generate(diskPath, request.uri, listing))
+                return make_response(500);
+
             HttpResponse response = make_response(200);
             response.headers["Content-Type"] = "text/html; charset=UTF-8";
-            response.body = "<html>Directory listing placeholder</html>";
+            response.body = listing;
             return response;
-
         }
     }
 
