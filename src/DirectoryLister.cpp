@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <iostream>
 #include <sstream>
+#include <algorithm>
 
 std::string DirectoryLister::html_escape(const std::string& raw)
 {
@@ -91,4 +92,15 @@ std::string DirectoryLister::render(const std::string& diskPath, const std::stri
 
     html += "</body>\n</html>\n";
     return html;
+}
+
+bool DirectoryLister::generate(const std::string& diskPath, const std::string& uri, std::string& outHtml)
+{
+    std::vector<std::string> names;
+    if (!read_entries(diskPath, names))
+        return false;
+
+    std::sort(names.begin(), names.end());
+    outHtml = render(diskPath, uri, names);
+    return true;
 }
