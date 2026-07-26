@@ -7,7 +7,7 @@
 //
 // #include <sys/stat.h>
 // #include <unistd.h>
-//
+// #include "../includes/HttpStatus.hpp"
 // #include "../includes/DirectoryLister.hpp"
 //
 // static const std::string ROOT = "./tmp_dirlister";
