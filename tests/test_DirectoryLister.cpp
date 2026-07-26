@@ -12,7 +12,13 @@
 
 static const std::string ROOT = "./tmp_dirlister";
 
+// Every character html_escape must neutralise, in one legal Linux filename.
 static const std::string HOSTILE = "<a href=\"x\">&.txt";
+
+// Characters that are harmless in HTML but break a URL: a space (invalid) and
+// a '#' (starts a fragment, truncating the link). html_escape does nothing to
+// either -- this fixture is what proves url_encode is being applied.
+static const std::string URLHOSTILE = "a b#c.txt";
 
 static std::string at(const std::string& rel) { return ROOT + rel; }
 
@@ -29,6 +35,7 @@ static void teardown_fixtures()
     unlink(at("/apple.txt").c_str());
     unlink(at("/banana.txt").c_str());
     unlink(at("/" + HOSTILE).c_str());
+    unlink(at("/" + URLHOSTILE).c_str());
     rmdir(at("/sub").c_str());
     rmdir(at("/empty").c_str());
     rmdir(ROOT.c_str());
@@ -45,6 +52,7 @@ static void setup_fixtures()
     write_file(at("/apple.txt"), "aaa");
     write_file(at("/banana.txt"), "bbbbb");
     write_file(at("/" + HOSTILE), "x");
+    write_file(at("/" + URLHOSTILE), "y");
 }
 
 static bool contains(const std::string& haystack, const std::string& needle)
@@ -58,7 +66,7 @@ static size_t index_of(const std::string& haystack, const std::string& needle)
 }
 
 // ---------------------------------------------------------------------------
-// html_escape -- the security boundary. Pure string assertions, no filesystem.
+// html_escape -- the document-structure boundary. Pure strings, no filesystem.
 // ---------------------------------------------------------------------------
 
 static void test_escape_passthrough()
@@ -139,6 +147,8 @@ static void test_generate_sorted()
 
 static void test_generate_directory_trailing_slash()
 {
+    // The slash must survive url_encode -- if it were encoded it would appear
+    // as %2F and every directory link would break.
     std::string html;
     DirectoryLister::generate(ROOT + "/", "/", html);
     assert(contains(html, "<a href=\"/sub/\">sub/</a>"));
@@ -158,9 +168,26 @@ static void test_generate_escapes_hostile_name()
 {
     std::string html;
     DirectoryLister::generate(ROOT + "/", "/", html);
+    // display text: HTML-escaped, raw form absent
     assert(contains(html, "&lt;a href=&quot;x&quot;&gt;&amp;.txt"));
-    assert(!contains(html, "<a href=\"x\">&.txt"));   // raw form absent
+    assert(!contains(html, "<a href=\"x\">&.txt"));
+    // href: URL-encoded, so no HTML-special byte reaches the attribute at all
+    assert(contains(html, "href=\"/%3Ca%20href%3D%22x%22%3E%26.txt\""));
     std::cout << "[OK] generate escapes a hostile filename (no XSS)" << std::endl;
+}
+
+static void test_generate_url_encodes_href()
+{
+    // The bug this test exists for: without url_encode the href reads
+    // href="/a b#c.txt" -- the space is invalid and "#c.txt" becomes a fragment,
+    // so the browser requests "/a b" and the link is dead.
+    std::string html;
+    DirectoryLister::generate(ROOT + "/", "/", html);
+    assert(contains(html, "href=\"/a%20b%23c.txt\""));
+    assert(!contains(html, "href=\"/a b#c.txt\""));
+    // display text keeps the readable name -- the two encodings are independent
+    assert(contains(html, ">a b#c.txt</a>"));
+    std::cout << "[OK] generate URL-encodes the href, not the display text" << std::endl;
 }
 
 static void test_generate_empty_directory()
@@ -181,6 +208,24 @@ static void test_generate_escapes_uri()
     std::cout << "[OK] generate escapes the URI in the page heading" << std::endl;
 }
 
+static void test_generate_parent_link_at_root()
+{
+    // At the location root there is no servable parent, so no "../" row.
+    std::string html;
+    DirectoryLister::generate(ROOT + "/", "/", html);
+    assert(!contains(html, "<a href=\"../\">"));
+    std::cout << "[OK] generate omits the parent link at the location root" << std::endl;
+}
+
+static void test_generate_parent_link_below_root()
+{
+    // Below the root the parent is a real location, so the row is present.
+    std::string html;
+    DirectoryLister::generate(ROOT + "/sub/", "/sub/", html);
+    assert(contains(html, "<a href=\"../\">../</a>"));
+    std::cout << "[OK] generate keeps the parent link below the root" << std::endl;
+}
+
 int main()
 {
     setup_fixtures();
@@ -199,8 +244,11 @@ int main()
     test_generate_directory_trailing_slash();
     test_generate_href_is_uri_not_diskpath();
     test_generate_escapes_hostile_name();
+    test_generate_url_encodes_href();
     test_generate_empty_directory();
     test_generate_escapes_uri();
+    test_generate_parent_link_at_root();
+    test_generate_parent_link_below_root();
 
     teardown_fixtures();
 
