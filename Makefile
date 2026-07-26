@@ -17,6 +17,7 @@ SRCS = \
 	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
+	src/HttpStatus.cpp \
 	tests/test_router.cpp \
 	tests/test_FileUtils.cpp \
 	tests/test_GetHandler.cpp \
@@ -39,6 +40,7 @@ INCLUDES = \
 	includes/CgiHandler.hpp \
 	includes/DirectoryLister.hpp \
 	includes/FileUtils.hpp \
+	includes/HttpStatus.hpp \
 
 all: $(NAME)
 
