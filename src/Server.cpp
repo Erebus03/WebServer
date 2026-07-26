@@ -353,8 +353,50 @@ static std::string reasonPhrase(int code) {
     }
 }
 
+static std::string toLowerCopy(const std::string& s) {
+    std::string out = s;
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = static_cast<char>(tolower(static_cast<unsigned char>(out[i])));
+    return out;
+}
+
+// Some failures make the byte stream itself untrustworthy: after a malformed
+// request we do not know where it ended, and after a timeout or a size cap
+// there is unread garbage still queued. Reusing such a connection would frame
+// the NEXT request out of leftovers. 501 is not in that class — it is a normal
+// answer to a well-formed request, so the connection may persist.
+static bool statusForcesClose(int code) {
+    switch (code) {
+        case 400:   // framing unknown
+        case 408:   // we gave up mid-request
+        case 413:   // body cut short by the cap
+        case 431:   // headers cut short by the cap
+            return true;
+        default:
+            return false;
+    }
+}
+
+// RFC 9112 §9.3. HTTP/1.1 is persistent unless told otherwise; HTTP/1.0 is the
+// reverse and needs an explicit opt-in. `Connection` may carry a list
+// ("keep-alive, Upgrade"), hence substring matching rather than equality.
+static bool requestWantsKeepAlive(const HttpRequest& request) {
+    std::map<std::string, std::string>::const_iterator it =
+        request.headers.find("connection");
+    const std::string value =
+        (it != request.headers.end()) ? toLowerCopy(it->second) : "";
+
+    if (value.find("close") != std::string::npos)
+        return false;
+    if (request.version == "HTTP/1.0")
+        return value.find("keep-alive") != std::string::npos;
+    return true;                                   // HTTP/1.1 default
+}
+
 void Server::_startErrorResponse(Client* client, int status_code) {
     const std::string reason = reasonPhrase(status_code);
+    client->keep_alive = !statusForcesClose(status_code) &&
+                         requestWantsKeepAlive(client->request);
 
     std::string body;
     // Prefer the operator's page when the config names one for this code.
@@ -378,7 +420,9 @@ void Server::_startErrorResponse(Client* client, int status_code) {
     head << "HTTP/1.1 " << status_code << " " << reason << "\r\n"
          << "Content-Type: text/html\r\n"
          << "Content-Length: " << body.size() << "\r\n"
-         << "Connection: close\r\n"
+         // Content-Length is what makes reuse possible at all: without a length
+         // the client could only find the end of the body by us closing.
+         << "Connection: " << (client->keep_alive ? "keep-alive" : "close") << "\r\n"
          << "\r\n";
 
     const std::string wire = head.str() + body;
@@ -565,8 +609,17 @@ void Server::_handleClientWrite(int client_fd) {
         client->last_send_progress = std::time(NULL);  // progress, not attempts
 
     if (client->bytes_sent >= client->output_buf.size()) {
-        std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
-        _removeClient(client_fd);
+        if (client->keep_alive) {
+            // Recycle instead of destroy. state goes back to READING, which is
+            // what makes _rebuildPollFds ask for POLLIN again — the event mask
+            // follows the state machine, so a connection can cycle
+            // READING -> SENDING -> READING indefinitely.
+            std::cout << "Response sent to client " << client_fd << ", keeping connection alive" << std::endl;
+            client->resetForNextRequest();
+        } else {
+            std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
+            _removeClient(client_fd);
+        }
     }
 }
 // void Server::_handleClientWrite(int client_fd) {

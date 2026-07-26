@@ -166,8 +166,11 @@ Walk this chain in your head until it's reflex — it's the #1 interview questio
 8. **`poll()` reports `POLLOUT`** (we only ask for it when output is pending)
    and **`send()`** pushes as much as the kernel will take; `bytes_sent`
    remembers our position; repeat until drained.
-9. **Connection closes** (we close after the response for now; keep-alive is a
-   later refinement), the `Client` is destroyed, the fd removed from the map.
+9. **Connection is recycled or closed.** If the request permitted keep-alive and
+   the status did not poison the stream, `resetForNextRequest()` clears the
+   per-request state and the client goes back to `READING` — same fd, same
+   `Client`, step 4 again. Otherwise the `Client` is destroyed and the fd
+   removed from the map.
 
 ---
 
@@ -702,6 +705,70 @@ and assume it all went out work perfectly in local tests (loopback never
 fills) and lose data the moment a real, slow network appears. Evaluators
 simulate exactly that.
 
+#### Keep-alive — when the response ends but the connection does not
+
+In HTTP/1.0 one TCP connection carried one request. A page with 20 images meant
+21 connections, each paying a three-way handshake — a full round trip — before
+a single byte of HTTP moved. On a 100 ms link that is two seconds of pure
+waiting. HTTP/1.1 made connections **persistent by default**; `Connection:
+close` is the opt-out. HTTP/1.0 is the reverse: closed by default, and
+`Connection: keep-alive` is an explicit opt-in.
+
+So a drained `output_buf` no longer means "destroy the client":
+
+```cpp
+if (client->bytes_sent >= client->output_buf.size()) {
+    if (client->keep_alive) client->resetForNextRequest();   // recycle
+    else                    _removeClient(client_fd);        // destroy
+}
+```
+
+**What makes reuse possible at all is `Content-Length`.** Without a declared
+length the only way a client can know a body ended is us closing the socket —
+that is *why* HTTP/1.0 closed every time. Framing every response with a length
+is the precondition for persistence, not a detail.
+
+**Two things decide `keep_alive`,** and both must agree:
+
+1. *Does the client want it?* HTTP/1.1 unless it said `close`; HTTP/1.0 only if
+   it said `keep-alive`. The header can be a list (`keep-alive, Upgrade`), so we
+   substring-match rather than compare.
+2. *Is the stream still trustworthy?* `statusForcesClose()` — after **400** we
+   do not know where the bad request ended; after **408**, **413** or **431**
+   there is unread garbage still queued. Reusing those connections would frame
+   the *next* request out of leftovers. **501** is not in that class: it is a
+   normal answer to a well-formed request, so it may persist.
+
+**`resetForNextRequest()` must clear everything.** A stale header in `request`
+or a stale byte in `input_buf` does not cause a crash — it silently corrupts
+the *next* request, which is far worse to debug. Note it also zeroes
+`request_start`, handing the idle gap between requests back to the idle clock;
+leaving it set would make the request deadline fire on a perfectly healthy
+parked connection.
+
+**This is why the POLLIN fix had to land first.** A connection now cycles
+`READING → SENDING → READING` indefinitely instead of dying after one response,
+so the event mask tracking `state` stops being a nicety and becomes the thing
+that keeps the loop asleep between requests.
+
+**Known gap — pipelining.** `resetForNextRequest()` *clears* `input_buf`
+instead of removing just the finished request from its front, because
+`HttpParser::parse()` does not report how many bytes it consumed. A client that
+pipelines (sends request 2 before reading response 1) loses request 2; it then
+waits, the idle clock closes the connection, and it retries on a fresh one —
+the standard recovery path, but a real cost. The honest alternative would be
+guessing where the request ended, which means re-implementing the parser inside
+the read handler: exactly the mistake §5.4 exists to prevent. It is fixed the
+day `parse()` returns a consumed count.
+
+**Measured:** three HTTP/1.1 requests over **one** TCP connection
+(`num_connects` = 1,0,0); `Connection: close` and HTTP/1.0 each force three
+connections; HTTP/1.0 *with* `keep-alive` reuses again. Two sequential requests
+with different `Host` values on one connection correctly select different
+virtual hosts — proof that per-request state really is cleared. A parked
+kept-alive connection is reaped by the idle clock at t+61s, not by the request
+deadline.
+
 ### 5.6 Removing — `_removeClient(client_fd)`
 
 ```cpp
@@ -822,6 +889,7 @@ The fields that earn their existence:
 | `last_activity` | timestamp refreshed on reads; fuel for the **idle** clock in `_checkTimeouts` |
 | `request_start` | when the current request's first byte arrived, 0 if none; never refreshed, which is what makes the **request deadline** catch a slow-loris (§5.7) |
 | `last_send_progress` | when `send()` last actually moved bytes; powers the **send-stall** clock, which catches a peer that stopped reading without punishing one that is merely slow (§5.7) |
+| `keep_alive` | whether to recycle this connection once the response drains; decided at framing time from the request's version + `Connection` header and the status code (§5.5) |
 | `cgi_pipe_fd`, `cgi_pid` | pre-wired seats for CGI (Phase 5): the child's stdout pipe joins the same `poll()`, the pid feeds `waitpid` |
 | `server_cfg` | which server block accepted this client (non-owning) |
 

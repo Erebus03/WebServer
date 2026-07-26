@@ -48,6 +48,10 @@ public:
     // PROGRESS, not on attempts — see isSendStalled().
     time_t  last_send_progress;
 
+    // Reuse this connection once the current response has drained? Decided when
+    // the response is framed, from the request's version and Connection header.
+    bool    keep_alive;
+
     // --- config + parsed data ---
     ServerConfig*  server_cfg;  // server block that accepted this client; never owns
 
@@ -81,6 +85,12 @@ public:
     // Enter SENDING with the write-side cursor and clock reset. Every path that
     // queues a response goes through here so the stall clock can't be forgotten.
     void beginSending();
+
+    // Recycle a live connection for the next request instead of destroying it.
+    // Clears every piece of per-request state so nothing leaks across requests —
+    // a stale byte in input_buf or a stale header in `request` would corrupt the
+    // next one.
+    void resetForNextRequest();
 
 };
 

@@ -15,6 +15,7 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
       last_activity(std::time(NULL)),
       request_start(0),
       last_send_progress(0),
+      keep_alive(false),
       server_cfg(NULL)
 {
     // HttpRequest is a plain struct with no constructor, so its scalars are
@@ -42,4 +43,27 @@ void Client::beginSending() {
     state = SENDING;
     bytes_sent = 0;
     last_send_progress = std::time(NULL);
+}
+
+void Client::resetForNextRequest() {
+    // KNOWN GAP: input_buf is cleared rather than having just the finished
+    // request removed from its front, because HttpParser::parse() does not
+    // report how many bytes it consumed. A client that PIPELINES (sends request
+    // 2 before reading response 1) loses request 2 here. It then waits, our idle
+    // clock closes the connection, and the client retries on a fresh one — the
+    // standard recovery path, but a real cost. Fixed the day parse() returns a
+    // consumed count; until then clearing is the only honest option, since
+    // guessing where the request ended would mean re-implementing the parser.
+    input_buf.clear();
+    output_buf.clear();
+    bytes_sent = 0;
+    last_send_progress = 0;         // not sending any more
+
+    request = HttpRequest();        // drop every header/body of the old request
+    request.state = READING_REQUEST_LINE;
+    request.is_complete = false;
+
+    request_start = 0;              // no request in flight; idle clock owns this gap
+    last_activity = std::time(NULL);
+    state = READING;
 }
