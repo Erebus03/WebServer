@@ -29,6 +29,7 @@ public:
 
     // connection identity
     int          fd;
+    int          listen_fd;       // socket we were accepted on; picks the vhost candidates
     int          cgi_pipe_fd;     // CGI stdout pipe read end; -1 if none
     pid_t        cgi_pid;         // CGI child pid for waitpid(); -1 if none
     std::string  remote_address;
@@ -54,7 +55,7 @@ public:
                                 // PROVISIONAL: location of parser state is a
                                 // B decision — may move into Request later.
 
-    Client(int socket_fd, const std::string& remote_addr);
+    Client(int socket_fd, int accepted_on, const std::string& remote_addr);
 
     bool isTimedOut(time_t timeout_seconds) const;
 

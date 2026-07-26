@@ -128,20 +128,38 @@ void Server::stop() {
 }
 
 void Server::_createListenSockets() {
+    // host:port -> listen fd, so a second server block on an endpoint we already
+    // bound joins that socket instead of calling bind() again. Binding twice on
+    // the same address fails with EADDRINUSE (SO_REUSEADDR does not permit it),
+    // which used to drop every virtual host after the first one, silently.
+    std::map<std::string, int> endpoint_to_fd;
+
     for (size_t i = 0; i < config.size(); ++i) {
         const ServerConfig& server = config[i];
 
+        std::stringstream key;
+        key << server.host << ":" << server.port;
+        const std::string endpoint = key.str();
+
+        std::map<std::string, int>::iterator known = endpoint_to_fd.find(endpoint);
+        if (known != endpoint_to_fd.end()) {
+            listen_fd_to_server_idxs[known->second].push_back(i);
+            std::cout << "  + virtual host on " << endpoint << std::endl;
+            continue;
+        }
+
         int sock = _createListeningSocket(server.host, server.port);
         if (sock < 0) {
-            std::cerr << "Failed to create socket for " << server.host << ":" << server.port << std::endl;
+            std::cerr << "Failed to create socket for " << endpoint << std::endl;
             // Continue with other servers, don't exit
             continue;
         }
-        
+
         listening_sockets.push_back(sock);
-        listen_fd_to_server_idx[sock] = i;
-        
-        std::cout << "Listening on " << server.host << ":" << server.port << std::endl;
+        listen_fd_to_server_idxs[sock].push_back(i);
+        endpoint_to_fd[endpoint] = sock;
+
+        std::cout << "Listening on " << endpoint << std::endl;
     }
 }
 
@@ -233,7 +251,7 @@ void Server::_handlePollEvents(const std::vector<struct pollfd>& pollfds) {
         
         int fd = pollfds[i].fd;
 
-        if (listen_fd_to_server_idx.count(fd)) {
+        if (listen_fd_to_server_idxs.count(fd)) {
             if (pollfds[i].revents & POLLIN) _acceptNewClient(fd);
             if (pollfds[i].revents & (POLLERR | POLLNVAL))
                 std::cerr << "[fatal] listen fd " << fd << " went bad" << std::endl;
@@ -274,17 +292,18 @@ void Server::_acceptNewClient(int listen_fd) {
     ss << ipv4ToString(client_addr.sin_addr.s_addr) << ":" << ntohs(client_addr.sin_port);
     std::string remote_addr = ss.str();
     
-    Client* client = new Client(client_fd, remote_addr);
+    Client* client = new Client(client_fd, listen_fd, remote_addr);
 
-    // Bind the client to the server block that owns this listening socket, so
-    // per-server settings (client_max_body_size, error_pages) are available
-    // from the very first byte instead of being hard-coded in the read path.
+    // Start on this endpoint's default server (first block in config order) so
+    // per-server settings (client_max_body_size, error_pages) are available from
+    // the very first byte, before any header has been read. _resolveServerConfig
+    // narrows this to the right virtual host once Host is parsed.
     // `config` is filled once in initialize() and never resized afterwards, so
     // taking a pointer into it is safe for the client's lifetime.
-    std::map<int, int>::iterator sit = listen_fd_to_server_idx.find(listen_fd);
-    if (sit != listen_fd_to_server_idx.end() &&
-        sit->second >= 0 && static_cast<size_t>(sit->second) < config.size())
-        client->server_cfg = &config[sit->second];
+    std::map<int, std::vector<size_t> >::iterator sit =
+        listen_fd_to_server_idxs.find(listen_fd);
+    if (sit != listen_fd_to_server_idxs.end() && !sit->second.empty())
+        client->server_cfg = &config[sit->second[0]];
 
     clients[client_fd] = client;
     
@@ -371,6 +390,51 @@ bool Server::_enforceReadLimits(Client* client) {
     return true;
 }
 
+// "Example.COM:8080" -> "example.com". The port is not part of the name, and
+// host names are case-insensitive (RFC 9110 §4.2.3).
+static std::string hostNameOnly(const std::string& raw) {
+    const size_t colon = raw.find(':');
+    std::string name = (colon == std::string::npos) ? raw : raw.substr(0, colon);
+    for (size_t i = 0; i < name.size(); ++i)
+        name[i] = static_cast<char>(tolower(static_cast<unsigned char>(name[i])));
+    return name;
+}
+
+void Server::_resolveServerConfig(Client* client) {
+    std::map<int, std::vector<size_t> >::const_iterator sit =
+        listen_fd_to_server_idxs.find(client->listen_fd);
+    if (sit == listen_fd_to_server_idxs.end() || sit->second.empty())
+        return;                                   // keep whatever accept() chose
+    const std::vector<size_t>& candidates = sit->second;
+
+    // Default server for this endpoint: answers when Host is absent (HTTP/1.0)
+    // or names something no server_name claims.
+    client->server_cfg = &config[candidates[0]];
+    if (candidates.size() == 1)
+        return;                                   // nothing to disambiguate
+
+    // The parser lowercases header names, so "host" is the key regardless of
+    // how the client capitalised it.
+    std::map<std::string, std::string>::const_iterator h =
+        client->request.headers.find("host");
+    if (h == client->request.headers.end())
+        return;
+
+    const std::string wanted = hostNameOnly(h->second);
+    if (wanted.empty())
+        return;
+
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const ServerConfig& srv = config[candidates[i]];
+        for (size_t n = 0; n < srv.server_names.size(); ++n) {
+            if (hostNameOnly(srv.server_names[n]) == wanted) {
+                client->server_cfg = &config[candidates[i]];
+                return;
+            }
+        }
+    }
+}
+
 void Server::_processRequest(Client* client) {
     // Integration seam. Reached only for a request the parser called COMPLETE,
     // exactly once per request. Dispatcher.hpp is still empty, so until it has
@@ -425,6 +489,13 @@ void Server::_handleClientRead(int client_fd) {
         _startErrorResponse(client, 400);
         return;
     }
+
+    // Headers are in as soon as the parser leaves the header section, so settle
+    // the virtual host here rather than at COMPLETE — that way the body is
+    // accumulated under the right server's client_max_body_size, not the
+    // default server's. Idempotent, so calling it on every recv is harmless.
+    if (client->request.state == READING_BODY || client->request.state == COMPLETE)
+        _resolveServerConfig(client);
 
     // The gate. A partial request stops here and waits for the next POLLIN —
     // this is what makes a request split across TCP segments produce one

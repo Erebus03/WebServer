@@ -4,8 +4,9 @@
 // Initializer list is in member-declaration order (avoids -Wreorder).
 // input_buf, output_buf, request, response, parser are intentionally omitted —
 // they default-construct correctly on their own.
-Client::Client(int socket_fd, const std::string& remote_addr)
+Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
     : fd(socket_fd),
+      listen_fd(accepted_on),
       cgi_pipe_fd(-1),
       cgi_pid(-1),
       remote_address(remote_addr),
