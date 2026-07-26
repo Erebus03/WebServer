@@ -25,6 +25,7 @@ SRCS = \
 	tests/test_DirectoryLister.cpp \
 	tests/test_HttpStatus.cpp \
 	tests/test_http_parser.cpp \
+	tests/test_DeleteHandler.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
