@@ -4,19 +4,17 @@
 #include <string>
 #include "types.hpp"   // Config, ServerConfig, LocationConfig
 
+// Robust, token-based configuration parser.
+//
+// parse() never throws and never crashes: on ANY malformed input it prints a
+// diagnostic (with line number) to stderr and returns an EMPTY Config. Callers
+// treat an empty result as "no valid configuration" and fail closed.
 class ConfigParser {
 public:
     ConfigParser();
     ~ConfigParser();
 
     Config parse(const std::string& config_file);
-
-private:
-    void trim(std::string& str);
-    void parseSize(const std::string& size_str, size_t& result);
-    void parseServerLine(const std::string& line, ServerConfig& server);
-    void parseLocationLine(const std::string& line, LocationConfig& location);
-
 };
 
 #endif
