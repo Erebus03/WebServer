@@ -476,10 +476,10 @@ O(n) — and we're already O(n) inside `poll()` itself, so it changes nothing
 asymptotically while being impossible to get out of sync. Simplicity chosen
 deliberately, not by laziness.
 
-The subtle line — arguably the most important line in the file:
+The subtle lines — arguably the most important in the file:
 
 ```cpp
-pfd.events = POLLIN;                                  // always want to read
+pfd.events = (client->state == Client::READING) ? POLLIN : 0;
 if (client->bytes_sent < client->output_buf.size())
     pfd.events |= POLLOUT;                            // ONLY if data is pending
 ```
@@ -491,6 +491,33 @@ know, we have nothing to say), and the loop would spin at 100% CPU doing
 nothing. Requesting write-readiness **only when we actually have bytes queued**
 is what turns the loop from a busy-wait into a true sleep. This exact bug —
 "my server idles at 100% CPU" — is one of the most common webserv failures.
+
+**Why not always ask for POLLIN either?** Same trap, second door — and this one
+we walked into and had to measure our way out of.
+
+`poll()` is **level-triggered**: it re-reports a condition for as long as the
+condition *holds*, not once when it changes. So the rule is absolute:
+
+> Never ask poll about a condition you are not going to act on.
+
+`_handleClientRead` opens with a state guard — it refuses to `recv` unless the
+client is `READING`, so that a pipelined request can't be spliced into the one
+we're still answering (§5.4). But refusing to read does not make the bytes go
+away. They sit in the kernel receive buffer, `POLLIN` stays asserted, `poll()`
+returns instantly forever, and the read handler returns instantly forever.
+
+Measured, on a client stuck in `SENDING` that had pipelined one extra request:
+**287 CPU ticks per 3 seconds — 96% of a core, from one connection.** No
+bandwidth, no cleverness: a single socket saturating a CPU. Gating `POLLIN` on
+`state == READING` took it to **0**.
+
+The general lesson is worth more than the fix: *a state guard in a handler and
+the event mask that wakes that handler must agree.* Guarding one without the
+other converts a correctness fix into a denial of service.
+
+`POLLERR`/`POLLHUP`/`POLLNVAL` are reported **regardless of `events`**, so a
+socket we're not reading still tells us when the peer hangs up. That's why
+`events = 0` is safe rather than blind.
 
 #### `_handlePollEvents()` — dispatch, and the use-after-free dance
 
@@ -719,6 +746,22 @@ So there are two clocks, measuring genuinely different things:
 |---|---|---|
 | `isTimedOut(60)` | "Have you sent me *anything* lately?" | **Yes** — that's correct here |
 | `isRequestOverdue(30)` | "You began a request 30s ago. Where is it?" | **Never** — that's the point |
+| `isSendStalled(30)` | "Your response hasn't moved a byte in 30s." | On **progress**, not attempts |
+
+**The mirror-image attack: slow read.** A client can also send a *perfectly
+valid* request and then simply never read the response. The kernel's send
+buffer fills, `POLLOUT` stops arriving, and the connection sits in `SENDING`
+forever holding an fd. Same denial of service, opposite direction.
+
+`isSendStalled` measures time since the last **successful** `send()` — the
+moment bytes actually moved — not total response time. That distinction is
+load-bearing: a 100 MB file to a phone on 3G legitimately takes minutes, and a
+total-time deadline would murder it. Only a peer that has stopped draining
+entirely trips this. (`last_send_progress` is updated in `_handleClientWrite`
+when `n > 0`; `beginSending()` seeds it so no response path can forget to.)
+
+We drop such a client without a response — framing a 408 would be pointless,
+since it would stall in exactly the same queue the current response is stuck in.
 
 `request_start` is stamped on the **first byte of a request** and left alone
 afterwards. Dribbling cannot move it. (It resets to 0 when the request
@@ -749,8 +792,10 @@ returned `void`, so the modern `it = map.erase(it)` idiom doesn't even exist
 for us.) Two passes cost nothing and are immune by construction.
 
 **Measured, not assumed:** a client dribbling one byte every 5s receives its
-408 at exactly **t+30s**, while a client that connects and says nothing at all
-is reaped by the idle clock at **t+61s** — different paths, both correct.
+408 at exactly **t+30s**; a client that connects and says nothing at all is
+reaped by the idle clock at **t+61s**; a client that stops reading its response
+is dropped by the stall clock at **t+30s**; and a slow-but-progressing client
+draining 6 MB over 46s is **not** touched. Four paths, four correct outcomes.
 nginx draws the same distinction: `keepalive_timeout` vs
 `client_header_timeout` / `client_body_timeout`. Both values are policy
 constants here, trivially movable to the config later.
@@ -776,6 +821,7 @@ The fields that earn their existence:
 | `state` (READING → PROCESSING → SENDING → …) | which phase of its life this connection is in; drives what events we care about |
 | `last_activity` | timestamp refreshed on reads; fuel for the **idle** clock in `_checkTimeouts` |
 | `request_start` | when the current request's first byte arrived, 0 if none; never refreshed, which is what makes the **request deadline** catch a slow-loris (§5.7) |
+| `last_send_progress` | when `send()` last actually moved bytes; powers the **send-stall** clock, which catches a peer that stopped reading without punishing one that is merely slow (§5.7) |
 | `cgi_pipe_fd`, `cgi_pid` | pre-wired seats for CGI (Phase 5): the child's stdout pipe joins the same `poll()`, the pid feeds `waitpid` |
 | `server_cfg` | which server block accepted this client (non-owning) |
 

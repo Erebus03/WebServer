@@ -44,6 +44,9 @@ public:
     // When the first byte of the CURRENT request arrived; 0 = none in flight.
     // Deliberately not refreshed as more bytes come in — see isRequestOverdue().
     time_t  request_start;
+    // Last time send() actually moved bytes; 0 = not sending. Refreshed on
+    // PROGRESS, not on attempts — see isSendStalled().
+    time_t  last_send_progress;
 
     // --- config + parsed data ---
     ServerConfig*  server_cfg;  // server block that accepted this client; never owns
@@ -68,6 +71,16 @@ public:
     // FIRST byte, which is what makes it immune to a client that dribbles just
     // enough to keep isTimedOut() happy forever (slow-loris).
     bool isRequestOverdue(time_t deadline_seconds) const;
+
+    // A response that has stopped draining. Measures time since the last byte
+    // actually went out, NOT total response time — a big file to a genuinely
+    // slow client keeps making progress and must not be killed for being slow.
+    // Only a peer that has stopped reading entirely trips this.
+    bool isSendStalled(time_t stall_seconds) const;
+
+    // Enter SENDING with the write-side cursor and clock reset. Every path that
+    // queues a response goes through here so the stall clock can't be forgotten.
+    void beginSending();
 
 };
 

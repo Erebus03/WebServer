@@ -14,6 +14,7 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
       bytes_sent(0),
       last_activity(std::time(NULL)),
       request_start(0),
+      last_send_progress(0),
       server_cfg(NULL)
 {
     // HttpRequest is a plain struct with no constructor, so its scalars are
@@ -30,4 +31,15 @@ bool Client::isTimedOut(time_t timeout_seconds) const {
 bool Client::isRequestOverdue(time_t deadline_seconds) const {
     if (request_start == 0) return false;   // nothing in flight to be late
     return (std::time(NULL) - request_start) >= deadline_seconds;
+}
+
+bool Client::isSendStalled(time_t stall_seconds) const {
+    if (state != SENDING || last_send_progress == 0) return false;
+    return (std::time(NULL) - last_send_progress) >= stall_seconds;
+}
+
+void Client::beginSending() {
+    state = SENDING;
+    bytes_sent = 0;
+    last_send_progress = std::time(NULL);
 }

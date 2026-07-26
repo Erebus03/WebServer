@@ -227,12 +227,22 @@ void Server::_rebuildPollFds(std::vector<struct pollfd>& pollfds) {
     
     // Add client sockets
     for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
+        Client* client = it->second;
+
         struct pollfd pfd;
         pfd.fd = it->first;
-        pfd.events = POLLIN;  // Always ready to read
-        
-        Client* client = it->second;
-        // if (!client->isOutputBufferEmpty()) {
+
+        // Ask for POLLIN ONLY while we are actually willing to read. poll() is
+        // level-triggered: if a client pipelines a request while we are SENDING,
+        // those bytes sit unread in the kernel buffer and POLLIN stays asserted
+        // forever. Requesting it anyway means poll() returns instantly on every
+        // iteration while _handleClientRead's state guard declines to drain —
+        // a 100% CPU spin driven by a single connection. Measured at 96% of a
+        // core before this line existed.
+        // POLLERR/POLLHUP/POLLNVAL are reported regardless of `events`, so we
+        // still notice a hangup on a socket we are not reading.
+        pfd.events = (client->state == Client::READING) ? POLLIN : 0;
+
         if (client->bytes_sent < client->output_buf.size()) {
             pfd.events |= POLLOUT;  // Ready to write if we have data
         }
@@ -325,8 +335,12 @@ static const size_t MAX_HEADER_BYTES = 8192;
 // REQUEST: "you began a request this long ago and still have not finished it."
 // Anchored to the request's first byte and NEVER refreshed — a slow-loris keeps
 // the idle clock fresh by design, so only this one can catch it.
+// SEND_STALL: "your response has not moved a single byte in this long." Measured
+// from the last successful send, so a slow-but-progressing download is safe and
+// only a peer that stopped reading is dropped.
 static const time_t IDLE_TIMEOUT_SEC    = 60;
 static const time_t REQUEST_TIMEOUT_SEC = 30;
+static const time_t SEND_STALL_SEC      = 30;
 
 static std::string reasonPhrase(int code) {
     switch (code) {
@@ -369,8 +383,7 @@ void Server::_startErrorResponse(Client* client, int status_code) {
 
     const std::string wire = head.str() + body;
     client->output_buf.assign(wire.begin(), wire.end());
-    client->bytes_sent = 0;
-    client->state = Client::SENDING;
+    client->beginSending();
 
     // No request is being accumulated any more, so stop the request clock —
     // otherwise a client killed by the deadline would still look overdue while
@@ -548,6 +561,8 @@ void Server::_handleClientWrite(int client_fd) {
     }
 
     client->bytes_sent += n;
+    if (n > 0)
+        client->last_send_progress = std::time(NULL);  // progress, not attempts
 
     if (client->bytes_sent >= client->output_buf.size()) {
         std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
@@ -605,14 +620,18 @@ void Server::_checkTimeouts() {
     // Collect first, then act: _removeClient() erases from `clients`, which
     // would invalidate the iterator if done inside the loop.
     std::vector<int> overdue;   // began a request, never finished it -> 408
+    std::vector<int> stalled;   // stopped reading its response -> drop
     std::vector<int> idle;      // said nothing at all -> just drop
 
     for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
         Client* c = it->second;
-        // Deadline first: an overdue client is usually also "active" by the
-        // idle clock's reckoning, which is the whole reason it needs its own.
+        // Specific clocks before the general one: a client that is overdue or
+        // stalled usually still looks "active" to the idle clock, which is the
+        // whole reason each of these needs its own measurement.
         if (c->state == Client::READING && c->isRequestOverdue(REQUEST_TIMEOUT_SEC))
             overdue.push_back(it->first);
+        else if (c->isSendStalled(SEND_STALL_SEC))
+            stalled.push_back(it->first);
         else if (c->isTimedOut(IDLE_TIMEOUT_SEC))
             idle.push_back(it->first);
     }
@@ -625,6 +644,13 @@ void Server::_checkTimeouts() {
         // from a server crash at the other end. The write handler flushes it and
         // closes on the next POLLOUT.
         _startErrorResponse(it->second, 408);
+    }
+
+    for (size_t i = 0; i < stalled.size(); ++i) {
+        // No point framing an error: this peer has stopped reading, so anything
+        // we queue would stall exactly like the response already has.
+        std::cout << "Client " << stalled[i] << " stopped reading its response, closing connection" << std::endl;
+        _removeClient(stalled[i]);
     }
 
     for (size_t i = 0; i < idle.size(); ++i) {
