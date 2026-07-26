@@ -5,9 +5,6 @@
 #include <sstream>
 #include <algorithm>
 
-// Display text guard: neutralises the characters that have structural meaning
-// in an HTML document. Single left-to-right pass -- each input byte is examined
-// once and its output fixed immediately, so double-escaping cannot occur.
 std::string DirectoryLister::html_escape(const std::string& raw)
 {
     std::string result;
@@ -29,12 +26,6 @@ std::string DirectoryLister::html_escape(const std::string& raw)
     return result;
 }
 
-// href guard: a different context needs a different alphabet. HTML-escaping does
-// nothing for a space (invalid in a URL) or a '#' (truncates the link at the
-// fragment), so the name portion of every href is percent-encoded instead.
-// Everything outside RFC 3986's unreserved set becomes %XX.
-// NOTE: '/' is NOT unreserved and IS encoded -- callers must pass a bare
-// filename, never a path, and append any trailing slash after encoding.
 std::string DirectoryLister::url_encode(const std::string& raw)
 {
     static const char HEX[] = "0123456789ABCDEF";
@@ -42,8 +33,6 @@ std::string DirectoryLister::url_encode(const std::string& raw)
 
     for (size_t i = 0; i < raw.size(); i++)
     {
-        // cast first: char may be signed, and a high UTF-8 byte must index HEX
-        // as 0..255, not as a negative number.
         unsigned char c = static_cast<unsigned char>(raw[i]);
 
         if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
@@ -72,9 +61,6 @@ bool DirectoryLister::read_entries(const std::string& diskPath, std::vector<std:
     dirent *entry;
     while ((entry = readdir(dir)) != NULL)
     {
-        // "." is never useful in a listing; ".." is emitted by render() as a
-        // single hardcoded parent row, so it is dropped here too. Both are
-        // handled in exactly one place each.
         std::string name(entry->d_name);
         if (name == "." || name == "..")
             continue;
@@ -93,9 +79,6 @@ std::string DirectoryLister::render(const std::string& diskPath, const std::stri
     html += html_escape(uri);
     html += "</h1>\n";
 
-    // No parent link at the location root: "/.." is not a servable location, so
-    // the link would either escape the served space or produce a confusing
-    // redirect. Real servers omit it here.
     if (uri != "/")
         html += "<a href=\"../\">../</a>\n";
 
@@ -106,16 +89,8 @@ std::string DirectoryLister::render(const std::string& diskPath, const std::stri
 
         struct stat st = {};
         if (stat(fullPath.c_str(), &st) != 0)
-            continue;   // deliberate: an entry we cannot stat (deleted mid-loop,
-                        // or directory permissions) is dropped rather than shown
-                        // with unknown columns. One bad entry never kills the page.
+            continue;
 
-        // Two encodings for two contexts, applied to the same name:
-        //   display text -> html_escape   (guards the document structure)
-        //   href         -> url_encode    (guards the URL structure)
-        // They are not interchangeable and neither substitutes for the other.
-        // The trailing slash is appended AFTER encoding, because url_encode
-        // would turn a '/' into %2F and break every directory link.
         std::string name = *it;
         std::string encodedName = url_encode(*it);
         std::string sizeCol;
@@ -124,7 +99,7 @@ std::string DirectoryLister::render(const std::string& diskPath, const std::stri
         {
             name += '/';
             encodedName += '/';
-            sizeCol = "-";      // st_size on a directory is meaningless to a user
+            sizeCol = "-";
         }
         else
         {
@@ -132,8 +107,6 @@ std::string DirectoryLister::render(const std::string& diskPath, const std::stri
             ss << st.st_size;
             sizeCol = ss.str();
         }
-        // No date column: deliberate scope cut. st_mtime + strftime/localtime
-        // if it is wanted later; it is cosmetic, not correctness.
 
         std::string safeName = html_escape(name);
         html += "<a href=\"";
@@ -156,10 +129,6 @@ bool DirectoryLister::generate(const std::string& diskPath, const std::string& u
     if (!read_entries(diskPath, names))
         return false;
 
-    // readdir order is arbitrary and differs between machines. Sorting here is
-    // what makes the output deterministic, and therefore testable.
-    // Plain alphabetical, deliberately: directories-first is nicer but not
-    // worth the extra branch today.
     std::sort(names.begin(), names.end());
     outHtml = render(diskPath, uri, names);
     return true;
