@@ -35,16 +35,13 @@ private:
     
 
     /*
-        Important behavioral note about the current design:
-        Because listen_fd_to_server_idx maps a listen fd to a single ServerConfig index,
-        the current code assumes each listening socket is owned by exactly one ServerConfig.
-        That works if we create a distinct socket per server block/listen directive,
-        but it’s limiting when multiple server blocks should share the same port and be
-        selected at request-time via the Host header.
-
+        One socket per unique host:port, NOT one per server block. Several server
+        blocks may share an endpoint and be told apart by the Host header, so a
+        listen fd maps to every block that asked for that endpoint, in config
+        order. The first entry is that endpoint's default server: it answers when
+        Host is absent (HTTP/1.0) or matches no server_name.
     */
-    std::map<int, int> listen_fd_to_server_idx;     // listen_fd -> ServerConfig index
-    //mapping a single listening socket fd to a single ServerConfig index
+    std::map<int, std::vector<size_t> > listen_fd_to_server_idxs;
 
     // Client connections
     std::map<int, Client*> clients;                  // client_fd -> Client*
@@ -67,6 +64,18 @@ private:
     void _handleCgiPipeRead(int cgi_fd);
     void _handleError(int fd);
     
+    // Read-side request pipeline
+    // Caps on how much we accumulate before the parser says COMPLETE. Returns
+    // false when a limit was hit and an error response is already queued.
+    bool _enforceReadLimits(Client* client);
+    // Picks the server block by Host among those sharing the client's endpoint.
+    // Call once per request, after the parser reports COMPLETE.
+    void _resolveServerConfig(Client* client);
+    // Hand-off seam: runs exactly once per complete request.
+    void _processRequest(Client* client);
+    // Frames a status-only response into output_buf and flips to SENDING.
+    void _startErrorResponse(Client* client, int status_code);
+
     // Client lifecycle
     void _removeClient(int client_fd);
     void _checkTimeouts();

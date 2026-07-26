@@ -4,21 +4,7 @@
 #include <iostream>
 #include <cctype>
 #include <cstdlib>
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Design
-// ─────────────────────────────────────────────────────────────────────────────
-// Two phases:
-//   1) tokenize()  — split the whole file into tokens. '{', '}' and ';' are
-//      always their own tokens even when glued to text ("server{" -> server, {),
-//      comments (#..EOL) are stripped, everything else splits on whitespace.
-//      Each token carries its source line for diagnostics.
-//   2) parse the flat token stream with a tiny recursive descent.
-//
-// Any structural or value error throws a std::string (a formatted message with a
-// line number). ConfigParser::parse() catches it, reports it, and returns an
-// empty Config. This makes the parser fail-closed: a bad config yields zero
-// servers rather than a silently corrupt one.
+#include <limits>
 
 namespace { 
 
@@ -62,9 +48,18 @@ bool parseSize(const std::string& tok, size_t& out) {
     else if (suf == "G" || suf == "g")     mult = 1024UL * 1024UL * 1024UL;
     else                                   return false; // unknown suffix
 
+    // On overflow C++98 sets failbit and leaves `val` untouched, so a silent 0
+    // would be indistinguishable from a genuine "0". Check the stream instead.
     std::istringstream is(num);
     size_t val = 0;
     is >> val;
+    if (is.fail())
+        return false; // number too large for size_t
+
+    // val * mult would wrap; reject rather than store a wrong (smaller) limit.
+    if (mult > 1 && val > std::numeric_limits<size_t>::max() / mult)
+        return false;
+
     out = val * mult;
     return true;
 }
@@ -289,8 +284,11 @@ void applyLocationDirective(LocationConfig& l, const std::string& d,
 }
 
 // pos points just past "location". Parses "<path> { ... }".
+// Inheritance from the enclosing server is deliberately NOT applied here: at
+// this point the server block is still half-built. parseServer resolves it in
+// a second pass. `bodySet` reports whether this block set its own body size.
 LocationConfig parseLocation(const std::vector<Token>& toks, size_t& pos,
-                             const ServerConfig& srv) {
+                             bool& bodySet) {
     if (pos >= toks.size())
         fail("expected path after 'location'", lastLine(toks));
     const Token& pathTok = toks[pos];
@@ -302,7 +300,7 @@ LocationConfig parseLocation(const std::vector<Token>& toks, size_t& pos,
     ++pos;
     expect(toks, pos, "{");
 
-    bool bodySet = false;
+    bodySet = false;
     while (true) {
         if (pos >= toks.size())
             fail("unclosed 'location' block (missing '}')", lastLine(toks));
@@ -320,14 +318,6 @@ LocationConfig parseLocation(const std::vector<Token>& toks, size_t& pos,
         applyLocationDirective(loc, directive, args, dline, bodySet);
     }
 
-    // Inherit unset values from the enclosing server.
-    if (loc.root.empty())
-        loc.root = srv.root;
-    if (loc.index_files.empty())
-        loc.index_files = srv.index_files;
-    if (!bodySet)
-        loc.client_max_body_size = srv.client_max_body_size;
-
     return loc;
 }
 
@@ -336,6 +326,11 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
     ServerConfig srv = ServerConfig();
     srv.host = "0.0.0.0"; // defaults, overridden by 'listen'
     srv.port = 8080;
+
+    // 0 is a legal client_max_body_size ("reject every body"), so it cannot
+    // double as "unset". Track explicitness per location, parallel to
+    // srv.locations, rather than adding a field to the shared LocationConfig.
+    std::vector<bool> bodyExplicit;
 
     bool bodySet = false;
     while (true) {
@@ -346,7 +341,9 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
 
         if (t.text == "location") {
             ++pos;
-            srv.locations.push_back(parseLocation(toks, pos, srv));
+            bool locBodySet = false;
+            srv.locations.push_back(parseLocation(toks, pos, locBodySet));
+            bodyExplicit.push_back(locBodySet);
             continue;
         }
         if (t.text == "server")
@@ -367,6 +364,20 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
     if (!bodySet)
         srv.client_max_body_size = 1024UL * 1024UL; // 1M
 
+    // Second pass: resolve location inheritance only now that `srv` is final
+    // (all directives seen, all defaults applied). Doing this inside the loop
+    // above snapshots a half-built server, which makes the parse result depend
+    // on the order directives happen to appear in.
+    for (size_t i = 0; i < srv.locations.size(); ++i) {
+        LocationConfig& loc = srv.locations[i];
+        if (loc.root.empty())
+            loc.root = srv.root;
+        if (loc.index_files.empty())
+            loc.index_files = srv.index_files;
+        if (!bodyExplicit[i])
+            loc.client_max_body_size = srv.client_max_body_size;
+    }
+
     return srv;
 }
 
@@ -384,9 +395,7 @@ Config parseTokens(const std::vector<Token>& toks) {
     return config;
 }
 
-} // anonymous namespace
-
-// ─────────────────────────────────────────────────────────────────────────────
+}
 
 ConfigParser::ConfigParser() {}
 

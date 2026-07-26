@@ -4,17 +4,66 @@
 // Initializer list is in member-declaration order (avoids -Wreorder).
 // input_buf, output_buf, request, response, parser are intentionally omitted —
 // they default-construct correctly on their own.
-Client::Client(int socket_fd, const std::string& remote_addr)
+Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
     : fd(socket_fd),
+      listen_fd(accepted_on),
       cgi_pipe_fd(-1),
       cgi_pid(-1),
       remote_address(remote_addr),
       state(READING),
       bytes_sent(0),
       last_activity(std::time(NULL)),
+      request_start(0),
+      last_send_progress(0),
+      keep_alive(false),
       server_cfg(NULL)
-{}
+{
+    // HttpRequest is a plain struct with no constructor, so its scalars are
+    // indeterminate until we set them. The read handler branches on `state`,
+    // which makes leaving it uninitialised a real bug, not a style issue.
+    request.state = READING_REQUEST_LINE;
+    request.is_complete = false;
+}
 
 bool Client::isTimedOut(time_t timeout_seconds) const {
     return (std::time(NULL) - last_activity) >= timeout_seconds;
+}
+
+bool Client::isRequestOverdue(time_t deadline_seconds) const {
+    if (request_start == 0) return false;   // nothing in flight to be late
+    return (std::time(NULL) - request_start) >= deadline_seconds;
+}
+
+bool Client::isSendStalled(time_t stall_seconds) const {
+    if (state != SENDING || last_send_progress == 0) return false;
+    return (std::time(NULL) - last_send_progress) >= stall_seconds;
+}
+
+void Client::beginSending() {
+    state = SENDING;
+    bytes_sent = 0;
+    last_send_progress = std::time(NULL);
+}
+
+void Client::resetForNextRequest() {
+    // KNOWN GAP: input_buf is cleared rather than having just the finished
+    // request removed from its front, because HttpParser::parse() does not
+    // report how many bytes it consumed. A client that PIPELINES (sends request
+    // 2 before reading response 1) loses request 2 here. It then waits, our idle
+    // clock closes the connection, and the client retries on a fresh one — the
+    // standard recovery path, but a real cost. Fixed the day parse() returns a
+    // consumed count; until then clearing is the only honest option, since
+    // guessing where the request ended would mean re-implementing the parser.
+    input_buf.clear();
+    output_buf.clear();
+    bytes_sent = 0;
+    last_send_progress = 0;         // not sending any more
+
+    request = HttpRequest();        // drop every header/body of the old request
+    request.state = READING_REQUEST_LINE;
+    request.is_complete = false;
+
+    request_start = 0;              // no request in flight; idle clock owns this gap
+    last_activity = std::time(NULL);
+    state = READING;
 }

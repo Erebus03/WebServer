@@ -29,6 +29,7 @@ public:
 
     // connection identity
     int          fd;
+    int          listen_fd;       // socket we were accepted on; picks the vhost candidates
     int          cgi_pipe_fd;     // CGI stdout pipe read end; -1 if none
     pid_t        cgi_pid;         // CGI child pid for waitpid(); -1 if none
     std::string  remote_address;
@@ -40,12 +41,23 @@ public:
     size_t             bytes_sent;
 
     time_t  last_activity;
+    // When the first byte of the CURRENT request arrived; 0 = none in flight.
+    // Deliberately not refreshed as more bytes come in — see isRequestOverdue().
+    time_t  request_start;
+    // Last time send() actually moved bytes; 0 = not sending. Refreshed on
+    // PROGRESS, not on attempts — see isSendStalled().
+    time_t  last_send_progress;
+
+    // Reuse this connection once the current response has drained? Decided when
+    // the response is framed, from the request's version and Connection header.
+    bool    keep_alive;
 
     // --- config + parsed data ---
     ServerConfig*  server_cfg;  // server block that accepted this client; never owns
 
-    // waiting for chfoq
-    // Request        request;     // parsed request   (B's type — see header note)
+    // The parser writes here; the router reads here. `state` is the completeness
+    // signal the read handler gates on — see ParseState in types.hpp.
+    HttpRequest    request;
     // Response       response;    // response to send (B's type — see header note)
 
 
@@ -53,9 +65,32 @@ public:
                                 // PROVISIONAL: location of parser state is a
                                 // B decision — may move into Request later.
 
-    Client(int socket_fd, const std::string& remote_addr);
+    Client(int socket_fd, int accepted_on, const std::string& remote_addr);
 
+    // Silent for too long. Refreshed by activity, so it only catches connections
+    // that have genuinely gone quiet.
     bool isTimedOut(time_t timeout_seconds) const;
+
+    // Started a request and still hasn't finished it. Anchored to the request's
+    // FIRST byte, which is what makes it immune to a client that dribbles just
+    // enough to keep isTimedOut() happy forever (slow-loris).
+    bool isRequestOverdue(time_t deadline_seconds) const;
+
+    // A response that has stopped draining. Measures time since the last byte
+    // actually went out, NOT total response time — a big file to a genuinely
+    // slow client keeps making progress and must not be killed for being slow.
+    // Only a peer that has stopped reading entirely trips this.
+    bool isSendStalled(time_t stall_seconds) const;
+
+    // Enter SENDING with the write-side cursor and clock reset. Every path that
+    // queues a response goes through here so the stall clock can't be forgotten.
+    void beginSending();
+
+    // Recycle a live connection for the next request instead of destroying it.
+    // Clears every piece of per-request state so nothing leaks across requests —
+    // a stale byte in input_buf or a stale header in `request` would corrupt the
+    // next one.
+    void resetForNextRequest();
 
 };
 
