@@ -8,7 +8,6 @@ webserv
 *~
 mdFiles/UNDERSTANDING_GUIDE.md
 # Local-only entry point (each teammate keeps their own to avoid merge conflicts)
-src/main.cpp
 .idea/
 
 .mcp.json
