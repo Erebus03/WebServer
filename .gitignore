@@ -12,3 +12,4 @@ mdFiles/UNDERSTANDING_GUIDE.md
 src/main.cpp
 .idea/
 Makefile
+tests/
