@@ -156,12 +156,17 @@ Walk this chain in your head until it's reflex — it's the #1 interview questio
    (Puzzle-by-mail analogy: pieces arrive in envelopes over days; you keep a
    table (the buffer) where the partial puzzle stays assembled between
    deliveries. You never throw away progress because an envelope was small.)
-6. **Parse → route → handle** *(post-merge; today a hardcoded 200 fills in)* —
-   the response bytes are appended to `client->output_buf`.
-7. **`poll()` reports `POLLOUT`** (we only ask for it when output is pending)
+6. **Feed the parser.** Every `recv` hands the accumulated buffer to
+   `HttpParser`. It answers with a `ParseState`. Anything short of `COMPLETE`
+   means "come back with more bytes" and we return — **this is the gate**, and
+   it is why a request split across ten segments still produces exactly one
+   response. Once headers are in, `Host` selects the virtual host (§5.4.1).
+7. **Route → handle** *(`_processRequest`; answers 501 until the Dispatcher
+   exists)* — the response bytes are appended to `client->output_buf`.
+8. **`poll()` reports `POLLOUT`** (we only ask for it when output is pending)
    and **`send()`** pushes as much as the kernel will take; `bytes_sent`
    remembers our position; repeat until drained.
-8. **Connection closes** (we close after the response for now; keep-alive is a
+9. **Connection closes** (we close after the response for now; keep-alive is a
    later refinement), the `Client` is destroyed, the fd removed from the map.
 
 ---
@@ -381,6 +386,43 @@ frozen server. We set it on listen sockets AND on every accepted client fd
 (fds do not inherit non-blocking status through `accept()` on Linux — you must
 set it per-fd; know this, it's a classic gotcha).
 
+#### One socket per *endpoint*, not per server block — `_createListenSockets()`
+
+The plural function wraps the singular one, and the distinction it draws is
+worth understanding because getting it wrong is silent.
+
+A config may hold several `server { }` blocks that all say `listen 8080;` and
+differ only by `server_name`. That is the whole point of **virtual hosting**:
+one IP and port serving `alpha.test` and `bravo.test`, told apart by the
+request's `Host:` header. Ten sites, one socket.
+
+The naive loop — "for each server block, create a socket" — **cannot work**:
+
+```
+block 1: listen 8080  → socket, bind(0.0.0.0:8080)  ✓
+block 2: listen 8080  → socket, bind(0.0.0.0:8080)  ✗ EADDRINUSE
+```
+
+Two sockets cannot bind the same address and port. `SO_REUSEADDR` does *not*
+rescue you here — it only relaxes the `TIME_WAIT` restart case, not concurrent
+binding (that's the different and rarely-appropriate `SO_REUSEPORT`). So the
+second block fails, gets logged and skipped, and `server_name` quietly never
+does anything. Nothing crashes; the feature simply isn't there.
+
+The fix is to key sockets on the **endpoint**:
+
+```cpp
+std::map<std::string, int> endpoint_to_fd;      // "0.0.0.0:8080" -> fd
+// already bound this host:port? just add this block to its candidate list
+listen_fd_to_server_idxs[known->second].push_back(i);
+```
+
+`listen_fd_to_server_idxs` maps one listen fd to **every** server block that
+asked for that endpoint, in config order. First entry = that endpoint's
+**default server** (the one that answers when `Host` matches nothing). Which
+block actually handles a given request is decided later, per request, in
+§5.4.1 — because it depends on a header we haven't read yet at bind time.
+
 ### 5.2 The event loop — `run()`
 
 ```cpp
@@ -498,13 +540,48 @@ the door to a table; the door stays open behind them.)
 ### 5.4 Reading — `_handleClientRead(client_fd)`
 
 ```cpp
-char buffer[4096];
+if (client->state != Client::READING) return;      // state guard — see below
+char buffer[READ_CHUNK];
 ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
 if (n < 0)  { _handleError(client_fd); return; }   // NO errno check — rule!
 if (n == 0) { _removeClient(client_fd); return; }  // orderly close (FIN)
 client->input_buf.insert(client->input_buf.end(), buffer, buffer + n);
 client->last_activity = std::time(NULL);
+
+if (!_enforceReadLimits(client)) return;           // 431 / 413 already framed
+client->parser.parse(bytes, client->request);      // B owns all framing
+if (client->request.state == ERROR) { _startErrorResponse(client, 400); return; }
+if (client->request.state != COMPLETE) return;     // ← THE GATE
+client->state = Client::PROCESSING;
+_processRequest(client);
 ```
+
+**The shape is the lesson.** Read → feed parser → *only if the parser says
+complete* → route. An earlier version of this function appended a canned 200
+response after **every** `recv`. On a fast local connection it looked perfect.
+Split the request across two TCP segments — which any real network does — and
+the client got **two responses** for one request. The second is garbage framed
+onto the same connection.
+
+The bug was not the hardcoded response; it was that **routing lived in the read
+handler**. Any code that produces output per-`recv` is wrong by construction,
+because `recv` boundaries are meaningless. The gate is what makes segment count
+irrelevant: a partial request returns early and waits for the next `POLLIN`.
+
+**The state guard.** `if (client->state != Client::READING) return;` — a peer
+that pipelines (sends request 2 before reading response 1) hands us `POLLIN`
+while we are still `SENDING`. Appending those bytes into `input_buf` would
+splice a new request into the one being served. The `Client::state` field is
+what keeps the two halves of the connection from stepping on each other.
+
+**The limits** (`_enforceReadLimits`) run *before* the parser, because their
+whole job is bounding what we're willing to accumulate on behalf of a client
+who may never finish:
+- request line + headers over `MAX_HEADER_BYTES` (8 KB) → **431**. Not
+  config-driven on purpose: the config grammar has `client_max_body_size` and
+  no header-size directive, so a knob here would be one no `.conf` can reach.
+- total over header cap + `client_max_body_size` → **413**, from the resolved
+  server block (§5.4.1).
 
 **Why `recv` and not `read`?** Both are allowed and both work on sockets;
 `recv` is the socket-specific call (it has a flags parameter — `MSG_PEEK`
@@ -529,8 +606,50 @@ The 4 KB stack buffer is just a shuttle between kernel space and
 `input_buf` — its size only affects how many loop iterations a large upload
 takes, not correctness.
 
-*(Today the read handler appends a hardcoded "Hello World" response to
-output_buf — the marked placeholder that B's parser + C's router replace.)*
+*(Past the gate, `_processRequest()` is the hand-off seam. It currently answers
+**501 Not Implemented** — an honest placeholder rather than a fake 200 — until
+`Dispatcher` has an interface to call.)*
+
+### 5.4.1 Choosing the virtual host — `_resolveServerConfig(client)`
+
+§5.1 bound one socket per endpoint and kept **every** server block that claimed
+it. Now we pick one. The input is the `Host:` header, which is mandatory in
+HTTP/1.1 precisely so that virtual hosting can work — it's the client telling
+us *which site* it thinks it's talking to, on a connection where the IP and
+port cannot tell us.
+
+```cpp
+client->server_cfg = &config[candidates[0]];       // default server
+...
+if (hostNameOnly(srv.server_names[n]) == wanted) { // first match wins
+    client->server_cfg = &config[candidates[i]];
+```
+
+Three details that are easy to get wrong:
+
+- **Strip the port.** `Host: alpha.test:8080` names the host `alpha.test`. The
+  port is already known from the socket; comparing it against `server_name`
+  would never match.
+- **Case-insensitive.** Host names are case-insensitive (RFC 9110 §4.2.3), so
+  `Bravo.Test` in the config must match `bravo.test` on the wire. Both sides go
+  through `hostNameOnly()`, which lowercases.
+- **Always have a fallback.** Missing `Host` (an HTTP/1.0 client) or a name
+  nothing claims must still be served, by candidate 0 — the default server.
+  Returning an error there would break plain `curl http://127.0.0.1:8080/`.
+
+**Why it runs at `READING_BODY`, not only at `COMPLETE`.** The body limit
+(`client_max_body_size`) is per-server-block. If we waited until the whole
+request was in, we'd have accumulated the body under the *default* server's
+limit and only then discovered the request belonged to a vhost with a stricter
+one — enforcing it after the fact defeats the point. The parser leaves the
+header section as soon as headers are done, which is the earliest moment `Host`
+is knowable, so that's where the decision belongs. The call is idempotent, so
+running it on every subsequent `recv` costs nothing.
+
+**Interview framing:** "one socket, many sites, disambiguated by a header" is
+the entire idea of virtual hosting. The reason `Host` became mandatory in
+HTTP/1.1 is that IPv4 addresses ran short — you could no longer afford one IP
+per website.
 
 ### 5.5 Writing — `_handleClientWrite(client_fd)` and partial sends
 
@@ -582,24 +701,59 @@ no bandwidth at all. **Analogy:** customers who occupy every table for hours
 and never order. The fix is a house rule: idle too long, you're politely shown
 the door.
 
+#### One clock is not enough — and this is the subtle part
+
+The obvious defence is an **idle timeout**: `last_activity`, refreshed on every
+successful `recv`, and anyone silent for 60s gets dropped. That is necessary,
+and it is *not sufficient*.
+
+A real slow-loris does not go silent. It sends **one byte every 20 seconds** —
+just often enough to keep `last_activity` fresh. It is, by the idle clock's
+definition, a perfectly active client. It never times out. It holds an fd for
+as long as it likes. The defence measures the wrong thing: *the activity is the
+attack*.
+
+So there are two clocks, measuring genuinely different things:
+
+| Clock | Question it asks | Refreshed by activity? |
+|---|---|---|
+| `isTimedOut(60)` | "Have you sent me *anything* lately?" | **Yes** — that's correct here |
+| `isRequestOverdue(30)` | "You began a request 30s ago. Where is it?" | **Never** — that's the point |
+
+`request_start` is stamped on the **first byte of a request** and left alone
+afterwards. Dribbling cannot move it. (It resets to 0 when the request
+completes, so a future keep-alive connection sitting idle *between* requests
+isn't wrongly judged late — the idle clock owns that period.)
+
 ```cpp
-std::vector<int> expired;                       // 1. collect
-for (it = clients.begin(); it != clients.end(); ++it)
-    if (it->second->isTimedOut(60)) expired.push_back(it->first);
-for (i = 0; i < expired.size(); ++i)            // 2. then remove
-    _removeClient(expired[i]);
+if (c->state == Client::READING && c->isRequestOverdue(REQUEST_TIMEOUT_SEC))
+    overdue.push_back(it->first);          // -> 408, then flush and close
+else if (c->isTimedOut(IDLE_TIMEOUT_SEC))
+    idle.push_back(it->first);             // -> just drop
 ```
 
-**Why collect-then-remove instead of removing inside the loop?**
+The deadline is checked **first**: an overdue client is usually also "active"
+by the idle clock, so testing idleness first would let it slip through.
+
+**Why 408 instead of just closing.** A bare close (RST) is indistinguishable
+from a server crash at the other end. `408 Request Timeout` says *we* made a
+decision. `_startErrorResponse` frames it, flips the client to `SENDING`, and
+the normal `POLLOUT` path flushes and closes it — the timeout code never
+touches a socket, which keeps the "all I/O in one place" rule intact.
+
+**Why collect-then-act instead of acting inside the loop?**
 `_removeClient` calls `clients.erase()`. Erasing the element an iterator
 points to **invalidates that iterator**; `++it` afterward is undefined
 behavior — the classic crashes-once-a-week bug. (C++98 note: `map::erase`
 returned `void`, so the modern `it = map.erase(it)` idiom doesn't even exist
 for us.) Two passes cost nothing and are immune by construction.
 
-`last_activity` is refreshed on every successful `recv`, so only genuinely
-silent connections age out. Sixty seconds is a policy constant — trivially
-movable to the config later.
+**Measured, not assumed:** a client dribbling one byte every 5s receives its
+408 at exactly **t+30s**, while a client that connects and says nothing at all
+is reaped by the idle clock at **t+61s** — different paths, both correct.
+nginx draws the same distinction: `keepalive_timeout` vs
+`client_header_timeout` / `client_body_timeout`. Both values are policy
+constants here, trivially movable to the config later.
 
 ---
 
@@ -615,10 +769,13 @@ The fields that earn their existence:
 | Field | Why it exists |
 |---|---|
 | `fd` | the socket; the map key duplicated for convenience |
+| `listen_fd` | which listening socket accepted us — picks the candidate server blocks for `Host` matching (§5.4.1) |
+| `request` (`HttpRequest`) | what the parser fills in; its `state` field is the completeness signal the read handler gates on |
 | `input_buf` (`vector<char>`) | TCP fragments requests — bytes accumulate here between poll iterations until the parser says "complete" |
 | `output_buf` + `bytes_sent` | the partial-send machinery (§5.5) |
 | `state` (READING → PROCESSING → SENDING → …) | which phase of its life this connection is in; drives what events we care about |
-| `last_activity` | timestamp refreshed on reads; fuel for `_checkTimeouts` |
+| `last_activity` | timestamp refreshed on reads; fuel for the **idle** clock in `_checkTimeouts` |
+| `request_start` | when the current request's first byte arrived, 0 if none; never refreshed, which is what makes the **request deadline** catch a slow-loris (§5.7) |
 | `cgi_pipe_fd`, `cgi_pid` | pre-wired seats for CGI (Phase 5): the child's stdout pipe joins the same `poll()`, the pid feeds `waitpid` |
 | `server_cfg` | which server block accepted this client (non-owning) |
 

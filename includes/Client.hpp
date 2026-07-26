@@ -41,6 +41,9 @@ public:
     size_t             bytes_sent;
 
     time_t  last_activity;
+    // When the first byte of the CURRENT request arrived; 0 = none in flight.
+    // Deliberately not refreshed as more bytes come in — see isRequestOverdue().
+    time_t  request_start;
 
     // --- config + parsed data ---
     ServerConfig*  server_cfg;  // server block that accepted this client; never owns
@@ -57,7 +60,14 @@ public:
 
     Client(int socket_fd, int accepted_on, const std::string& remote_addr);
 
+    // Silent for too long. Refreshed by activity, so it only catches connections
+    // that have genuinely gone quiet.
     bool isTimedOut(time_t timeout_seconds) const;
+
+    // Started a request and still hasn't finished it. Anchored to the request's
+    // FIRST byte, which is what makes it immune to a client that dribbles just
+    // enough to keep isTimedOut() happy forever (slow-loris).
+    bool isRequestOverdue(time_t deadline_seconds) const;
 
 };
 

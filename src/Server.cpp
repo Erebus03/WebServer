@@ -320,9 +320,18 @@ static const size_t READ_CHUNK = 4096;
 // can reach. Raise it if a real client ever legitimately exceeds it.
 static const size_t MAX_HEADER_BYTES = 8192;
 
+// ── Two clocks, and they measure different things ────────────────────────────
+// IDLE: "you have sent me nothing at all for this long." Refreshed by activity.
+// REQUEST: "you began a request this long ago and still have not finished it."
+// Anchored to the request's first byte and NEVER refreshed — a slow-loris keeps
+// the idle clock fresh by design, so only this one can catch it.
+static const time_t IDLE_TIMEOUT_SEC    = 60;
+static const time_t REQUEST_TIMEOUT_SEC = 30;
+
 static std::string reasonPhrase(int code) {
     switch (code) {
         case 400: return "Bad Request";
+        case 408: return "Request Timeout";
         case 413: return "Content Too Large";
         case 431: return "Request Header Fields Too Large";
         case 501: return "Not Implemented";
@@ -362,6 +371,13 @@ void Server::_startErrorResponse(Client* client, int status_code) {
     client->output_buf.assign(wire.begin(), wire.end());
     client->bytes_sent = 0;
     client->state = Client::SENDING;
+
+    // No request is being accumulated any more, so stop the request clock —
+    // otherwise a client killed by the deadline would still look overdue while
+    // its 408 is draining. Refreshing last_activity gives the response a full
+    // idle window to flush before the idle reaper could take the connection.
+    client->request_start = 0;
+    client->last_activity = std::time(NULL);
 }
 
 bool Server::_enforceReadLimits(Client* client) {
@@ -477,6 +493,12 @@ void Server::_handleClientRead(int client_fd) {
     client->input_buf.insert(client->input_buf.end(), buffer, buffer + n);
     client->last_activity = std::time(NULL); // keep the connection alive
 
+    // Start the request clock on the first byte of a new request only. Not
+    // touched by later recvs: that is precisely what stops a client sending one
+    // byte a minute from resetting its way out of the deadline forever.
+    if (client->request_start == 0)
+        client->request_start = client->last_activity;
+
     if (!_enforceReadLimits(client)) return; // error already framed into output_buf
 
     // Feed the parser. It owns every framing decision; this handler only
@@ -502,6 +524,7 @@ void Server::_handleClientRead(int client_fd) {
     // response instead of one per segment.
     if (client->request.state != COMPLETE) return;
 
+    client->request_start = 0;               // request landed; stop its clock
     client->state = Client::PROCESSING;
     _processRequest(client);
 }
@@ -579,21 +602,34 @@ void Server::_removeClient(int client_fd) {
 }
 
 void Server::_checkTimeouts() {
-    // Drop connections that have been silent for too long (guards against
-    // slow-loris style clients that connect and never finish a request).
-    const time_t timeout_seconds = 60;
-
-    // Collect first, then remove: _removeClient() erases from `clients`, which
+    // Collect first, then act: _removeClient() erases from `clients`, which
     // would invalidate the iterator if done inside the loop.
-    std::vector<int> expired;
+    std::vector<int> overdue;   // began a request, never finished it -> 408
+    std::vector<int> idle;      // said nothing at all -> just drop
+
     for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
-        if (it->second->isTimedOut(timeout_seconds))
-            expired.push_back(it->first);
+        Client* c = it->second;
+        // Deadline first: an overdue client is usually also "active" by the
+        // idle clock's reckoning, which is the whole reason it needs its own.
+        if (c->state == Client::READING && c->isRequestOverdue(REQUEST_TIMEOUT_SEC))
+            overdue.push_back(it->first);
+        else if (c->isTimedOut(IDLE_TIMEOUT_SEC))
+            idle.push_back(it->first);
     }
 
-    for (size_t i = 0; i < expired.size(); ++i) {
-        std::cout << "Client " << expired[i] << " timed out, closing connection" << std::endl;
-        _removeClient(expired[i]);
+    for (size_t i = 0; i < overdue.size(); ++i) {
+        std::map<int, Client*>::iterator it = clients.find(overdue[i]);
+        if (it == clients.end()) continue;
+        std::cout << "Client " << overdue[i] << " exceeded the request deadline, sending 408" << std::endl;
+        // Say why rather than dropping silently: a bare RST is indistinguishable
+        // from a server crash at the other end. The write handler flushes it and
+        // closes on the next POLLOUT.
+        _startErrorResponse(it->second, 408);
+    }
+
+    for (size_t i = 0; i < idle.size(); ++i) {
+        std::cout << "Client " << idle[i] << " idle too long, closing connection" << std::endl;
+        _removeClient(idle[i]);
     }
 }
 
