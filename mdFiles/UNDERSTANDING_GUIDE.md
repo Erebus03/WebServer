@@ -1228,7 +1228,38 @@ plus two `claude --resume <id>` session markers left over from drafting.
 Real doc comments were kept. Git remembers the deleted version if it is ever
 wanted.
 
-### 12.5 Still open elsewhere
+### 12.5 Pipelining — FIXED 2026-07-27
+
+Was: `resetForNextRequest()` cleared `input_buf` wholesale, so a client that
+pipelined (sent request 2 before reading response 1) lost request 2. Now that
+`parse()` reports `consumed`, `_advanceRequest()` erases exactly the finished
+request's bytes at COMPLETE; the reset keeps the leftover. The subtle half of
+the fix: those leftover bytes were recv'd long ago, so **no POLLIN will ever
+announce them again** — the write handler re-runs `_advanceRequest()` right
+after recycling. Verified with two requests in one TCP segment (2 responses on
+one connection) and with request 2 split across segments.
+
+### 12.6 EMFILE accept-spin — FIXED 2026-07-27
+
+Was: when the process ran out of fds, `accept()` failed but the pending
+connection stayed queued; level-triggered `poll()` re-reported POLLIN forever,
+spinning the loop at 100% CPU. Fix is the classic **reserve fd**: hold
+`open("/dev/null")` from `initialize()`; when accept fails, close the reserve,
+accept the connection, close it immediately (the shed client sees a clean
+close and retries), reopen the reserve. Chosen over checking `errno == EMFILE`
+because the subject forbids leaning on errno. Verified under `ulimit -n 16`
+with 25 held connections: 14 sheds, 0 CPU ticks while exhausted, served
+normally after.
+
+### 12.7 Idle clock killed active downloads — FIXED 2026-07-27
+
+Was: `_handleClientWrite` refreshed `last_send_progress` but not
+`last_activity`, so a slow-but-reading client on a long download made constant
+progress yet "looked idle" and was killed after IDLE_TIMEOUT_SEC. Now sending
+bytes counts as activity. The stall clock still catches peers that stop
+reading entirely — the two clocks measure different failures.
+
+### 12.8 Still open elsewhere
 
 - **Chunked transfer decoding** is unimplemented in `HttpParser` (Member B).
 - **`_processRequest()`** is still the honest 501 placeholder — it answers

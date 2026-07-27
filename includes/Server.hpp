@@ -41,6 +41,12 @@ private:
 
     Config config;
     bool running;
+
+    // Held open so accept() can be forced to succeed once when the process is
+    // out of fds — close it, accept, close the accepted fd, reopen. Without a
+    // spare, a pending connection under EMFILE spins poll() forever, because
+    // level-triggered POLLIN keeps firing until the connection is accepted.
+    int reserve_fd;
     
     // Listening sockets: one per (host, port) pair from config
     std::vector<int> listening_sockets;              // list of listen fd's
@@ -84,6 +90,10 @@ private:
     // Picks the server block by Host among those sharing the client's endpoint.
     // Call once per request, after the parser reports COMPLETE.
     void _resolveServerConfig(Client* client);
+    // Parse input_buf and dispatch if a request is complete. Called after every
+    // recv, and after recycling a keep-alive connection whose input_buf already
+    // holds pipelined bytes (those get no further POLLIN).
+    void _advanceRequest(Client* client);
     // Hand-off seam: runs exactly once per complete request.
     void _processRequest(Client* client);
     // Frames a status-only response into output_buf and flips to SENDING.

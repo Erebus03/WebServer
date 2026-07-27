@@ -57,7 +57,7 @@ static std::string ipv4ToString(uint32_t netAddr) {
     return os.str();
 }
 
-Server::Server() : running(false) {
+Server::Server() : running(false), reserve_fd(-1) {
 }
 
 Server::~Server() {
@@ -66,11 +66,14 @@ Server::~Server() {
         close(it->first);
         delete it->second;
     }
-    
+
     // Close listening sockets
     for (size_t i = 0; i < listening_sockets.size(); ++i) {
         close(listening_sockets[i]);
     }
+
+    if (reserve_fd >= 0)
+        close(reserve_fd);
 }
 
 int Server::initialize(const std::string& config_file) {
@@ -85,6 +88,10 @@ int Server::initialize(const std::string& config_file) {
     // would inherit a fatal default it never asked for. The guarantee belongs
     // to the class that does the writing.
     std::signal(SIGPIPE, SIG_IGN);
+
+    // One fd held in reserve so that when the process hits its fd limit,
+    // accept() can still be made to succeed once — see _acceptNewClient.
+    reserve_fd = open("/dev/null", O_RDONLY);
 
     // Parse configuration
     ConfigParser parser;
@@ -299,7 +306,25 @@ void Server::_acceptNewClient(int listen_fd) {
     
     int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &addr_len);
     if (client_fd < 0) {
-        std::cerr << "accept failed on listen fd :" << listen_fd << std::endl;       
+        // Likely out of fds. poll() is level-triggered: the pending connection
+        // keeps reporting POLLIN until accepted, so returning here would spin
+        // the loop at 100% CPU. We cannot ask errno whether this is EMFILE
+        // (SUBJECT_RULES forbids leaning on errno), so we probe instead: free
+        // the reserve fd, retry the accept, and immediately close what we get.
+        // The shed client sees a clean close and retries; the server breathes.
+        // If the retry also fails, the cause was transient (e.g. the peer
+        // aborted between poll and accept) and there is nothing to shed.
+        if (reserve_fd >= 0) {
+            close(reserve_fd);
+            int shed = accept(listen_fd, (struct sockaddr*)&client_addr, &addr_len);
+            if (shed >= 0) {
+                std::cerr << "out of fds: shedding one connection" << std::endl;
+                close(shed);
+            }
+            reserve_fd = open("/dev/null", O_RDONLY); // re-arm for next time
+        } else {
+            std::cerr << "accept failed on listen fd " << listen_fd << std::endl;
+        }
         return;
     }
 
@@ -565,11 +590,22 @@ void Server::_handleClientRead(int client_fd) {
 
     if (!_enforceReadLimits(client)) return; // error already framed into output_buf
 
-    // Feed the parser. It owns every framing decision; this handler only
-    // supplies bytes. The parser is currently restartable, so handing it the
-    // whole accumulated buffer each time is idempotent.
+    _advanceRequest(client);
+}
+
+// Parse whatever input_buf holds and, if a full request is in, dispatch it.
+// Split out of _handleClientRead because recv() is not the only way bytes end
+// up waiting: a client that PIPELINES sends request 2 before reading response
+// 1, so request 2 is already sitting in input_buf when the connection is
+// recycled — those bytes were read long ago, and poll() will never announce
+// them again. The write handler calls this after resetForNextRequest() for
+// exactly that case.
+void Server::_advanceRequest(Client* client) {
+    // Feed the parser. It owns every framing decision; this function only
+    // supplies bytes. The parser is restartable, so handing it the whole
+    // accumulated buffer each time is idempotent.
     const std::string bytes(client->input_buf.begin(), client->input_buf.end());
-    size_t consumed = 0; // bytes this request used; for dropping them on keep-alive
+    size_t consumed = 0; // bytes this request used; valid once COMPLETE
     client->parser.parse(bytes, client->request, consumed);
 
     if (client->request.state == ERROR) {
@@ -588,6 +624,12 @@ void Server::_handleClientRead(int client_fd) {
     // this is what makes a request split across TCP segments produce one
     // response instead of one per segment.
     if (client->request.state != COMPLETE) return;
+
+    // Drop exactly this request's bytes; everything after them is the start of
+    // the next pipelined request and must survive. The parsed request holds its
+    // own copies, so the raw bytes are no longer needed.
+    client->input_buf.erase(client->input_buf.begin(),
+                            client->input_buf.begin() + consumed);
 
     client->request_start = 0;               // request landed; stop its clock
     client->state = Client::PROCESSING;
@@ -613,8 +655,14 @@ void Server::_handleClientWrite(int client_fd) {
     }
 
     client->bytes_sent += n;
-    if (n > 0)
+    if (n > 0) {
         client->last_send_progress = std::time(NULL);  // progress, not attempts
+        // Sending IS activity. Without this, a slow-but-reading client on a
+        // long download looks idle (last_activity froze when the request
+        // landed) and the idle clock kills a transfer that is progressing
+        // fine. The stall clock above still catches peers that stop reading.
+        client->last_activity = client->last_send_progress;
+    }
 
     if (client->bytes_sent >= client->output_buf.size()) {
         if (client->keep_alive) {
@@ -624,6 +672,13 @@ void Server::_handleClientWrite(int client_fd) {
             // READING -> SENDING -> READING indefinitely.
             std::cout << "Response sent to client " << client_fd << ", keeping connection alive" << std::endl;
             client->resetForNextRequest();
+            // A pipelined next request may already be sitting in input_buf —
+            // its bytes arrived while we were SENDING, so its POLLIN is long
+            // gone and recv() will never be our trigger. Parse it now.
+            if (!client->input_buf.empty()) {
+                client->request_start = std::time(NULL); // deadline clock restarts
+                _advanceRequest(client);
+            }
         } else {
             std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
             _removeClient(client_fd);

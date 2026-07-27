@@ -46,15 +46,13 @@ void Client::beginSending() {
 }
 
 void Client::resetForNextRequest() {
-    // KNOWN GAP: input_buf is cleared rather than having just the finished
-    // request removed from its front, because HttpParser::parse() does not
-    // report how many bytes it consumed. A client that PIPELINES (sends request
-    // 2 before reading response 1) loses request 2 here. It then waits, our idle
-    // clock closes the connection, and the client retries on a fresh one — the
-    // standard recovery path, but a real cost. Fixed the day parse() returns a
-    // consumed count; until then clearing is the only honest option, since
-    // guessing where the request ended would mean re-implementing the parser.
-    input_buf.clear();
+    // input_buf is deliberately NOT cleared. The finished request's bytes were
+    // already erased from its front at COMPLETE (parse() reports `consumed`,
+    // Server::_advanceRequest does the erase), so whatever remains here is the
+    // start of the next PIPELINED request and must survive the recycle. This
+    // closes the old known gap where clearing wholesale lost request 2 of a
+    // pipelined pair. The caller re-parses the leftover immediately, because
+    // those bytes will never trigger another POLLIN.
     output_buf.clear();
     bytes_sent = 0;
     last_send_progress = 0;         // not sending any more
