@@ -26,6 +26,7 @@ class HttpParser {
         bool parseHeaders(const std::string& bytes, size_t start, size_t end, HttpRequest& request) const;
         bool parseHeaderLine(const std::string& line, std::string& name, std::string& value) const;
         void readBody(const std::string& bytes, size_t body_start, HttpRequest& request, size_t& consumed) const;
+        void readChunkedBody(const std::string& bytes, size_t body_start, HttpRequest& request, size_t& consumed) const;
 };
 
 #endif
