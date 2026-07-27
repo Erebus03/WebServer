@@ -21,6 +21,7 @@
 9. [The "Why not X?" cheat table](#9-why-not-x)
 10. [Interview questions you WILL get](#10-interview-questions)
 11. [Glossary](#11-glossary)
+12. [Open items (Member A)](#12-open-items-member-a)
 
 ---
 
@@ -1027,12 +1028,31 @@ also works for types like `Token`, which `static` can't cover).
 Cover these at "explain the design" depth — the deep dives are theirs, but
 you WILL be asked how the pieces connect.
 
-**`HttpParser` (Member B, in progress):** currently parses the request line
-(`GET /index.html HTTP/1.1` → method/uri/version, state → READING_HEADERS).
-The essential property it must have: **resumability**. Because TCP fragments
-arbitrarily (§5.4), the parser is a state machine that consumes whatever bytes
-exist and remembers where it stopped — never assumes a complete request is
-present. Coming: headers, Content-Length bodies, chunked transfer decoding.
+**`HttpParser` (Member B):** the essential property it must have is
+**resumability**. Because TCP fragments arbitrarily (§5.4), the parser is a
+state machine that consumes whatever bytes exist and remembers where it
+stopped — it never assumes a complete request is present.
+
+The call contract, as of the merge on 2026-07-27:
+
+```cpp
+ParseResult parse(const std::string& bytes, HttpRequest& request, size_t& consumed);
+// PARSE_INCOMPLETE — keep the buffer, call again after the next recv()
+// PARSE_COMPLETE   — request filled; `consumed` bytes were used
+// PARSE_ERROR      — malformed
+```
+
+Three details matter to the read handler. `bytes` is the **whole accumulated
+buffer** every call, not a delta — so the handler keeps passing all of
+`input_buf`. `consumed` is what finally lets `Client::resetForNextRequest()`
+drop just the finished request instead of clearing the buffer wholesale, which
+is what used to lose pipelined requests. And `request.state` is still
+maintained alongside the enum, which is what §5.4.1 relies on to settle the
+virtual host the moment headers land — before the body accumulates, so the
+right server block's `client_max_body_size` is the one being enforced.
+
+Still open on this seam: `PARSE_ERROR` reports no status code (§12.3), and
+chunked transfer decoding is unimplemented.
 
 **`Router` (Member C, in progress):** `match(uri, server)` — finds the
 location block with the **longest matching prefix** (`/uploads/photos` beats
@@ -1153,7 +1173,55 @@ code's limits far more than people who claim it's perfect.
 
 ---
 
+---
+
+## 12. Open items (Member A)
+
+Live list of known defects and unfinished contracts in the network layer.
+Deleting a row is only allowed once the fix is committed.
+
+### 12.1 SIGPIPE is set outside the repo — crash risk
+
+`std::signal(SIGPIPE, SIG_IGN)` exists only in `src/main.cpp`, and that file
+is **gitignored and untracked**. Anyone who clones the repo has no main.cpp at
+all, and whatever they write instead probably won't ignore SIGPIPE. The first
+`send()` to a peer that closed early then kills the whole server process —
+which is exactly what an evaluator does when they hit Ctrl-C in curl mid-download.
+
+Fix: move the call into `Server::initialize()`, so the protection travels with
+the class that actually does the writing rather than with a file that isn't
+version-controlled.
+
+### 12.2 Orthodox Canonical Form missing
+
+`Server` (`includes/Server.hpp`) declares only `Server()` and `~Server()`. No
+copy constructor, no assignment operator. The class owns raw fds and
+`Client*` pointers, so a copy would double-`close()` and double-`delete`.
+`Client` has the same gap. 42 evaluation asks for OCF by name.
+
+Fix: declare both private and leave them undefined — the C++98 way to make a
+copy a link-time error instead of a runtime disaster.
+
+### 12.3 `PARSE_ERROR` carries no status code
+
+Member B's `parse()` contract (§8) landed with three of the four things the
+read handler asked for: the `consumed` out-param, whole-buffer feeding, and a
+still-maintained `request.state`. The fourth is open — `PARSE_ERROR` is
+documented as "send 400 and close", so `_handleClientRead` hardcodes 400.
+
+That merges statuses that are genuinely different: an unknown method is 501,
+a bad HTTP version is 505, oversized headers are 431. Needs an int status on
+the request, set by the parser when it rejects.
+
+### 12.4 Commented-out code in `Server.cpp`
+
+Leftovers from the original draft, interleaved with the real doc comments.
+Harmless at runtime; it is also the first thing a reader scrolls past.
+
+---
+
 *Companion files: `SUBJECT_RULES.txt` (allowed functions & hard rules) ·
-`webserv_roadmap.md` (day-by-day plan) · `instructions.txt` (team architecture
-guide). When code changes materially, update the relevant section here — a
-stale guide is worse than none.*
+`MEMBER_B_GUIDE.md` (parser internals, Member B). The structs themselves live
+in `includes/types.hpp` — that file is the contract, not any document here.
+When code changes materially, update the relevant section here — a stale guide
+is worse than none.*
