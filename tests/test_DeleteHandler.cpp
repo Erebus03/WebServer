@@ -4,39 +4,23 @@
 #include <iostream>
 #include <fstream>
 #include <string>
-
 #include <sys/stat.h>
 #include <unistd.h>
-
 #include "../includes/DeleteHandler.hpp"
 
-// ---------------------------------------------------------------------------
-// Fixtures -- and why this suite differs from every other one in the project.
-//
-// test_GetHandler and test_DirectoryLister are read-only: one fixture world is
-// built once in main(), and every test runs against it in any order, forever.
-// DELETE breaks that. A passing test destroys its own fixture, so:
-//
-//   - test order would become significant (a 404 test could pass because an
-//     earlier test deleted the file, not because it was set up that way)
-//   - a second run would not see the same world as the first
-//
-// The fix chosen here: every test calls setup_fixtures() as its first line, and
-// setup_fixtures() tears the world down before rebuilding it. Slightly more work
-// per test, and in exchange each test is independent of every other one and of
-// its own previous run. The alternative -- giving each test its own private file
-// inside one shared world -- is less code but leaves tests sharing a directory.
+// Unlike the read-only suites in this project, a passing DELETE test destroys
+// its own fixture. Each test therefore calls setup_fixtures() first, which tears
+// the world down before rebuilding it -- so no test depends on what ran before
+// it, and a second run sees the same world as the first.
 //
 //   tmp_deletehandler/
-//       victim.txt             "delete me"        (the happy path)
-//       sub/                                      (directory guard)
-//       locked/                mode 0555          (permission branch)
-//           prisoner.txt       "cannot remove"
+//       victim.txt                            (the happy path)
+//       sub/                                  (directory guard)
+//       locked/            mode 0555          (permission branch)
+//           prisoner.txt
 //
-// Teardown restores locked/ to 0755 BEFORE trying to empty it: you cannot remove
-// an entry from a directory you have no write permission on. Same trap as the
-// chmod 000 file in test_GetHandler, one level up.
-// ---------------------------------------------------------------------------
+// teardown_fixtures() restores locked/ to 0755 before emptying it: you cannot
+// remove an entry from a directory you have no write permission on.
 
 static const std::string ROOT = "./tmp_deletehandler";
 
@@ -50,6 +34,8 @@ static void write_file(const std::string& path, const std::string& content)
     out.close();
 }
 
+// Does this path exist on disk right now? Used to prove a delete really happened
+// rather than trusting the status code alone.
 static bool exists_on_disk(const std::string& path)
 {
     struct stat st = {};
@@ -58,8 +44,12 @@ static bool exists_on_disk(const std::string& path)
 
 static void teardown_fixtures()
 {
+    // Restore write permission first, or the unlink below cannot remove the entry
+    // and the rmdir after it cannot remove a non-empty directory.
     chmod(at("/locked").c_str(), 0755);
 
+    // Every unlink here may legitimately fail: the whole point of this suite is
+    // that tests delete their own fixtures. Return values are ignored on purpose.
     unlink(at("/locked/prisoner.txt").c_str());
     unlink(at("/victim.txt").c_str());
 
@@ -79,13 +69,15 @@ static void setup_fixtures()
     write_file(at("/victim.txt"), "delete me");
     write_file(at("/locked/prisoner.txt"), "cannot remove");
 
+    // r-xr-xr-x: readable and traversable, but not writable -- so the directory
+    // entry inside it cannot be removed. This is what unlink() reports as EACCES.
     assert(chmod(at("/locked").c_str(), 0555) == 0);
 }
 
 // ---------------------------------------------------------------------------
 // Builders: every field set explicitly, including the ones DeleteHandler never
-// reads. "Initialize everything you construct" -- not "initialize what happens
-// to be read today" (test finding T2/T3).
+// reads. Initialize everything you construct, not just what happens to be read
+// today -- an uninitialized bool read later is a silent wrong answer.
 // ---------------------------------------------------------------------------
 
 static LocationConfig make_location(const std::string& root)
@@ -176,6 +168,7 @@ static void test_directory_is_refused()
     HttpResponse response = DeleteHandler::handle(request, location);
 
     assert(response.status_code == 403);
+    // The guard must stop before unlink() -- the directory is still there.
     assert(exists_on_disk(at("/sub")));
     std::cout << "[OK] a directory is refused and left intact" << std::endl;
 }
@@ -191,11 +184,12 @@ static void test_delete_succeeds()
     LocationConfig location = make_location(ROOT);
     HttpRequest request = make_request("/victim.txt");
 
-    assert(exists_on_disk(at("/victim.txt")));
+    assert(exists_on_disk(at("/victim.txt")));      // precondition, not decoration
 
     HttpResponse response = DeleteHandler::handle(request, location);
 
     assert(response.status_code == 204);
+    // The status code alone would pass even if unlink() were never called.
     assert(!exists_on_disk(at("/victim.txt")));
     std::cout << "[OK] an existing file is deleted and reports 204" << std::endl;
 }
@@ -210,7 +204,8 @@ static void test_success_has_empty_body()
     HttpResponse response = DeleteHandler::handle(request, location);
 
     assert(response.status_code == 204);
-
+    // 204 promises no representation, so a body here would be a lie the
+    // serializer must not send. This pins the contract stated in the header.
     assert(response.body.empty());
     std::cout << "[OK] a 204 carries no body" << std::endl;
 }
@@ -225,6 +220,9 @@ static void test_delete_is_not_idempotent_in_status()
     HttpResponse first = DeleteHandler::handle(request, location);
     assert(first.status_code == 204);
 
+    // The effect is idempotent (the file is gone either way); the status is not.
+    // The second call takes the file_exists() branch, which is the honest answer:
+    // there is nothing at that URI now.
     HttpResponse second = DeleteHandler::handle(request, location);
     assert(second.status_code == 404);
 
@@ -252,6 +250,8 @@ static void test_unwritable_directory_is_refused()
 
     HttpResponse response = DeleteHandler::handle(request, location);
 
+    // unlink() modifies the DIRECTORY, so it is the directory's write bit that
+    // decides this -- the file itself is perfectly writable. errno is EACCES.
     assert(response.status_code == 403);
     assert(exists_on_disk(at("/locked/prisoner.txt")));
     std::cout << "[OK] a file in an unwritable directory is refused" << std::endl;
