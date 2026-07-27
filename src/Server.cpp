@@ -137,7 +137,7 @@ void Server::_createListenSockets() {
     for (size_t i = 0; i < config.size(); ++i) {
         const ServerConfig& server = config[i];
 
-        std::stringstream key;
+        std::stringstream key; //how likely is this to fail
         key << server.host << ":" << server.port;
         const std::string endpoint = key.str();
 
@@ -466,6 +466,7 @@ bool Server::_enforceReadLimits(Client* client) {
 // "Example.COM:8080" -> "example.com". The port is not part of the name, and
 // host names are case-insensitive (RFC 9110 §4.2.3).
 static std::string hostNameOnly(const std::string& raw) {
+    //protect if raw is empty?
     const size_t colon = raw.find(':');
     std::string name = (colon == std::string::npos) ? raw : raw.substr(0, colon);
     for (size_t i = 0; i < name.size(); ++i)
@@ -476,6 +477,7 @@ static std::string hostNameOnly(const std::string& raw) {
 void Server::_resolveServerConfig(Client* client) {
     std::map<int, std::vector<size_t> >::const_iterator sit =
         listen_fd_to_server_idxs.find(client->listen_fd);
+
     if (sit == listen_fd_to_server_idxs.end() || sit->second.empty())
         return;                                   // keep whatever accept() chose
     const std::vector<size_t>& candidates = sit->second;
