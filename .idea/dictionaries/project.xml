@@ -10,6 +10,7 @@
       <w>cassert</w>
       <w>cout</w>
       <w>cstdio</w>
+      <w>deletehandler</w>
       <w>diskpath</w>
       <w>endl</w>
       <w>gethandler</w>
