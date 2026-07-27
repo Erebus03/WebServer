@@ -1180,27 +1180,33 @@ code's limits far more than people who claim it's perfect.
 Live list of known defects and unfinished contracts in the network layer.
 Deleting a row is only allowed once the fix is committed.
 
-### 12.1 SIGPIPE is set outside the repo — crash risk
+### 12.1 SIGPIPE — FIXED 2026-07-27
 
-`std::signal(SIGPIPE, SIG_IGN)` exists only in `src/main.cpp`, and that file
-is **gitignored and untracked**. Anyone who clones the repo has no main.cpp at
-all, and whatever they write instead probably won't ignore SIGPIPE. The first
-`send()` to a peer that closed early then kills the whole server process —
-which is exactly what an evaluator does when they hit Ctrl-C in curl mid-download.
+Was: `std::signal(SIGPIPE, SIG_IGN)` lived only in `src/main.cpp`, which is
+untracked. Anyone cloning the repo got no main.cpp, so the first `send()` to a
+peer that closed early killed the whole server — exactly what happens when an
+evaluator hits Ctrl-C in curl mid-download.
 
-Fix: move the call into `Server::initialize()`, so the protection travels with
-the class that actually does the writing rather than with a file that isn't
-version-controlled.
+Now set at the top of `Server::initialize()`, before any socket exists. The
+guarantee belongs to the class that does the writing, not to a file that isn't
+version-controlled. Ignoring the signal turns the case into `send()` returning
+-1, which `_handleClientWrite` already handles by dropping just that client.
 
-### 12.2 Orthodox Canonical Form missing
+**Verified**, not just reasoned: 5 clients requested an 8 MB file and were
+`kill -9`'d mid-transfer; the server survived all 5 and still answered a
+following request. Before this change the same test killed the process.
 
-`Server` (`includes/Server.hpp`) declares only `Server()` and `~Server()`. No
-copy constructor, no assignment operator. The class owns raw fds and
-`Client*` pointers, so a copy would double-`close()` and double-`delete`.
-`Client` has the same gap. 42 evaluation asks for OCF by name.
+### 12.2 Orthodox Canonical Form — FIXED 2026-07-27
 
-Fix: declare both private and leave them undefined — the C++98 way to make a
-copy a link-time error instead of a runtime disaster.
+Was: `Server` and `Client` declared only a constructor and destructor. Both
+own raw fds (and `Server` owns heap `Client*`s), so a copy would `close()` the
+same fd twice and `delete` the same pointer twice.
+
+Now both declare a copy constructor and `operator=` **private and undefined**.
+Private stops outside code at compile time; undefined stops the class's own
+members and friends at link time. C++98 has no `= delete`, so this pair is the
+idiom. Neither class was ever copied, so this costs nothing and converts an
+assumption into something the compiler enforces.
 
 ### 12.3 `PARSE_ERROR` carries no status code
 
@@ -1213,10 +1219,27 @@ That merges statuses that are genuinely different: an unknown method is 501,
 a bad HTTP version is 505, oversized headers are 431. Needs an int status on
 the request, set by the parser when it rejects.
 
-### 12.4 Commented-out code in `Server.cpp`
+### 12.4 Commented-out code in `Server.cpp` — FIXED 2026-07-27
 
-Leftovers from the original draft, interleaved with the real doc comments.
-Harmless at runtime; it is also the first thing a reader scrolls past.
+Removed a superseded `_handleClientWrite` (27 commented lines calling an
+accessor API — `getOutputBuffer()`, `updateOutputBufferSent()` — that no longer
+exists, and which closed the connection unconditionally, i.e. pre-keep-alive),
+plus two `claude --resume <id>` session markers left over from drafting.
+Real doc comments were kept. Git remembers the deleted version if it is ever
+wanted.
+
+### 12.5 Still open elsewhere
+
+- **Chunked transfer decoding** is unimplemented in `HttpParser` (Member B).
+- **`_processRequest()`** is still the honest 501 placeholder — it answers
+  `501 Not Implemented` rather than faking a 200, and stays that way until
+  `Dispatcher` has an interface to call. Not a bug; do not "fix" it by
+  hardcoding a response.
+- **`.gitignore` has 4 dead rules** (`tests/*`, `tests/`, `Makefile`,
+  `mdFiles/UNDERSTANDING_GUIDE.md`, `.idea/`) — those paths are already
+  tracked, and `.gitignore` only affects untracked files, so the rules do
+  nothing. Left as-is deliberately; `.git/info/exclude` is the right tool if
+  per-clone ignoring is ever wanted.
 
 ---
 

@@ -26,6 +26,19 @@ public:
     void stop();
     
 private:
+    // Orthodox Canonical Form, restrictive branch. A Server owns raw listening
+    // fds and heap-allocated Client objects, and neither can be duplicated
+    // meaningfully: copying one would give two objects the same fds, so the
+    // second destructor would close() fds already closed and delete Clients
+    // already deleted. There is no sane copy, so rather than write a wrong one
+    // we make the compiler refuse.
+    //
+    // Declared private and deliberately left undefined: private stops outside
+    // code at compile time, and undefined stops the class's own members and
+    // friends at link time. C++98 has no `= delete`, so this pair is the idiom.
+    Server(const Server& other);
+    Server& operator=(const Server& other);
+
     Config config;
     bool running;
     

@@ -92,6 +92,15 @@ public:
     // next one.
     void resetForNextRequest();
 
+private:
+    // Orthodox Canonical Form, restrictive branch — same reasoning as Server.
+    // A Client is identified by its fd: two copies would both refer to one
+    // connection, and whichever is cleaned up first closes the fd out from
+    // under the other. Clients are always held as `Client*` in Server::clients
+    // and never copied, so forbidding this costs nothing and makes the
+    // never-copied assumption enforced rather than merely intended.
+    Client(const Client& other);
+    Client& operator=(const Client& other);
 };
 
 #endif

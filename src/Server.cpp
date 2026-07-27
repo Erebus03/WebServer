@@ -8,15 +8,12 @@
 #include <cctype>
 #include <ctime>
 #include <cerrno>
+#include <csignal>
 #include <stdint.h>
 #include <sstream>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-
-
-// MAIN CHAT claude --resume d6b4be4d-bbf2-4223-9ce9-c9518d681475
-
 
 
 // ── Allowed-function-safe IPv4 helpers ───────────────────────────────────────
@@ -77,6 +74,18 @@ Server::~Server() {
 }
 
 int Server::initialize(const std::string& config_file) {
+    // Ignore SIGPIPE before any socket exists. Writing to a peer that has
+    // already closed raises SIGPIPE, whose default action is to kill the
+    // process — one client hanging up mid-download would take the whole server
+    // with it. Ignoring it turns that case into a send() returning -1, which
+    // _handleClientWrite already handles by dropping just that client.
+    //
+    // This lives here, not in main(), because main.cpp is not tracked by git:
+    // a teammate's or an evaluator's main() would not set it, and the server
+    // would inherit a fatal default it never asked for. The guarantee belongs
+    // to the class that does the writing.
+    std::signal(SIGPIPE, SIG_IGN);
+
     // Parse configuration
     ConfigParser parser;
     config = parser.parse(config_file);
@@ -517,10 +526,6 @@ void Server::_processRequest(Client* client) {
     // TODO: Router::match() -> Dispatcher -> HttpResponse -> serialise to output_buf.
     _startErrorResponse(client, 501);
 }
-
-
-
-//side chat claude --resume 9e8a6cfd-9128-499f-ab93-8f1f77ddc798******************************
 void Server::_handleClientRead(int client_fd) {
     std::map<int, Client*>::iterator it = clients.find(client_fd);
     if (it == clients.end()) return;
@@ -625,34 +630,6 @@ void Server::_handleClientWrite(int client_fd) {
         }
     }
 }
-// void Server::_handleClientWrite(int client_fd) {
-//     // Client* client = clients[client_fd];
-//     // if (!client) return;
-//     std::map<int, Client*>::iterator it = clients.find(client_fd);
-//     if (it == clients.end()) return;
-//     Client* client = it->second;
-    
-//     const std::vector<char>& output = client->getOutputBuffer();
-//     size_t sent = client->getOutputBufferSent();
-//     size_t remaining = output.size() - sent;
-    
-//     if (remaining == 0) return;
-    
-//     ssize_t n = send(client_fd, &output[sent], remaining, 0);
-    
-//     if (n < 0) {
-//         _handleError(client_fd);
-//         return;
-//     }
-    
-//     client->updateOutputBufferSent(n);
-    
-//     if (client->isOutputBufferEmpty()) {
-//         std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
-//         _removeClient(client_fd);
-//     }
-// }
-
 void Server::_handleCgiPipeRead(int cgi_fd) {
     (void)cgi_fd;
     // TODO: Handle CGI pipe reads
