@@ -26,8 +26,27 @@ public:
     void stop();
     
 private:
+    // Orthodox Canonical Form, restrictive branch. A Server owns raw listening
+    // fds and heap-allocated Client objects, and neither can be duplicated
+    // meaningfully: copying one would give two objects the same fds, so the
+    // second destructor would close() fds already closed and delete Clients
+    // already deleted. There is no sane copy, so rather than write a wrong one
+    // we make the compiler refuse.
+    //
+    // Declared private and deliberately left undefined: private stops outside
+    // code at compile time, and undefined stops the class's own members and
+    // friends at link time. C++98 has no `= delete`, so this pair is the idiom.
+    Server(const Server& other);
+    Server& operator=(const Server& other);
+
     Config config;
     bool running;
+
+    // Held open so accept() can be forced to succeed once when the process is
+    // out of fds — close it, accept, close the accepted fd, reopen. Without a
+    // spare, a pending connection under EMFILE spins poll() forever, because
+    // level-triggered POLLIN keeps firing until the connection is accepted.
+    int reserve_fd;
     
     // Listening sockets: one per (host, port) pair from config
     std::vector<int> listening_sockets;              // list of listen fd's
@@ -71,6 +90,10 @@ private:
     // Picks the server block by Host among those sharing the client's endpoint.
     // Call once per request, after the parser reports COMPLETE.
     void _resolveServerConfig(Client* client);
+    // Parse input_buf and dispatch if a request is complete. Called after every
+    // recv, and after recycling a keep-alive connection whose input_buf already
+    // holds pipelined bytes (those get no further POLLIN).
+    void _advanceRequest(Client* client);
     // Hand-off seam: runs exactly once per complete request.
     void _processRequest(Client* client);
     // Frames a status-only response into output_buf and flips to SENDING.
