@@ -564,7 +564,8 @@ void Server::_handleClientRead(int client_fd) {
     // supplies bytes. The parser is currently restartable, so handing it the
     // whole accumulated buffer each time is idempotent.
     const std::string bytes(client->input_buf.begin(), client->input_buf.end());
-    client->parser.parse(bytes, client->request);
+    size_t consumed = 0; // bytes this request used; for dropping them on keep-alive
+    client->parser.parse(bytes, client->request, consumed);
 
     if (client->request.state == ERROR) {
         _startErrorResponse(client, 400);

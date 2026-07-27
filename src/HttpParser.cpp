@@ -72,17 +72,20 @@ static bool percentDecode(const std::string& in, std::string& out)
     return true;
 }
 
-// bytes in -> fill HttpRequest. Runs top to bottom; RETURNS to wait when data
-// is only half here (TCP splits requests), never errors on "not yet".
-void HttpParser::parse(const std::string& bytes, HttpRequest& request)
+// bytes in -> fill HttpRequest. Runs top to bottom; returns PARSE_INCOMPLETE to
+// wait when data is only half here (TCP splits requests), never errors on "not yet".
+// On PARSE_COMPLETE, `consumed` = how many bytes this request used.
+ParseResult HttpParser::parse(const std::string& bytes, HttpRequest& request, size_t& consumed)
 {
+    consumed = 0;                               // only real once the request is COMPLETE
+
     // request line = up to the first \r\n
     size_t line_end = bytes.find("\r\n");
     if (line_end == std::string::npos)
-        return;                                 // not here yet -> wait
+        return PARSE_INCOMPLETE;                // not here yet -> wait
     if (!parseRequestLine(bytes.substr(0, line_end), request)) {
         request.state = ERROR;
-        return;
+        return PARSE_ERROR;
     }
     request.state = READING_HEADERS;
 
@@ -91,13 +94,20 @@ void HttpParser::parse(const std::string& bytes, HttpRequest& request)
     size_t headers_start = line_end + 2;
     size_t blank_line = bytes.find("\r\n\r\n", line_end);
     if (blank_line == std::string::npos)
-        return;                                 // headers not done -> wait
+        return PARSE_INCOMPLETE;                // headers not done -> wait
     if (!parseHeaders(bytes, headers_start, blank_line, request)) {
         request.state = ERROR;
-        return;
+        return PARSE_ERROR;
     }
 
-    readBody(bytes, blank_line + 4, request);   // +4 skips the \r\n\r\n
+    readBody(bytes, blank_line + 4, request, consumed);   // +4 skips the \r\n\r\n
+
+    // translate the parser's internal state into the caller-facing result
+    if (request.state == COMPLETE)
+        return PARSE_COMPLETE;
+    if (request.state == ERROR)
+        return PARSE_ERROR;
+    return PARSE_INCOMPLETE;                     // READING_BODY -> body still arriving
 }
 
 // "GET /path?q HTTP/1.1" -> method / uri / version, split on the two spaces.
@@ -167,9 +177,10 @@ bool HttpParser::parseHeaderLine(const std::string& line, std::string& name,
     return true;
 }
 
-// body framing: Content-Length -> read N bytes; nothing -> done; chunked -> TODO
+// body framing: Content-Length -> read N bytes; nothing -> done; chunked -> TODO.
+// on COMPLETE, `consumed` is set to where this request ends in the buffer.
 void HttpParser::readBody(const std::string& bytes, size_t body_start,
-                          HttpRequest& request) const
+                          HttpRequest& request, size_t& consumed) const
 {
     std::map<std::string, std::string>::const_iterator te =
         request.headers.find("transfer-encoding");
@@ -182,6 +193,7 @@ void HttpParser::readBody(const std::string& bytes, size_t body_start,
         request.headers.find("content-length");
     if (cl == request.headers.end()) {
         request.state = COMPLETE;               // no body
+        consumed = body_start;                  // request ends at the blank line
         return;
     }
 
@@ -199,4 +211,5 @@ void HttpParser::readBody(const std::string& bytes, size_t body_start,
 
     request.body  = bytes.substr(body_start, expected);
     request.state = COMPLETE;
+    consumed = body_start + expected;           // request ends after its body
 }
