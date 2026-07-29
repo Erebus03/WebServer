@@ -47,6 +47,9 @@ HttpResponse HttpStatus::make_response(int statusCode)
     case 500:
         response.status_message = "Internal Server Error";
         break;
+    case 501:
+        response.status_message = "Not implemented";
+        break;
     default:
         response.status_message = "Unknown Status";
         break;
