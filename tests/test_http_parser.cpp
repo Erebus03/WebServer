@@ -18,7 +18,7 @@ int main()
 
         std::string raw =
             "GET /api/users/1024 HTTP/1.1\r\n"
-            "Host: api.example.com\r\n"
+            "HosT : api.example.com\r\n"
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
             "Accept: application/json\r\n"
             "Authorization: Bearer eyJ0eXAiOiJKV1Qi....\r\n"

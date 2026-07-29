@@ -50,6 +50,7 @@ struct HttpRequest {
     std::map<std::string, std::string> headers;
     std::string                        body;
     bool                               is_complete;
+    int                                status;   // code to send on PARSE_ERROR (400 unless set otherwise)
 };
 
 struct HttpResponse {

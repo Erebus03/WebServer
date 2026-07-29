@@ -9,6 +9,7 @@ SRCS = \
 	src/Dispatcher.cpp \
 	src/Config.cpp \
 	src/HttpParser.cpp \
+	src/HttpVersion.cpp \
 	src/Client.cpp \
 	src/Server.cpp \
 	src/GetHandler.cpp \
@@ -28,6 +29,7 @@ INCLUDES = \
 	includes/Config.hpp \
 	includes/GetHandler.hpp \
 	includes/HttpParser.hpp \
+	includes/HttpVersion.hpp \
 	includes/DeleteHandler.hpp \
 	includes/Server.hpp \
 	includes/PostHandler.hpp \
