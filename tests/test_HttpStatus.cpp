@@ -51,6 +51,7 @@
 // static void test_server_error_codes()
 // {
 //     check(500, "Internal Server Error");
+//     check(501, "Not implemented");
 //     std::cout << "[OK] 5xx codes carry their reason phrases" << std::endl;
 // }
 //
