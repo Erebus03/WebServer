@@ -1,5 +1,9 @@
 #include "../includes/DirectoryLister.hpp"
+#include "../includes/FileUtils.hpp"
 #include <dirent.h>
+#include <sys/stat.h>
+#include <sstream>
+#include <algorithm>
 
 std::string DirectoryLister::html_escape(const std::string& raw)
 {
@@ -22,6 +26,31 @@ std::string DirectoryLister::html_escape(const std::string& raw)
     return result;
 }
 
+std::string DirectoryLister::url_encode(const std::string& raw)
+{
+    static const char HEX[] = "0123456789ABCDEF";
+    std::string result;
+
+    for (size_t i = 0; i < raw.size(); i++)
+    {
+        unsigned char c = static_cast<unsigned char>(raw[i]);
+
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '.' || c == '_' || c == '~')
+        {
+            result += static_cast<char>(c);
+        }
+        else
+        {
+            result += '%';
+            result += HEX[c >> 4];
+            result += HEX[c & 0x0F];
+        }
+    }
+
+    return result;
+}
 
 bool DirectoryLister::read_entries(const std::string& diskPath, std::vector<std::string>& outNames)
 {
@@ -32,19 +61,75 @@ bool DirectoryLister::read_entries(const std::string& diskPath, std::vector<std:
     dirent *entry;
     while ((entry = readdir(dir)) != NULL)
     {
-        if (std::string(entry->d_name) == ".")
+        std::string name(entry->d_name);
+        if (name == "." || name == "..")
             continue;
-        outNames.push_back(entry->d_name);
+        outNames.push_back(name);
     }
     closedir(dir);
     return true;
 }
 
-// TODO(abdo): build the HTML index page from sortedNames
-std::string DirectoryLister::render(const std::string& disPath, const std::string& uri, const std::vector<std::string>& sortedNames)
+std::string DirectoryLister::render(const std::string& diskPath, const std::string& uri, const std::vector<std::string>& sortedNames)
 {
-    (void)disPath;
-    (void)uri;
-    (void)sortedNames;
-    return "";
+    std::string html;
+    html += "<html>\n<head><title>Index of ";
+    html += html_escape(uri);
+    html += "</title></head>\n<body>\n<h1>Index of ";
+    html += html_escape(uri);
+    html += "</h1>\n";
+
+    if (uri != "/")
+        html += "<a href=\"../\">../</a>\n";
+
+    for (std::vector<std::string>::const_iterator it = sortedNames.begin(); it != sortedNames.end(); ++it)
+    {
+        std::string fullPath;
+        FileUtils::resolve_path(diskPath, *it, fullPath);
+
+        struct stat st = {};
+        if (stat(fullPath.c_str(), &st) != 0)
+            continue;
+
+        std::string name = *it;
+        std::string encodedName = url_encode(*it);
+        std::string sizeCol;
+
+        if (S_ISDIR(st.st_mode))
+        {
+            name += '/';
+            encodedName += '/';
+            sizeCol = "-";
+        }
+        else
+        {
+            std::ostringstream ss;
+            ss << st.st_size;
+            sizeCol = ss.str();
+        }
+
+        std::string safeName = html_escape(name);
+        html += "<a href=\"";
+        html += uri;
+        html += encodedName;
+        html += "\">";
+        html += safeName;
+        html += "</a>  ";
+        html += sizeCol;
+        html += '\n';
+    }
+
+    html += "</body>\n</html>\n";
+    return html;
+}
+
+bool DirectoryLister::generate(const std::string& diskPath, const std::string& uri, std::string& outHtml)
+{
+    std::vector<std::string> names;
+    if (!read_entries(diskPath, names))
+        return false;
+
+    std::sort(names.begin(), names.end());
+    outHtml = render(diskPath, uri, names);
+    return true;
 }
