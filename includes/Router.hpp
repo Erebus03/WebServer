@@ -5,7 +5,7 @@
 
 class Router {
 public:
-    const LocationConfig *match(const std::string& uri, const ServerConfig& server);
+    static const LocationConfig *match(const std::string& uri, const ServerConfig& server);
 };
 
 #endif
