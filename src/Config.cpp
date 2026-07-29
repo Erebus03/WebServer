@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include <limits>
 
-namespace { 
+namespace {
 
 struct Token {
     std::string text;
