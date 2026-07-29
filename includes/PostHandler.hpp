@@ -7,7 +7,7 @@ class PostHandler{
 private:
     PostHandler();
 public:
-    static HttpResponse handler(LocationConfig& location, ServerConfig& server);
+    static HttpResponse handle(const HttpRequest& request, const LocationConfig& location);
 };
 
 #endif
