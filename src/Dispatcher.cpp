@@ -1,4 +1,5 @@
 #include "../includes/Dispatcher.hpp"
+#include "../includes/FileUtils.hpp"
 #include "../includes/Router.hpp"
 #include "../includes/HttpStatus.hpp"
 #include "../includes/DeleteHandler.hpp"
@@ -6,8 +7,10 @@
 #include "../includes/PostHandler.hpp"
 #include <string>
 #include <vector>
+#include <sstream>
 
-HttpResponse Dispatcher::dispatch(const HttpRequest& request, const ServerConfig& server)
+
+HttpResponse Dispatcher::produce_response(const HttpRequest& request, const ServerConfig& server)
 {
     // No matching location is a 404 rather than a synthesized default: building a
     // fallback location out of ServerConfig is config logic and belongs in the
@@ -68,4 +71,43 @@ HttpResponse Dispatcher::dispatch(const HttpRequest& request, const ServerConfig
         return PostHandler::handle(request, *location);
 
     return HttpStatus::make_response(501);
+}
+
+void Dispatcher::attach_error_body(HttpResponse& response, const ServerConfig& server)
+{
+    if (response.status_code < 400)
+        return;
+
+    if (!response.body.empty())
+        return;
+
+    std::map<int, std::string>::const_iterator pages = server.error_pages.find(response.status_code);
+    if (pages != server.error_pages.end())
+    {
+        if (FileUtils::read_file(pages->second, response.body))
+        {
+            response.headers["Content-Type"] = "text/html; charset=UTF-8";
+            return;
+        }
+    }
+    // The floor of the fallback chain: generating a string in memory has no
+    // failure mode. That is what guarantees termination -- if this step could
+    // fail it would need an error page of its own, which could also fail, and
+    // the error path would recurse until the stack gives out. Nothing here may
+    // read the filesystem or the config.
+    std::ostringstream page_body;
+    page_body << "<html><head><title>" << response.status_code << " "
+              << response.status_message << "</title></head><body><h1>"
+              << response.status_code << " " << response.status_message
+              << "</h1></body></html>";
+
+    response.body = page_body.str();
+    response.headers["Content-Type"] = "text/html; charset=UTF-8";
+}
+
+HttpResponse Dispatcher::dispatch(const HttpRequest& request, const ServerConfig& server)
+{
+    HttpResponse response = produce_response(request, server);
+    attach_error_body(response, server);
+    return response;
 }
