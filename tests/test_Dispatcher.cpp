@@ -49,6 +49,7 @@ static void teardown_fixtures()
     unlink(at("/index.html").c_str());
     unlink(at("/victim.txt").c_str());
     unlink(at("/errors/404.html").c_str());
+    unlink(at("/errors/empty.html").c_str());
     rmdir(at("/errors").c_str());
     rmdir(ROOT.c_str());
 }
@@ -63,6 +64,7 @@ static void setup_fixtures()
     write_file(at("/index.html"), "hello");
     write_file(at("/victim.txt"), "delete me");
     write_file(at("/errors/404.html"), "CUSTOM NOT FOUND");
+    write_file(at("/errors/empty.html"), "");
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +385,10 @@ static void test_configured_error_page_is_served()
 
 static void test_missing_error_page_falls_back()
 {
-
+    // The termination test. A configured page that cannot be read must not
+    // become a second error needing its own page: the chain bottoms out in a
+    // generated string, which has no failure mode. A crash or an empty body here
+    // means the fallback recursed instead of terminating.
     setup_fixtures();
 
     ServerConfig server = make_server();
@@ -406,6 +411,7 @@ static void test_no_configured_page_still_gets_a_body()
 
     ServerConfig server = make_server();
     server.locations.push_back(make_location("/files"));
+    // error_pages deliberately left empty
 
     HttpRequest request = make_request("GET", "/somewhere-else");
     HttpResponse response = Dispatcher::dispatch(request, server);
@@ -417,6 +423,9 @@ static void test_no_configured_page_still_gets_a_body()
 
 static void test_204_body_is_left_empty()
 {
+    // Decoration keys on status >= 400, which is what keeps the promise
+    // DeleteHandler's header makes: a 204 carries no representation. Decorating
+    // it would put a body on a response that must not have one.
     setup_fixtures();
 
     ServerConfig server = make_server();
@@ -433,6 +442,8 @@ static void test_204_body_is_left_empty()
 
 static void test_handler_error_body_is_preserved()
 {
+    // The second half of the decoration condition. Decoration only fills an
+    // EMPTY body, so a handler that produced its own error page keeps it.
     setup_fixtures();
 
     ServerConfig server = make_server();
@@ -442,9 +453,107 @@ static void test_handler_error_body_is_preserved()
     HttpRequest request = make_request("GET", "/no_such_file.html");
     HttpResponse response = Dispatcher::dispatch(request, server);
 
+    // GetHandler returns 404 with an empty body, so decoration does fill it here
+    // -- this pins that the two conditions are ANDed, not either/or.
     assert(response.status_code == 404);
     assert(response.body == "CUSTOM NOT FOUND");
     std::cout << "[OK] a handler 404 with no body is decorated" << std::endl;
+}
+
+
+static void test_redirect_with_invalid_code_is_server_error()
+{
+    // Checking only for 0 is too narrow: the config parser does no validation, so
+    // any integer reaches this gate. 42 would put "HTTP/1.1 42" on the wire.
+    setup_fixtures();
+
+    ServerConfig server = make_server();
+    LocationConfig location = make_location("/");
+    location.redirect_url = "/new-home";
+    location.redirect_code = 42;
+    server.locations.push_back(location);
+
+    HttpRequest request = make_request("GET", "/index.html");
+    HttpResponse response = Dispatcher::dispatch(request, server);
+
+    assert(response.status_code == 500);
+    assert(!has_header(response, "Location"));
+    std::cout << "[OK] a redirect with a nonsense code is a 500" << std::endl;
+}
+
+static void test_all_valid_redirect_codes_pass()
+{
+    setup_fixtures();
+
+    const int valid[] = { 301, 302, 303, 307, 308 };
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); ++i)
+    {
+        ServerConfig server = make_server();
+        LocationConfig location = make_location("/");
+        location.redirect_url = "/new-home";
+        location.redirect_code = valid[i];
+        server.locations.push_back(location);
+
+        HttpRequest request = make_request("GET", "/index.html");
+        HttpResponse response = Dispatcher::dispatch(request, server);
+
+        assert(response.status_code == valid[i]);
+        assert(header_value(response, "Location") == "/new-home");
+    }
+    std::cout << "[OK] every real redirect code is passed through" << std::endl;
+}
+
+static void test_directory_as_error_page_falls_back()
+{
+    // An ifstream opens a directory and reads zero bytes, so read_file reports
+    // success with an empty body. Without the non-empty check this ships a 404
+    // with no body -- terminating, but useless to the client.
+    setup_fixtures();
+
+    ServerConfig server = make_server();
+    server.locations.push_back(make_location("/files"));
+    server.error_pages[404] = at("/errors");
+
+    HttpRequest request = make_request("GET", "/somewhere-else");
+    HttpResponse response = Dispatcher::dispatch(request, server);
+
+    assert(response.status_code == 404);
+    assert(!response.body.empty());
+    assert(contains(response.body, "404"));
+    std::cout << "[OK] a directory configured as an error page falls back" << std::endl;
+}
+
+static void test_empty_file_as_error_page_falls_back()
+{
+    setup_fixtures();
+
+    ServerConfig server = make_server();
+    server.locations.push_back(make_location("/files"));
+    server.error_pages[404] = at("/errors/empty.html");
+
+    HttpRequest request = make_request("GET", "/somewhere-else");
+    HttpResponse response = Dispatcher::dispatch(request, server);
+
+    assert(response.status_code == 404);
+    assert(!response.body.empty());
+    std::cout << "[OK] an empty file configured as an error page falls back" << std::endl;
+}
+
+static void test_unknown_method_with_no_restriction()
+{
+    // The other route to the routing default: methods is empty, so the gate is
+    // skipped entirely and PUT arrives without any config having named it. The
+    // answer is the same 501, and this pins that second path.
+    setup_fixtures();
+
+    ServerConfig server = make_server();
+    server.locations.push_back(make_location("/"));   // methods left empty
+
+    HttpRequest request = make_request("PUT", "/index.html");
+    HttpResponse response = Dispatcher::dispatch(request, server);
+
+    assert(response.status_code == 501);
+    std::cout << "[OK] an unrestricted location still refuses an unimplemented method" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +565,8 @@ int main()
     test_redirect_is_answered();
     test_redirect_before_method_gate();
     test_redirect_without_code_is_server_error();
+    test_redirect_with_invalid_code_is_server_error();
+    test_all_valid_redirect_codes_pass();
 
     test_method_not_allowed();
     test_allow_header_has_no_trailing_separator();
@@ -465,12 +576,15 @@ int main()
     test_delete_reaches_delete_handler();
     test_post_reaches_post_handler();
     test_config_allowed_but_unimplemented_method();
+    test_unknown_method_with_no_restriction();
 
     test_configured_error_page_is_served();
     test_missing_error_page_falls_back();
     test_no_configured_page_still_gets_a_body();
     test_204_body_is_left_empty();
     test_handler_error_body_is_preserved();
+    test_directory_as_error_page_falls_back();
+    test_empty_file_as_error_page_falls_back();
 
     teardown_fixtures();
 
