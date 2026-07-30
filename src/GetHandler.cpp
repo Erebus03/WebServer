@@ -7,8 +7,6 @@
 
 HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig& location)
 {
-    // Traversal attempt: 403 not 400 -- the request line is well-formed, we simply
-    // refuse it. 404 would hide the refusal but also lie about paths that exist.
     if (!FileUtils::is_path_safe(request.uri))
         return HttpStatus::make_response(403);
 
@@ -51,8 +49,6 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
                 return HttpStatus::make_response(403);
 
             std::string listing;
-            // generate() fails only if opendir dies on a directory we already
-            // confirmed exists (TOCTOU / FD exhaustion) -- that's a 500, not a 200.
             if (!DirectoryLister::generate(diskPath, request.uri, listing))
                 return HttpStatus::make_response(500);
 
