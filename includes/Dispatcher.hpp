@@ -6,7 +6,7 @@ class Dispatcher{
 private:
     Dispatcher();
 public:
-    static HttpResponse dispatch(HttpRequest& request, const ServerConfig& server);
+    static HttpResponse dispatch(const HttpRequest& request, const ServerConfig& server);
 };
 
 #endif
