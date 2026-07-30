@@ -9,18 +9,26 @@ have the RFC details you'd otherwise have to look up.*
 ## PART 0 — The 30-second version
 
 You own `HttpParser` — turning raw bytes off a socket into a filled-in `HttpRequest`
-struct, and (later) turning an `HttpResponse` struct back into bytes.
+struct — and `ResponseBuilder`, turning an `HttpResponse` struct back into bytes.
 
-**Done so far:**
-- The request line parser (`GET /path HTTP/1.1`)
+**Done:**
+- The request line parser (`GET /path HTTP/1.1`), including query-string splitting
+  and a version check that yields 400 or 505
 - The full header block parser, split into 4 small functions
-- A test file with 4 passing checks
+- Body parsing — both `Content-Length` and chunked, and a rejection when a request
+  carries both (that combination is request smuggling)
+- `ResponseBuilder::build()` — it exists and is what every response goes through
+- The request-line bug from Part 5, fixed
+- Wired into the real server loop as of 2026-07-30 — the server serves real files
 
 **Not done yet:**
-- Body parsing (Content-Length + chunked)
-- Response building — *doesn't exist at all yet*
-- Hooking any of it into the real server loop
-- One known bug in the request line (deliberately left for you — explained in Part 5)
+- **MIME types.** `Content-Type` is hardcoded `text/html` everywhere, so a `.txt`,
+  `.css` or `.png` is mislabelled. This is your next job — Part 7.8.
+- `HEAD` — the dispatcher answers 501, but `config/default.conf` advertises it
+
+**A caveat that undercuts every "done" above:** none of your tests are wired into
+the Makefile, so `tests/test_http_parser.cpp` is not being run by anyone. Building
+it is worth doing before trusting this list.
 
 ---
 
@@ -58,12 +66,17 @@ You serialize it. A sends it.
  2. Browser sends bytes                       → A's recv() into client->input_buf
  3. Bytes get parsed                          → YOUR parse()
  4. Is the request complete yet?              → YOUR state machine says
- 5. If complete → find the right handler      → C's Router
+ 5. If complete → find the right handler      → C's Dispatcher + Router
  6. Handler produces an HttpResponse          → C
- 7. Response gets serialized to text          → YOUR ResponseBuilder (NOT WRITTEN YET)
+ 7. Response gets serialized to text          → YOUR ResponseBuilder
  8. Bytes get sent                            → A's send()
  9. Keep connection alive, or close           → A
 ```
+
+Steps 5–7 all hang off one call in A's `Server::_processRequest()`:
+`Dispatcher::dispatch()` then `ResponseBuilder::build()`. Until 2026-07-30 that
+function returned a hardcoded 501 instead, which meant every line of your code
+and C's was written, compiled, and unreachable.
 
 Steps 3, 4 and 7 are yours.
 
@@ -159,12 +172,13 @@ enum ParseState {
 struct HttpRequest {
     ParseState                          state;
     std::string                         method;        // "GET"
-    std::string                         uri;           // "/api/users/1024"
-    std::string                         query_string;  // after '?' — NOT SPLIT YET
+    std::string                         uri;           // "/api/users/1024" (percent-decoded once)
+    std::string                         query_string;  // after '?', WITHOUT it; kept raw for CGI
     std::string                         version;       // "HTTP/1.1"
     std::map<std::string, std::string>  headers;       // lowercased keys
     std::string                         body;
     bool                                is_complete;   // redundant with state — see note
+    int                                 status;        // code to send on PARSE_ERROR
 };
 
 struct HttpResponse {
@@ -179,9 +193,18 @@ struct HttpResponse {
 
 - `is_complete` is redundant — `state == COMPLETE` already says it. Right now nothing
   writes to it. Either delete it or make sure you set it; a field that's always `false`
-  is a bug waiting to happen when C starts trusting it.
-- `query_string` is declared but you never fill it. Currently `/search?q=cat` puts
-  `"/search?q=cat"` entirely in `uri`. Splitting it is on the TODO list (Part 7).
+  is a bug waiting to happen when C starts trusting it. **Still true.**
+- `query_string` **is** filled now — `parse()` splits on the first `?` and leaves the
+  query percent-encoded, because CGI hands `QUERY_STRING` to the script undecoded.
+  The path half is decoded exactly once, before the traversal check, so `is_path_safe`
+  sees `..` rather than `%2e%2e`.
+- `status` is the code to send when `parse()` returns `PARSE_ERROR`. It is seeded to
+  400 at the top of `parse()` — so it is never uninitialised — and overwritten with
+  505 when the version is one we don't speak. **A cautionary tale:** this field was
+  added and populated correctly, but A's `_advanceRequest()` kept passing a literal
+  400 and ignored it, so 505 was unreachable for several commits. Populating a field
+  and consuming it are two separate pieces of work, and no parser test can catch the
+  gap between them.
 
 **`state` is your memory between calls.** The parser object itself is nearly stateless —
 the progress lives in the `HttpRequest`, which lives on the `Client`, which survives
@@ -437,9 +460,16 @@ is to append. Fine for this project, worth knowing if you're asked in defense.
 
 ---
 
-## PART 5 — The bug you still need to fix
+## PART 5 — The bug you still need to fix — **FIXED 2026-07-30**
 
-**Location:** `src/HttpParser.cpp`, lines 25–29, in `parse()`.
+> **This bug is fixed.** `parse()` now returns `PARSE_INCOMPLETE` when no
+> `\r\n` is present instead of setting `ERROR`. Keep reading anyway: the
+> reasoning below is the single best "tell me about a bug you found" story in
+> this project, and the distinction it draws — *absence of data is not the same
+> as bad data* — is the whole idea behind a resumable parser. The current code
+> is quoted at the end of the section.
+
+**Location (historic):** `src/HttpParser.cpp`, in `parse()`.
 
 ```cpp
 size_t line_end = bytes.find("\r\n");
@@ -492,67 +522,105 @@ if (line_end == std::string::npos)
 Test #2 in `tests/test_http_parser.cpp` already covers the equivalent case for headers.
 Add one for the request line when you fix this.
 
+### What actually shipped
+
+```cpp
+ParseResult HttpParser::parse(const std::string& bytes, HttpRequest& request, size_t& consumed)
+{
+    consumed = 0;
+    request.status = 400;   // set now, so any error path already has a code
+
+    size_t line_end = bytes.find("\r\n");
+    if (line_end == std::string::npos)
+        return PARSE_INCOMPLETE;          // ← the fix
+    if (!parseRequestLine(bytes.substr(0, line_end), request)) {
+        request.state = ERROR;
+        return PARSE_ERROR;
+    }
+    ...
+```
+
+Two things to notice beyond the fix itself. The function now returns a
+`ParseResult` rather than writing only to `request.state`, which is what let the
+read handler stop guessing. And `request.status` is seeded to 400 on the very
+first line — so every later rejection has a usable code and the field can never
+be read uninitialised, with `parseRequestLine` overwriting it with 505 for an
+HTTP version we don't speak.
+
 ### The related question worth thinking about on the bus
 
 If a malicious client opens a connection and sends `"GET /"` and then *nothing*, forever
 — with the fix above, you wait forever. That's the **Slowloris attack**. The defence
-isn't in the parser; it's Member A's timeout (`Client::isTimedOut`, already written) plus
-a cap on how large `input_buf` may grow before you give up. Worth raising with A. Also
-worth having an answer ready for it at defense — evaluators ask.
+isn't in the parser; it's Member A's side, and both halves now exist: a
+`REQUEST_TIMEOUT_SEC` clock anchored to the request's *first* byte and deliberately
+never refreshed (so dribbling one byte a minute cannot reset your way out of it),
+plus a `MAX_HEADER_BYTES` cap on how large `input_buf` may grow before giving up
+with a 431. Have this answer ready for the defense — evaluators ask.
 
 ---
 
 ## PART 6 — The tests
 
-`tests/test_http_parser.cpp`, currently 4 checks, all passing:
+`tests/test_http_parser.cpp`, 5 checks, all passing (verified 2026-07-30):
 
 | # | What it proves |
 |---|---|
-| 1 | Full realistic request → correct method/uri/version, all 4 headers lowercased and trimmed, `state == COMPLETE` |
-| 2 | Headers cut off mid-way → stays `READING_HEADERS`, does **not** error |
-| 3 | `Content-Length: 27` present → `state == READING_BODY` |
-| 4 | Header line with no colon → `state == ERROR` |
+| 1 | Full realistic request → `PARSE_COMPLETE`, correct method/uri/version, all 4 headers lowercased and trimmed, `consumed` = whole buffer |
+| 2 | Headers cut off mid-way → `PARSE_INCOMPLETE`, `consumed == 0` (nothing to drop while waiting) |
+| 3 | `Content-Length` present but body missing → `PARSE_INCOMPLETE`, `state == READING_BODY` |
+| 4 | Header line with no colon → `PARSE_ERROR` |
+| 5 | Two pipelined requests in one buffer → `consumed` splits them cleanly, both parse |
 
 ### How to run them
 
-There's a wrinkle: only one `main()` can link into the binary. Right now the **test**
-`main()` is active and `src/main.cpp`'s scratch `main()` is commented out.
-
 ```bash
-make re
-./webserv
+c++ -Wall -Wextra -Werror -g -std=c++98 \
+    tests/test_http_parser.cpp src/HttpParser.cpp src/HttpVersion.cpp \
+    -o /tmp/test_parser && /tmp/test_parser
 ```
 
 Expected output:
 
 ```
-[PASS] full request parses method/uri/version/headers, state=COMPLETE
-[PASS] partial headers wait instead of erroring
-[PASS] Content-Length header moves state to READING_BODY
-[PASS] header line with no colon is flagged ERROR
+[PASS] full request -> PARSE_COMPLETE, consumed = whole buffer
+[PASS] partial headers -> PARSE_INCOMPLETE, consumed = 0
+[PASS] Content-Length, body missing -> PARSE_INCOMPLETE
+[PASS] header with no colon -> PARSE_ERROR
+[PASS] pipelined requests: consumed splits the buffer cleanly
 All HttpParser tests passed.
 ```
 
-To switch back to the scratch harness: comment out `main()` in
-`tests/test_http_parser.cpp`, uncomment it in `src/main.cpp`, `make re`.
+> **The old instructions here were dangerous — do not follow them anywhere else
+> in this repo.** They said to comment out `main()` in `src/main.cpp` so the test
+> `main()` could link. Someone did exactly that, and `webserv` stopped linking
+> entirely (`undefined reference to 'main'`) until it was restored on 2026-07-30.
+> **Never comment out `src/main.cpp`.** The test file has its own `main()` and is
+> compiled separately, as above — it does not go through the Makefile at all.
 
-`assert()` aborts the program on the first failure and prints the file and line number.
-Note that `assert` compiles to nothing if `NDEBUG` is defined — it isn't here, so you're
-fine, but don't put logic with side effects inside an `assert(...)`.
+`assert()` aborts on the first failure and prints file and line. It compiles to
+nothing under `NDEBUG` — not defined here, so you're fine, but don't put logic
+with side effects inside an `assert(...)`.
 
-**This one-main()-at-a-time dance is temporary and a bit ugly.** Once the server proper
-is running, the cleanest fix is a separate `make test` target that builds the test files
-against a different entry point. Worth doing when it starts annoying you.
+**Still missing: a `make test` target.** None of `test_http_parser.cpp`,
+`test_config.cpp` or `test_integration.cpp` is referenced by the Makefile, so in
+practice nobody runs them. The one-line-per-test-binary target is the fix, and it
+is what makes the "all passing" claim above verifiable instead of folkloric.
 
 ---
 
 ## PART 7 — What's left, in the order to do it
 
-### 7.1 Fix the request-line bug
+> **Status 2026-07-30: 7.1 through 7.7 and 7.9 are all DONE.** Only **7.8 (MIME
+> types)** is still open, plus `HEAD` support, which this list never mentioned.
+> The sections are kept because each one explains *why* the piece is shaped the
+> way it is — read them as documentation of what exists, not as a work queue.
+> Each is marked inline below.
+
+### 7.1 Fix the request-line bug — DONE
 Part 5. Ten minutes. Do it first — it's a correctness bug in code you've already
 "finished," and those are the ones that get forgotten.
 
-### 7.2 Split the query string
+### 7.2 Split the query string — DONE
 Right now `/search?q=cat&page=2` lands entirely in `uri`, and `query_string` stays empty.
 C's router needs them separate — and CGI *requires* `QUERY_STRING` as its own
 environment variable.
@@ -567,7 +635,7 @@ if (qmark != std::string::npos) {
 }
 ```
 
-### 7.3 Body parsing — Content-Length case
+### 7.3 Body parsing — Content-Length case — DONE
 The straightforward one. You know exactly how many bytes to expect.
 
 - Body starts at `header_end + 4` (past `\r\n\r\n`).
@@ -580,7 +648,7 @@ The straightforward one. You know exactly how many bytes to expect.
 - Use `strtol` and check for overflow rather than bare `atoi`, which has no error
   reporting — `atoi("abc")` silently returns 0.
 
-### 7.4 Body parsing — chunked case
+### 7.4 Body parsing — chunked case — DONE
 The one people get wrong. Format:
 
 ```
@@ -604,7 +672,7 @@ Rules that bite people:
 
 Test it with: `curl -X POST --header "Transfer-Encoding: chunked" -d @file http://localhost:8080/`
 
-### 7.5 ResponseBuilder — doesn't exist yet
+### 7.5 ResponseBuilder — DONE (it exists now: `src/ResponseBuilder.cpp`)
 The whole second half of your job. `HttpResponse` is defined in `types.hpp` and nothing
 turns it into bytes. Nothing can be sent to a browser until this exists.
 
@@ -638,7 +706,7 @@ Requirements:
   std::stringstream ss; ss << body.size(); std::string len = ss.str();
   ```
 
-### 7.6 Default error pages
+### 7.6 Default error pages — DONE (`HttpStatus` + `Dispatcher::attach_error_body`)
 When something goes wrong and the config specifies no custom page, generate one:
 
 ```cpp
@@ -648,7 +716,7 @@ std::string ResponseBuilder::defaultErrorPage(int code, const std::string& messa
 Small self-contained HTML — `<h1>404 Not Found</h1>` and a line of text. Needed for
 400/403/404/405/413/500/501/505.
 
-### 7.7 Directory listing HTML
+### 7.7 Directory listing HTML — DONE (`DirectoryLister`, Member C)
 When `dir_listing` is on and the URI maps to a directory with no index file, generate an
 HTML index. You produce the HTML; C reads the directory with `opendir`/`readdir`
 (that's their side of the line). Agree on the interface — probably C hands you a
@@ -657,11 +725,11 @@ HTML index. You produce the HTML; C reads the directory with `opendir`/`readdir`
 Remember to HTML-escape filenames (`&` → `&amp;`, `<` → `&lt;`). A file named
 `<script>.txt` should not become executable markup.
 
-### 7.8 MIME type table
+### 7.8 MIME type table — **STILL OPEN — this is the next job**
 `Content-Type` from file extension. Table in Part 8. A `std::map<std::string,
 std::string>` built once. Default to `application/octet-stream` for unknown extensions.
 
-### 7.9 Hook into the real server
+### 7.9 Hook into the real server — DONE 2026-07-30
 `src/Server.cpp` around line 256 still has this:
 
 ```cpp
@@ -836,24 +904,50 @@ code you wrote badly yourself.
 
 ## Quick status
 
+Last verified 2026-07-30 against the running server, not just the source.
+
 ```
 DONE     Request line parsing (method / uri / version)
 DONE     Header block parsing, split into 4 testable functions
 DONE     Case-insensitive header names, whitespace trimming
 DONE     Body-vs-complete detection (Content-Length + chunked)
-DONE     4 passing tests
 DONE     Compiles clean with -Wall -Wextra -Werror -std=c++98
 
-BUG      Request line treats "incomplete" as ERROR         ← fix first
-TODO     Query string split
-TODO     Body parsing — Content-Length
-TODO     Body parsing — chunked
-TODO     ResponseBuilder::build()                          ← biggest remaining piece
-TODO     Default error pages
-TODO     Directory listing HTML
-TODO     MIME type table
-TODO     Replace the Hello World placeholder in Server.cpp (needs A and C)
+DONE     Request line "incomplete" bug   parse() returns PARSE_INCOMPLETE when
+                                         no \r\n is present yet, so a split
+                                         request no longer reads as malformed
+DONE     Query string split              HttpParser.cpp — splits on the FIRST
+                                         '?', query kept raw for CGI
+DONE     Body parsing — Content-Length
+DONE     Body parsing — chunked          + rejects chunked AND Content-Length
+                                         together (request smuggling)
+DONE     Status code on PARSE_ERROR      HttpRequest::status; 400 by default,
+                                         505 for a version we don't speak
+DONE     ResponseBuilder::build()        owns Content-Length/Date/Server/
+                                         Connection; handler's Content-Type wins
+DONE     Default error pages             HttpStatus + Dispatcher::attach_error_body
+DONE     Directory listing HTML          DirectoryLister (Member C)
+DONE     Hooked into the real server     Server::_processRequest now calls
+                                         Dispatcher::dispatch -> ResponseBuilder
+
+TODO     MIME type table                 ← your biggest remaining piece
+TODO     HEAD support                    Dispatcher falls through to 501, but
+                                         default.conf advertises HEAD
 ```
 
-Next session, start with the bug, then ResponseBuilder — nothing reaches a browser until
-that exists.
+**The server serves real files now.** Verified end to end: 200 on index and a
+nested file, 404, directory listing, 405 with `Allow`, 400 malformed, 505 bad
+version, 403 on raw and percent-encoded traversal, keep-alive reuse, and two
+pipelined requests in one write answered on one connection.
+
+Next piece to own is the **MIME table**. `Content-Type` is currently hardcoded
+to `text/html` in five places (`ResponseBuilder.cpp:47`, `Dispatcher.cpp:80,92`,
+`GetHandler.cpp:56`, `Server.cpp`), so a `.txt`, `.css`, `.js` or `.png` is
+served as HTML and browsers render binaries as garbage.
+`ResponseBuilder.cpp:42` already marks the seam: extension → type lookup,
+with `ResponseBuilder` as the single place that decides, and handlers setting
+`Content-Type` only when they genuinely know better (the directory lister does).
+
+Caveat on the tests: `tests/test_http_parser.cpp` has **no Makefile target** —
+nothing builds it, so it is not actually being run. Compiling it by hand is
+step one before trusting any "DONE" above.

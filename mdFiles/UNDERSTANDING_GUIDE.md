@@ -162,8 +162,10 @@ Walk this chain in your head until it's reflex — it's the #1 interview questio
    means "come back with more bytes" and we return — **this is the gate**, and
    it is why a request split across ten segments still produces exactly one
    response. Once headers are in, `Host` selects the virtual host (§5.4.1).
-7. **Route → handle** *(`_processRequest`; answers 501 until the Dispatcher
-   exists)* — the response bytes are appended to `client->output_buf`.
+7. **Route → handle** — `_processRequest` calls `Dispatcher::dispatch`
+   (Router picks the location, a handler produces an `HttpResponse`), then
+   `ResponseBuilder::build` serialises it and the bytes are appended to
+   `client->output_buf`.
 8. **`poll()` reports `POLLOUT`** (we only ask for it when output is pending)
    and **`send()`** pushes as much as the kernel will take; `bytes_sent`
    remembers our position; repeat until drained.
@@ -637,9 +639,10 @@ The 4 KB stack buffer is just a shuttle between kernel space and
 `input_buf` — its size only affects how many loop iterations a large upload
 takes, not correctness.
 
-*(Past the gate, `_processRequest()` is the hand-off seam. It currently answers
-**501 Not Implemented** — an honest placeholder rather than a fake 200 — until
-`Dispatcher` has an interface to call.)*
+*(Past the gate, `_processRequest()` is the hand-off seam: it calls
+`Dispatcher::dispatch` for the `HttpResponse` and `ResponseBuilder::build` for
+the wire bytes, and knows nothing about routing or HTTP syntax itself — see
+§12.9 for why it deliberately does not consult `statusForcesClose()`.)*
 
 ### 5.4.1 Choosing the virtual host — `_resolveServerConfig(client)`
 
@@ -1051,22 +1054,43 @@ maintained alongside the enum, which is what §5.4.1 relies on to settle the
 virtual host the moment headers land — before the body accumulates, so the
 right server block's `client_max_body_size` is the one being enforced.
 
-Still open on this seam: `PARSE_ERROR` reports no status code (§12.3), and
-chunked transfer decoding is unimplemented.
+Both items that were open on this seam are now closed: `PARSE_ERROR` carries a
+status code (§12.3) and chunked transfer decoding landed.
 
-**`Router` (Member C, in progress):** `match(uri, server)` — finds the
-location block with the **longest matching prefix** (`/uploads/photos` beats
-`/uploads` beats `/`), with a guard that `/upload` does NOT match location
-`/up` (a prefix must end at a `/` boundary unless it's the whole segment).
-Longest-prefix is nginx's rule: most-specific configuration wins.
-Coming: method checks (405), file path resolution, GET/POST/DELETE/CGI
-handlers.
+**`ResponseBuilder` (Member B):** `build(response, keep_alive)` — the mirror of
+the parser, turning a filled `HttpResponse` into wire bytes. It **always** owns
+`Content-Length` (computed from the body), `Date`, `Server` and `Connection`,
+and skips any handler-supplied copies of those, so a handler cannot desync the
+framing. `Content-Type` is the exception: the handler's value wins if it set
+one. Status text falls back to C's `HttpStatus` table when the handler left it
+empty, keeping one source of truth for reason phrases.
+
+**`Router` (Member C):** `match(uri, server)` — finds the location block with
+the **longest matching prefix** (`/uploads/photos` beats `/uploads` beats `/`),
+with a guard that `/upload` does NOT match location `/up` (a prefix must end at
+a `/` boundary unless it's the whole segment). Longest-prefix is nginx's rule:
+most-specific configuration wins.
+
+**`Dispatcher` (Member C):** `dispatch(request, server)` = `produce_response()`
+then `attach_error_body()`. It takes a `ServerConfig` rather than a
+`LocationConfig` — unlike the handlers — because it calls `Router::match`
+itself and because error decoration reads `ServerConfig::error_pages`. Order of
+checks: no location → 404; `redirect_url` set → 3xx (or 500 if the configured
+code is not a redirect code); method not in `allowed_methods` → 405 with an
+`Allow` header listing them; then GET/DELETE/POST to a handler; anything else
+→ 501.
 
 **The integration seam** (why merging should be mechanical, not painful):
 B consumes `client->input_buf`, produces a `Request`. C consumes the
-`Request` + `Config`, produces a `Response`. The serializer turns it into
+`Request` + `Config`, produces a `Response`. `ResponseBuilder` turns it into
 bytes in `client->output_buf`. Server (A) never learns what HTTP is; B and C
 never learn what a socket is.
+
+The seam is **joined** as of 2026-07-30 — `_processRequest()` calls
+`Dispatcher::dispatch` then `ResponseBuilder::build` (§12.9). Until that day
+all of B's and C's code was fully written but reachable from nothing, which is
+the failure mode this three-way split invites: each column can be complete and
+tested on its own while the product does nothing.
 
 ---
 
@@ -1140,7 +1164,7 @@ Practice answering these out loud, from memory, then check against the section.
 **Design & honesty** *(the differentiators)*
 23. How would you scale this to 100k connections? *("swap poll for epoll behind the same seam; then sharded event loops per core — the nginx model")*
 24. What would you do differently in modern C++? *(unique_ptr in the client map, std::atomic for the signal flag, string_view in the parser, std::expected instead of throw-a-string)*
-25. What's the weakest part of your current code? *(honest options: plain bool vs sig_atomic_t; connection-close after every response — no keep-alive yet; timeout constant not yet configurable; a failed listen doesn't abort startup)*
+25. What's the weakest part of your current code? *(honest options: CGI is entirely unwritten and POST is a 501 stub; no MIME table, so everything is served as `text/html`; plain bool vs sig_atomic_t; timeout constants not configurable; a failed listen doesn't abort startup)*
 
 Question 25 matters most. Interviewers trust people who know their own
 code's limits far more than people who claim it's perfect.
@@ -1208,16 +1232,28 @@ members and friends at link time. C++98 has no `= delete`, so this pair is the
 idiom. Neither class was ever copied, so this costs nothing and converts an
 assumption into something the compiler enforces.
 
-### 12.3 `PARSE_ERROR` carries no status code
+### 12.3 `PARSE_ERROR` carries no status code — FIXED 2026-07-30
 
-Member B's `parse()` contract (§8) landed with three of the four things the
-read handler asked for: the `consumed` out-param, whole-buffer feeding, and a
-still-maintained `request.state`. The fourth is open — `PARSE_ERROR` is
-documented as "send 400 and close", so `_handleClientRead` hardcodes 400.
+Was: `PARSE_ERROR` was documented as "send 400 and close", so `_advanceRequest`
+hardcoded 400 — merging statuses that are genuinely different.
 
-That merges statuses that are genuinely different: an unknown method is 501,
-a bad HTTP version is 505, oversized headers are 431. Needs an int status on
-the request, set by the parser when it rejects.
+Fixed in two halves, and the second one lagged the first by several commits.
+B added `int status` to `HttpRequest` (`types.hpp`) and set it in the parser:
+`parse()` seeds it to 400 before touching anything, so every rejection has a
+usable code and the field can never be read uninitialised; `checkHttpVersion()`
+overwrites it with 505 for a version we do not speak.
+
+The server half stayed broken meanwhile — `_advanceRequest` still passed a
+literal 400 and threw the parser's code away, so **505 was unreachable even
+though the parser computed it correctly**. Worth remembering as a pattern: a
+field being populated is not the same as a field being consumed, and the tests
+that covered the parser could not see the gap. It surfaced only by sending
+`GET / HTTP/9.9` to the running server.
+
+Now `_startErrorResponse(client, client->request.status)`. 505 was also added
+to `reasonPhrase()` (it was falling through to the generic "Error") and to
+`statusForcesClose()` — rejection happens at the request line, so the rest of
+that stream was never parsed and the connection cannot be framed again.
 
 ### 12.4 Commented-out code in `Server.cpp` — FIXED 2026-07-27
 
@@ -1259,18 +1295,66 @@ progress yet "looked idle" and was killed after IDLE_TIMEOUT_SEC. Now sending
 bytes counts as activity. The stall clock still catches peers that stop
 reading entirely — the two clocks measure different failures.
 
-### 12.8 Still open elsewhere
+### 12.9 `_processRequest()` was a 501 placeholder — FIXED 2026-07-30
 
-- **Chunked transfer decoding** is unimplemented in `HttpParser` (Member B).
-- **`_processRequest()`** is still the honest 501 placeholder — it answers
-  `501 Not Implemented` rather than faking a 200, and stays that way until
-  `Dispatcher` has an interface to call. Not a bug; do not "fix" it by
-  hardcoding a response.
-- **`.gitignore` has 4 dead rules** (`tests/*`, `tests/`, `Makefile`,
-  `mdFiles/UNDERSTANDING_GUIDE.md`, `.idea/`) — those paths are already
-  tracked, and `.gitignore` only affects untracked files, so the rules do
-  nothing. Left as-is deliberately; `.git/info/exclude` is the right tool if
-  per-clone ignoring is ever wanted.
+Was: the integration seam answered every well-formed request with a hardcoded
+`501 Not Implemented`, waiting for `Dispatcher` to exist. It did exist —
+`Dispatcher`, `Router`, the three handlers, `HttpStatus` and `ResponseBuilder`
+had all landed, fully implemented, and had **zero callers**. The whole response
+pipeline was dead code reachable from nothing, and the stale comment
+("Dispatcher.hpp is still empty") is what kept it looking intentional.
+
+Now `_processRequest` sequences and nothing more:
+
+```
+Dispatcher::dispatch(request, *server_cfg)   // what to answer
+  -> ResponseBuilder::build(response, keep_alive)   // how it looks on the wire
+  -> output_buf + beginSending()
+```
+
+One deliberate asymmetry with `_startErrorResponse`: **`statusForcesClose()` is
+not consulted here.** That helper exists for replies sent when framing is
+unknown — after a malformed request, a timeout, or a body cut off by the cap,
+there is unread garbage queued and the next request would be framed out of it.
+A dispatched response is the opposite case: the parser reported COMPLETE and
+`_advanceRequest()` erased exactly `consumed` bytes, so what remains in
+`input_buf` is a clean request boundary. A 404 or a 405 is a normal answer to a
+well-formed request and must not cost the client its connection.
+
+A null `server_cfg` falls back to a 500 through the legacy path, which needs no
+config to render. That branch means the fd→server map was empty — a config or
+bind bug, never anything the client sent.
+
+**Verified** against `tests/local-test.conf`, not just reasoned: 200 on index
+and on a nested file, 404, 200 directory listing, 405 carrying `Allow: GET`,
+501 from the POST stub, 400 malformed, 505 bad version, 403 on both raw and
+percent-encoded traversal, keep-alive reuse (`num_connects=0` on request 2),
+and two pipelined requests written in a single `write()` answered with two
+responses on one connection.
+
+### 12.10 Still open elsewhere
+
+- **`src/CgiHandler.cpp` is a 0-byte file.** CGI is a subject requirement and
+  is entirely unwritten; `_handleCgiPipeRead()` is an empty stub and the CGI
+  pipe fds are never added to the poll set (`Server.cpp`, two `TODO`s).
+- **`PostHandler` is a stub** — returns 501 and `(void)`s both parameters, so
+  uploads do not work. It is the last handler with no real body.
+- **No MIME table.** `Content-Type` is hardcoded to `text/html` in five places
+  (`ResponseBuilder.cpp`, `Dispatcher.cpp` ×2, `GetHandler.cpp`,
+  `Server.cpp`), so a `.txt`, `.css` or `.png` is served as HTML.
+  `ResponseBuilder.cpp:42` already names the intended fix (`MimeTypes`).
+- **`HEAD` is unimplemented** — `Dispatcher::produce_response` falls through to
+  501, yet `config/default.conf` lists `HEAD` in `allowed_methods`, so the
+  config promises a method the server refuses.
+- **No test target in the Makefile.** `tests/test_config.cpp`,
+  `test_http_parser.cpp` and `test_integration.cpp` are never built; they have
+  to be compiled by hand, which means in practice they are not being run.
+- **`.gitignore` has 3 dead rules** (`Makefile`, `tests/`,
+  `mdFiles/UNDERSTANDING_GUIDE.md`) — those paths are already tracked, and
+  `.gitignore` only affects untracked files, so the rules do nothing.
+  `.idea/` used to be a fourth; it was resolved on 2026-07-30 with
+  `git rm -r --cached .idea/`, which is the fix the others need if they are
+  ever meant to take effect. Left as-is deliberately.
 
 ---
 
