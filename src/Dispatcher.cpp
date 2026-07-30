@@ -6,6 +6,7 @@
 #include "../includes/GetHandler.hpp"
 #include "../includes/PostHandler.hpp"
 #include <string>
+#include <map>
 #include <vector>
 #include <sstream>
 
