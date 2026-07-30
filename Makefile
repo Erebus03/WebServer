@@ -11,6 +11,7 @@ SRCS = \
 	src/HttpParser.cpp \
 	src/HttpVersion.cpp \
 	src/HttpStatus.cpp \
+	src/ResponseBuilder.cpp \
 	src/Client.cpp \
 	src/Server.cpp \
 	src/GetHandler.cpp \
@@ -31,6 +32,8 @@ INCLUDES = \
 	includes/GetHandler.hpp \
 	includes/HttpParser.hpp \
 	includes/HttpVersion.hpp \
+	includes/HttpStatus.hpp \
+	includes/ResponseBuilder.hpp \
 	includes/DeleteHandler.hpp \
 	includes/Server.hpp \
 	includes/PostHandler.hpp \
