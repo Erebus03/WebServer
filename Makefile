@@ -1,7 +1,7 @@
 NAME = webserv
 
 CXX = c++
-CXXFLAGS = -Wall -Wextra -Werror -g -std=c++98
+CXXFLAGS = -Wall -Wextra -Werror -std=c++98
 
 SRCS = \
 	src/main.cpp \
@@ -17,11 +17,13 @@ SRCS = \
 	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
+	src/HttpStatus.cpp \
 	tests/test_router.cpp \
 	tests/test_FileUtils.cpp \
 	tests/test_GetHandler.cpp \
 	tests/test_Dispatcher.cpp \
 	tests/test_DirectoryLister.cpp \
+	tests/test_HttpStatus.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
@@ -39,6 +41,7 @@ INCLUDES = \
 	includes/CgiHandler.hpp \
 	includes/DirectoryLister.hpp \
 	includes/FileUtils.hpp \
+	includes/HttpStatus.hpp \
 
 all: $(NAME)
 
