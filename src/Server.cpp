@@ -1,5 +1,7 @@
 #include "../includes/Server.hpp"
 #include "../includes/FileUtils.hpp"
+#include "../includes/Dispatcher.hpp"
+#include "../includes/ResponseBuilder.hpp"
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -382,7 +384,9 @@ static std::string reasonPhrase(int code) {
         case 408: return "Request Timeout";
         case 413: return "Content Too Large";
         case 431: return "Request Header Fields Too Large";
+        case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
+        case 505: return "HTTP Version Not Supported";
         default:  return "Error";
     }
 }
@@ -405,6 +409,7 @@ static bool statusForcesClose(int code) {
         case 408:   // we gave up mid-request
         case 413:   // body cut short by the cap
         case 431:   // headers cut short by the cap
+        case 505:   // rejected at the request line; rest of the stream unread
             return true;
         default:
             return false;
@@ -544,12 +549,43 @@ void Server::_resolveServerConfig(Client* client) {
     }
 }
 
+// Integration seam. Reached only for a request the parser called COMPLETE,
+// exactly once per request. Sequences the response pipeline and nothing else:
+// Dispatcher decides WHAT to answer (Router::match -> handler -> error body),
+// ResponseBuilder decides how it looks on the wire. Neither knows about
+// sockets, and this function knows about neither routing nor HTTP syntax.
 void Server::_processRequest(Client* client) {
-    // Integration seam. Reached only for a request the parser called COMPLETE,
-    // exactly once per request. Dispatcher.hpp is still empty, so until it has
-    // an interface this answers honestly rather than faking a 200.
-    // TODO: Router::match() -> Dispatcher -> HttpResponse -> serialise to output_buf.
-    _startErrorResponse(client, 501);
+    // _resolveServerConfig() runs at the end of the header section and always
+    // installs candidates[0] when the listening socket has any server block, so
+    // a null here means the fd->server map was empty — a config/bind bug, not
+    // anything the client did. 500 via the legacy path, which needs no config.
+    if (!client->server_cfg) {
+        _startErrorResponse(client, 500);
+        return;
+    }
+
+    const HttpResponse response =
+        Dispatcher::dispatch(client->request, *client->server_cfg);
+
+    // Unlike the _startErrorResponse path, statusForcesClose() is deliberately
+    // NOT consulted here. It exists for replies sent when framing is unknown
+    // (a malformed request, a timeout, a body cut off by the cap) — reusing the
+    // connection would then frame the next request out of garbage. None of that
+    // applies to a dispatched response: the parser reported COMPLETE and
+    // _advanceRequest() erased exactly `consumed` bytes, so whatever remains in
+    // input_buf is a clean request boundary. A 404 or 405 is a normal answer to
+    // a well-formed request and must not cost the client its connection.
+    client->keep_alive = requestWantsKeepAlive(client->request);
+
+    const std::string wire = ResponseBuilder::build(response, client->keep_alive);
+    client->output_buf.assign(wire.begin(), wire.end());
+    client->beginSending();
+
+    // Same bookkeeping as _startErrorResponse: the request is fully consumed,
+    // so stop its deadline clock, and give the response a full idle window to
+    // drain before the reaper could consider the connection quiet.
+    client->request_start = 0;
+    client->last_activity = std::time(NULL);
 }
 void Server::_handleClientRead(int client_fd) {
     std::map<int, Client*>::iterator it = clients.find(client_fd);
@@ -609,7 +645,12 @@ void Server::_advanceRequest(Client* client) {
     client->parser.parse(bytes, client->request, consumed);
 
     if (client->request.state == ERROR) {
-        _startErrorResponse(client, 400);
+        // Use the code the parser chose, not a blanket 400. parse() seeds
+        // request.status to 400 before doing anything, so every rejection has a
+        // usable code and this can never read an uninitialised field; the
+        // request-line check overwrites it with 505 for a version we do not
+        // speak. Hardcoding 400 here is what made 505 unreachable.
+        _startErrorResponse(client, client->request.status);
         return;
     }
 
