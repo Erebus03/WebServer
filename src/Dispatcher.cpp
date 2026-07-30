@@ -12,7 +12,7 @@
 
 HttpResponse Dispatcher::produce_response(const HttpRequest& request, const ServerConfig& server)
 {
-        // No matching location is a 404 rather than a synthesized default: building a
+    // No matching location is a 404 rather than a synthesized default: building a
     // fallback location out of ServerConfig is config logic and belongs in the
     // parser. Consequence accepted -- every config must carry an explicit root
     // location, or it serves nothing.
