@@ -10,6 +10,7 @@ SRCS = \
 	src/Config.cpp \
 	src/HttpParser.cpp \
 	src/HttpVersion.cpp \
+	src/HttpStatus.cpp \
 	src/Client.cpp \
 	src/Server.cpp \
 	src/GetHandler.cpp \
