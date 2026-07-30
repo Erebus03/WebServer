@@ -14,6 +14,7 @@
       <w>diskpath</w>
       <w>endl</w>
       <w>gethandler</w>
+      <w>ifstream</w>
       <w>noread</w>
       <w>qout</w>
     </words>
