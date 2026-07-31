@@ -398,24 +398,6 @@ static std::string toLowerCopy(const std::string& s) {
     return out;
 }
 
-// Some failures make the byte stream itself untrustworthy: after a malformed
-// request we do not know where it ended, and after a timeout or a size cap
-// there is unread garbage still queued. Reusing such a connection would frame
-// the NEXT request out of leftovers. 501 is not in that class — it is a normal
-// answer to a well-formed request, so the connection may persist.
-static bool statusForcesClose(int code) {
-    switch (code) {
-        case 400:   // framing unknown
-        case 408:   // we gave up mid-request
-        case 413:   // body cut short by the cap
-        case 431:   // headers cut short by the cap
-        case 505:   // rejected at the request line; rest of the stream unread
-            return true;
-        default:
-            return false;
-    }
-}
-
 // RFC 9112 §9.3. HTTP/1.1 is persistent unless told otherwise; HTTP/1.0 is the
 // reverse and needs an explicit opt-in. `Connection` may carry a list
 // ("keep-alive, Upgrade"), hence substring matching rather than equality.
@@ -432,9 +414,19 @@ static bool requestWantsKeepAlive(const HttpRequest& request) {
     return true;                                   // HTTP/1.1 default
 }
 
-void Server::_startErrorResponse(Client* client, int status_code) {
+// `framing` is required rather than inferred from status_code. Whether the
+// connection survives depends on whether we still know where this request
+// ended — which the caller knows and the status number does not. The old
+// version kept a hardcoded list (400/408/413/431/505) that happened to be
+// right at every call site; the failure mode was that a NEW pre-parse
+// rejection (a 414 for an over-long request line, say) would default to
+// "reusable", leaving a desynced connection open. That corrupts every
+// subsequent request on it, and only shows up under pipelining plus malformed
+// input — i.e. never in a simple test.
+void Server::_startErrorResponse(Client* client, int status_code,
+                                 FramingState framing) {
     const std::string reason = reasonPhrase(status_code);
-    client->keep_alive = !statusForcesClose(status_code) &&
+    client->keep_alive = (framing == FRAMING_INTACT) &&
                          requestWantsKeepAlive(client->request);
 
     std::string body;
@@ -484,7 +476,9 @@ bool Server::_enforceReadLimits(Client* client) {
     if (client->request.state != READING_BODY &&
         client->request.state != COMPLETE &&
         received > MAX_HEADER_BYTES) {
-        _startErrorResponse(client, 431);
+        // Header section never closed, so we have no idea where this
+        // request ends. Stream is unusable.
+        _startErrorResponse(client, 431, FRAMING_LOST);
         return false;
     }
 
@@ -495,7 +489,11 @@ bool Server::_enforceReadLimits(Client* client) {
         const size_t max_total =
             MAX_HEADER_BYTES + client->server_cfg->client_max_body_size;
         if (received > max_total) {
-            _startErrorResponse(client, 413);
+            // We return before erasing `consumed`, and the client is very
+            // likely still sending body bytes we will never read. Even
+            // when the parser reached COMPLETE, the boundary is not acted
+            // on, so treat the stream as lost.
+            _startErrorResponse(client, 413, FRAMING_LOST);
             return false;
         }
     }
@@ -560,7 +558,9 @@ void Server::_processRequest(Client* client) {
     // a null here means the fd->server map was empty — a config/bind bug, not
     // anything the client did. 500 via the legacy path, which needs no config.
     if (!client->server_cfg) {
-        _startErrorResponse(client, 500);
+        // Post-parse: the request was framed correctly and this is our
+        // own config bug, so the connection is still perfectly usable.
+        _startErrorResponse(client, 500, FRAMING_INTACT);
         return;
     }
 
@@ -653,7 +653,7 @@ void Server::_advanceRequest(Client* client) {
         // usable code and this can never read an uninitialised field; the
         // request-line check overwrites it with 505 for a version we do not
         // speak. Hardcoding 400 here is what made 505 unreachable.
-        _startErrorResponse(client, client->request.status);
+        _startErrorResponse(client, client->request.status, FRAMING_LOST);
         return;
     }
 
@@ -807,7 +807,8 @@ void Server::_checkTimeouts() {
         // Say why rather than dropping silently: a bare RST is indistinguishable
         // from a server crash at the other end. The write handler flushes it and
         // closes on the next POLLOUT.
-        _startErrorResponse(it->second, 408);
+        // Gave up mid-request; the rest of it is still in flight.
+        _startErrorResponse(it->second, 408, FRAMING_LOST);
     }
 
     for (size_t i = 0; i < stalled.size(); ++i) {

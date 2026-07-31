@@ -39,6 +39,17 @@ private:
     Server(const Server& other);
     Server& operator=(const Server& other);
 
+    // IMMUTABLE after initialize() returns. Live Client objects hold interior
+    // pointers into this vector (Client::server_cfg == &config[i], set in
+    // _acceptNewClient and _resolveServerConfig), and Config is a std::vector,
+    // so ANY push_back/insert/erase/clear once clients exist may reallocate the
+    // buffer and leave every server_cfg dangling. That is a use-after-free with
+    // no crash at the point of the mistake: the server keeps running and reads
+    // freed memory as if it were a ServerConfig, under load, intermittently.
+    //
+    // If per-request or reloadable config is ever wanted, do NOT mutate this
+    // vector — store indices instead of pointers, or hold the blocks by pointer
+    // so the elements themselves never move.
     Config config;
     bool running;
 
@@ -96,8 +107,17 @@ private:
     void _advanceRequest(Client* client);
     // Hand-off seam: runs exactly once per complete request.
     void _processRequest(Client* client);
+
+    // Whether this request's byte stream is still trustworthy at the moment the
+    // error is raised. FRAMING_LOST means unread bytes of the current request
+    // may still be in the socket or in input_buf, so we cannot tell where the
+    // next request begins and the connection must not be reused. Only the
+    // caller knows this: it is a property of WHERE the error was raised, not of
+    // the status number.
+    enum FramingState { FRAMING_INTACT, FRAMING_LOST };
+
     // Frames a status-only response into output_buf and flips to SENDING.
-    void _startErrorResponse(Client* client, int status_code);
+    void _startErrorResponse(Client* client, int status_code, FramingState framing);
 
     // Client lifecycle
     void _removeClient(int client_fd);
