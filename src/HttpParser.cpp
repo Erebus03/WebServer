@@ -1,4 +1,5 @@
 #include "../includes/HttpParser.hpp"
+#include "../includes/HttpVersion.hpp"
 #include <cctype>
 
 // trim spaces/tabs off both ends
@@ -11,7 +12,7 @@ static std::string trim(const std::string& s)
     return s.substr(begin, end - begin + 1);
 }
 
-// lowercase copy — header names are case-insensitive
+// lowercase copy (header names are case-insensitive)
 static std::string toLowerCopy(const std::string& s)
 {
     std::string out = s;
@@ -20,7 +21,7 @@ static std::string toLowerCopy(const std::string& s)
     return out;
 }
 
-// Content-Length must be pure digits (atoi is too loose: -1, abc, 9zzz all slip through)
+// Content-Length -> size_t. digits only (atoi is too loose), overflow-safe.
 static bool parseContentLength(const std::string& s, size_t& out)
 {
     if (s.empty())
@@ -30,7 +31,7 @@ static bool parseContentLength(const std::string& s, size_t& out)
         if (s[i] < '0' || s[i] > '9')
             return false;
         size_t digit = static_cast<size_t>(s[i] - '0');
-        if (value > (static_cast<size_t>(-1) - digit) / 10)     // overflow guard
+        if (value > (static_cast<size_t>(-1) - digit) / 10)
             return false;
         value = value * 10 + digit;
     }
@@ -47,7 +48,7 @@ static int hexVal(char c)
     return -1;
 }
 
-// a chunk-size line ("4", "1a", "ff") -> size_t. false on empty/non-hex/overflow.
+// hex chunk-size -> size_t. overflow-safe.
 static bool parseHexSize(const std::string& s, size_t& out)
 {
     if (s.empty())
@@ -57,7 +58,7 @@ static bool parseHexSize(const std::string& s, size_t& out)
         int h = hexVal(s[i]);
         if (h < 0)
             return false;
-        if (value > (static_cast<size_t>(-1) - static_cast<size_t>(h)) / 16)  // overflow
+        if (value > (static_cast<size_t>(-1) - static_cast<size_t>(h)) / 16)
             return false;
         value = value * 16 + static_cast<size_t>(h);
     }
@@ -65,20 +66,20 @@ static bool parseHexSize(const std::string& s, size_t& out)
     return true;
 }
 
-// %XX -> one byte, decoded ONCE. false on bad escape (%zz, cut-off) or %00.
-// '+' stays a literal '+' here — turning it into space is a query rule, not a path rule.
+// %XX -> byte, decoded once. false on bad escape or %00.
+// note: don't turn '+' into space here — that's a query rule, not a path rule.
 static bool percentDecode(const std::string& in, std::string& out)
 {
     for (size_t i = 0; i < in.size(); ) {
         if (in[i] == '%') {
-            if (i + 2 >= in.size())             // need 2 hex chars after %
+            if (i + 2 >= in.size())
                 return false;
             int hi = hexVal(in[i + 1]);
             int lo = hexVal(in[i + 2]);
-            if (hi < 0 || lo < 0)               // not real hex
+            if (hi < 0 || lo < 0)
                 return false;
             char byte = static_cast<char>(hi * 16 + lo);
-            if (byte == '\0')                   // reject NUL
+            if (byte == '\0')
                 return false;
             out += byte;
             i += 3;
@@ -90,46 +91,42 @@ static bool percentDecode(const std::string& in, std::string& out)
     return true;
 }
 
-// bytes in -> fill HttpRequest. Runs top to bottom; returns PARSE_INCOMPLETE to
-// wait when data is only half here (TCP splits requests), never errors on "not yet".
-// On PARSE_COMPLETE, `consumed` = how many bytes this request used.
+// bytes -> filled HttpRequest. returns COMPLETE / INCOMPLETE / ERROR.
+// on COMPLETE, consumed = how many bytes this request used.
 ParseResult HttpParser::parse(const std::string& bytes, HttpRequest& request, size_t& consumed)
 {
-    consumed = 0;                               // only real once the request is COMPLETE
+    consumed = 0;
+    request.status = 400;   // set now, so any error path already has a code
 
-    // request line = up to the first \r\n
     size_t line_end = bytes.find("\r\n");
     if (line_end == std::string::npos)
-        return PARSE_INCOMPLETE;                // not here yet -> wait
+        return PARSE_INCOMPLETE;
     if (!parseRequestLine(bytes.substr(0, line_end), request)) {
         request.state = ERROR;
         return PARSE_ERROR;
     }
     request.state = READING_HEADERS;
 
-    // blank line ends the headers. search from line_end: a header-less request
-    // reuses the request line's own \r\n as the first half of the \r\n\r\n
-    size_t headers_start = line_end + 2;
+    // search the blank line from line_end, NOT +2: with no headers the request
+    // line's own \r\n is already half of the \r\n\r\n, so +2 skips it and hangs.
     size_t blank_line = bytes.find("\r\n\r\n", line_end);
     if (blank_line == std::string::npos)
-        return PARSE_INCOMPLETE;                // headers not done -> wait
-    if (!parseHeaders(bytes, headers_start, blank_line, request)) {
+        return PARSE_INCOMPLETE;
+    if (!parseHeaders(bytes, line_end + 2, blank_line, request)) {
         request.state = ERROR;
         return PARSE_ERROR;
     }
 
     readBody(bytes, blank_line + 4, request, consumed);   // +4 skips the \r\n\r\n
 
-    // translate the parser's internal state into the caller-facing result
     if (request.state == COMPLETE)
         return PARSE_COMPLETE;
     if (request.state == ERROR)
         return PARSE_ERROR;
-    return PARSE_INCOMPLETE;                     // READING_BODY -> body still arriving
+    return PARSE_INCOMPLETE;
 }
 
-// "GET /path?q HTTP/1.1" -> method / uri / version, split on the two spaces.
-// then split off query (raw) and decode the path once.
+// "GET /path?q HTTP/1.1" -> method / uri / version. split query off, decode path once.
 bool HttpParser::parseRequestLine(const std::string& line, HttpRequest& request) const
 {
     size_t first_space  = line.find(' ');
@@ -141,7 +138,14 @@ bool HttpParser::parseRequestLine(const std::string& line, HttpRequest& request)
     request.version = line.substr(second_space + 1);
     std::string raw_uri = line.substr(first_space + 1, second_space - first_space - 1);
     if (request.method.empty() || raw_uri.empty() || request.version.empty())
-        return false;                           // e.g. double space -> empty part
+        return false;
+
+    // version: 1.x -> ok, wrong major -> 505, bad shape -> 400
+    int vstatus = checkHttpVersion(request.version);
+    if (vstatus != 0) {
+        request.status = vstatus;
+        return false;
+    }
 
     // split on FIRST '?'. query stays raw — CGI decodes it itself.
     size_t q = raw_uri.find('?');
@@ -154,7 +158,7 @@ bool HttpParser::parseRequestLine(const std::string& line, HttpRequest& request)
         raw_path = raw_uri;
     }
 
-    // decode path ONCE so is_path_safe sees ".." not "%2e%2e". bad escape -> 400.
+    // decode path once so is_path_safe sees ".." not "%2e%2e"
     std::string decoded;
     if (!percentDecode(raw_path, decoded))
         return false;
@@ -162,7 +166,7 @@ bool HttpParser::parseRequestLine(const std::string& line, HttpRequest& request)
     return true;
 }
 
-// walk each "Name: Value" line between start and the blank line at end
+// walk each "Name: Value" header line between start and the blank line at end
 bool HttpParser::parseHeaders(const std::string& bytes, size_t start, size_t end,
                               HttpRequest& request) const
 {
@@ -183,7 +187,7 @@ bool HttpParser::parseHeaders(const std::string& bytes, size_t start, size_t end
     return true;
 }
 
-// split on FIRST colon — values can hold colons (localhost:8080)
+// split header on FIRST colon (values can hold colons: localhost:8080)
 bool HttpParser::parseHeaderLine(const std::string& line, std::string& name,
                                  std::string& value) const
 {
@@ -195,8 +199,7 @@ bool HttpParser::parseHeaderLine(const std::string& line, std::string& name,
     return true;
 }
 
-// body framing: chunked -> decode chunks; Content-Length -> read N bytes;
-// neither -> no body. on COMPLETE, `consumed` = where this request ends.
+// pick body framing: chunked / Content-Length / none. on COMPLETE, consumed = request end.
 void HttpParser::readBody(const std::string& bytes, size_t body_start,
                           HttpRequest& request, size_t& consumed) const
 {
@@ -209,7 +212,7 @@ void HttpParser::readBody(const std::string& bytes, size_t body_start,
                     toLowerCopy(te->second).find("chunked") != std::string::npos);
     bool has_length = (cl != request.headers.end());
 
-    // both framings at once is a request-smuggling vector -> reject
+    // both framings at once = smuggling trick -> reject
     if (chunked && has_length) {
         request.state = ERROR;
         return;
@@ -221,30 +224,28 @@ void HttpParser::readBody(const std::string& bytes, size_t body_start,
     }
 
     if (!has_length) {
-        request.state = COMPLETE;               // no body
-        consumed = body_start;                  // request ends at the blank line
+        request.state = COMPLETE;   // no body
+        consumed = body_start;
         return;
     }
 
     size_t expected;
     if (!parseContentLength(cl->second, expected)) {
-        request.state = ERROR;                  // -1 / abc / "" -> 400
+        request.state = ERROR;
         return;
     }
 
-    size_t available = bytes.size() - body_start;
-    if (available < expected) {
-        request.state = READING_BODY;           // rest still coming -> wait
+    if (bytes.size() - body_start < expected) {
+        request.state = READING_BODY;   // rest still coming -> wait
         return;
     }
 
     request.body  = bytes.substr(body_start, expected);
     request.state = COMPLETE;
-    consumed = body_start + expected;           // request ends after its body
+    consumed = body_start + expected;
 }
 
-// Decode a chunked body:  <hexsize>\r\n <data>\r\n ... 0\r\n [trailers] \r\n
-// The framing (sizes, CRLFs) is stripped; request.body gets only the data.
+// un-chunk: read hex size, copy that many bytes, repeat until size 0.
 void HttpParser::readChunkedBody(const std::string& bytes, size_t body_start,
                                  HttpRequest& request, size_t& consumed) const
 {
@@ -252,14 +253,13 @@ void HttpParser::readChunkedBody(const std::string& bytes, size_t body_start,
     size_t pos = body_start;
 
     while (true) {
-        // --- chunk-size line ---
         size_t line_end = bytes.find("\r\n", pos);
         if (line_end == std::string::npos) {
-            request.state = READING_BODY;       // size line not fully here yet
+            request.state = READING_BODY;
             return;
         }
 
-        // hex size, ignoring any ";chunk-extensions"
+        // size line, drop any ";extension"
         std::string size_line = bytes.substr(pos, line_end - pos);
         size_t semi = size_line.find(';');
         if (semi != std::string::npos)
@@ -267,40 +267,40 @@ void HttpParser::readChunkedBody(const std::string& bytes, size_t body_start,
 
         size_t chunk_size;
         if (!parseHexSize(trim(size_line), chunk_size)) {
-            request.state = ERROR;              // bad hex size
+            request.state = ERROR;
             return;
         }
-        pos = line_end + 2;                     // past the size line's \r\n
+        pos = line_end + 2;
 
-        // --- last chunk (size 0): skip optional trailers, then final \r\n ---
+        // size 0 = last chunk. skip trailers until the blank line, then done.
         if (chunk_size == 0) {
             while (true) {
                 size_t t = bytes.find("\r\n", pos);
                 if (t == std::string::npos) {
-                    request.state = READING_BODY;   // terminator not here yet
+                    request.state = READING_BODY;
                     return;
                 }
-                if (t == pos) {                 // empty line -> body ends
+                if (t == pos) {
                     request.body  = decoded;
                     request.state = COMPLETE;
                     consumed = pos + 2;
                     return;
                 }
-                pos = t + 2;                    // skip a trailer header line
+                pos = t + 2;
             }
         }
 
-        // --- data chunk: need chunk_size bytes + trailing \r\n (overflow-safe) ---
+        // need chunk_size bytes + trailing \r\n. written this way to avoid pos+size overflow.
         size_t available = bytes.size() - pos;
         if (chunk_size > available || available - chunk_size < 2) {
-            request.state = READING_BODY;       // data not all here yet
+            request.state = READING_BODY;
             return;
         }
         decoded.append(bytes, pos, chunk_size);
         pos += chunk_size;
 
         if (bytes.compare(pos, 2, "\r\n") != 0) {
-            request.state = ERROR;              // chunk data not followed by CRLF
+            request.state = ERROR;
             return;
         }
         pos += 2;

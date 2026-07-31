@@ -1,7 +1,7 @@
 NAME = webserv
 
 CXX = c++
-CXXFLAGS = -Wall -Wextra -Werror -std=c++98
+CXXFLAGS = -Wall -Wextra -Werror -g -std=c++98
 
 SRCS = \
 	src/main.cpp \
@@ -9,6 +9,12 @@ SRCS = \
 	src/Dispatcher.cpp \
 	src/Config.cpp \
 	src/HttpParser.cpp \
+	src/HttpVersion.cpp \
+	src/HttpStatus.cpp \
+	src/ResponseBuilder.cpp \
+	src/MimeTypes.cpp \
+	src/MultipartParser.cpp \
+	src/CgiResponse.cpp \
 	src/Client.cpp \
 	src/Server.cpp \
 	src/GetHandler.cpp \
@@ -17,13 +23,6 @@ SRCS = \
 	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
-	src/HttpStatus.cpp \
-	tests/test_router.cpp \
-	tests/test_FileUtils.cpp \
-	tests/test_GetHandler.cpp \
-	tests/test_Dispatcher.cpp \
-	tests/test_DirectoryLister.cpp \
-	tests/test_HttpStatus.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
@@ -35,13 +34,18 @@ INCLUDES = \
 	includes/Config.hpp \
 	includes/GetHandler.hpp \
 	includes/HttpParser.hpp \
+	includes/HttpVersion.hpp \
+	includes/HttpStatus.hpp \
+	includes/ResponseBuilder.hpp \
+	includes/MimeTypes.hpp \
+	includes/MultipartParser.hpp \
+	includes/CgiResponse.hpp \
 	includes/DeleteHandler.hpp \
 	includes/Server.hpp \
 	includes/PostHandler.hpp \
 	includes/CgiHandler.hpp \
 	includes/DirectoryLister.hpp \
 	includes/FileUtils.hpp \
-	includes/HttpStatus.hpp \
 
 all: $(NAME)
 

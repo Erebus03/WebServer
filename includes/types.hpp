@@ -50,6 +50,7 @@ struct HttpRequest {
     std::map<std::string, std::string> headers;
     std::string                        body;
     bool                               is_complete;
+    int                                status;   // code to send on PARSE_ERROR (400 unless set otherwise)
 };
 
 struct HttpResponse {
@@ -57,6 +58,14 @@ struct HttpResponse {
     std::string                        status_message;
     std::map<std::string, std::string> headers;
     std::string                        body;
+};
+
+// one piece of a multipart/form-data body (a form field or an uploaded file).
+struct MultipartPart {
+    std::string name;          // the form field name
+    std::string filename;      // upload's filename (RAW, unsanitized); empty if a plain field
+    std::string content_type;  // the part's own Content-Type, empty if none
+    std::string data;          // the part's raw bytes
 };
 
 #endif
