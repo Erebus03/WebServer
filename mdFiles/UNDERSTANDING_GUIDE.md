@@ -1543,7 +1543,58 @@ in C++98; `parse(const std::string&)` is far nicer for `find("\r\n")` and
 `substr`. Two sound local decisions that composed into a full-buffer copy at the
 seam between them — and neither person could see it from inside their own file.
 
-### 12.12 Still open elsewhere
+### 12.12 A location's `client_max_body_size` was never enforced — FIXED 2026-07-31
+
+Reported by a teammate as a **parser** bug: *"`client_max_body_size` doesn't
+inherit into a location if the directive comes after the location block —
+location gets 1M instead of the configured 10M."*
+
+The ordering half does not reproduce. Inheritance is resolved in a **second
+pass** once the server block closes (`Config.cpp:367-379`), specifically so
+source order cannot matter; `tests/test_config.cpp` now asserts the
+directive-after-location, interleaved, and explicit-`0` cases.
+
+But the symptom was real, one layer down. `_enforceReadLimits` read
+`server_cfg->client_max_body_size` and nothing else, so
+`loc.client_max_body_size` was read **nowhere outside `Config.cpp`**. The parser
+tokenised it, stored it, inherited it and applied overrides correctly — and then
+nothing ever looked at it. A location could neither raise nor lower the limit.
+
+Three configs pin this, kept in `config/` with the reproduction in their
+comments:
+
+| case | setup | 2 MB POST before | after |
+|---|---|---|---|
+| a | server 1M, **location 10M** | **413** | **501** |
+| b | location first, server 10M after | 501 | 501 |
+| c | control: server 1M, no override | 413 | 413 |
+
+**Case C is the one that makes the argument.** It is case A with the location
+override deleted, and before the fix it behaved *identically* — which is what
+proves A's 10M was doing nothing, rather than A's 413 coming from somewhere
+unrelated.
+
+The fix resolves the cap through `Router::match()`, the same matcher
+`Dispatcher` uses. A different matcher would let a request be admitted under one
+location's cap and then served by another. Two fallbacks to the server value,
+both deliberate: `request.uri` is empty until the request line is parsed (the
+431 check owns that window), and no-location-match still needs *a* bound because
+`Dispatcher`'s 404 only happens at COMPLETE — without it an unmatched path could
+stream bytes indefinitely.
+
+Also verified that the cap still *bounds*: 12 MB to a 10M location is 413, a 1M
+location under a 10M server rejects 2 MB, and an unmatched path takes 404 at
+100 KB but 413 at 2 MB.
+
+**Worth having ready:** the misdiagnosis was reasonable. `config/example.conf`'s
+8080 vhost is server-level 1M, so anyone overriding it on a location there sees
+exactly 1M enforced — which looks like inheritance failing, and that file does
+happen to put the directive near the locations. Two coincidences pointing at the
+parser, where the parser was correct. The general lesson: a value being *parsed
+correctly* and a value being *used* are separate claims, and testing only the
+first proves nothing about the second.
+
+### 12.13 Still open elsewhere
 
 - **`src/CgiHandler.cpp` is a 0-byte file.** CGI is a subject requirement and
   is entirely unwritten; `_handleCgiPipeRead()` is an empty stub and the CGI
