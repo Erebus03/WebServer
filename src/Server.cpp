@@ -1,6 +1,7 @@
 #include "../includes/Server.hpp"
 #include "../includes/FileUtils.hpp"
 #include "../includes/Dispatcher.hpp"
+#include "../includes/Router.hpp"
 #include "../includes/ResponseBuilder.hpp"
 #include <poll.h>
 #include <unistd.h>
@@ -486,8 +487,34 @@ bool Server::_enforceReadLimits(Client* client) {
     // so this is the cap of the vhost the Host header actually named, not the
     // default server's — see the ordering note in _advanceRequest().
     if (client->server_cfg) {
-        const size_t max_total =
-            MAX_HEADER_BYTES + client->server_cfg->client_max_body_size;
+        // A location may override the server's cap. Until now that override was
+        // parsed, inherited and then never read: this function only ever looked
+        // at the server value, so `client_max_body_size` inside a location block
+        // was dead config — a location asking for 10M under a 1M server still
+        // got 1M, silently. See config/bodysize-case-{a,b,c}.conf, which pin
+        // that behaviour (case C is case A minus the override and behaves
+        // identically, which is what proves the override did nothing).
+        //
+        // Resolved through the same Router::match() the Dispatcher uses, so the
+        // limit enforced here belongs to the location that will actually serve
+        // the request. Using a different matcher would let a request be admitted
+        // under one location's cap and then served by another.
+        size_t cap = client->server_cfg->client_max_body_size;
+        if (!client->request.uri.empty()) {
+            // uri is empty until the request line is parsed; the server cap
+            // covers that window, and it is not a real gap — the 431 check above
+            // owns everything before the header section closes.
+            const LocationConfig* loc =
+                Router::match(client->request.uri, *client->server_cfg);
+            if (loc)
+                cap = loc->client_max_body_size;
+            // No match falls back to the server cap deliberately. Dispatcher
+            // answers 404 for such a URI, but that happens only at COMPLETE, so
+            // the read path still needs a bound to stop an unmatched path from
+            // streaming bytes at us forever.
+        }
+
+        const size_t max_total = MAX_HEADER_BYTES + cap;
         if (received > max_total) {
             // We return before erasing `consumed`, and the client is very
             // likely still sending body bytes we will never read. Even
