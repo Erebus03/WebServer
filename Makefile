@@ -23,6 +23,12 @@ SRCS = \
 	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
+	tests/test_router.cpp \
+	tests/test_FileUtils.cpp \
+	tests/test_GetHandler.cpp \
+	tests/test_Dispatcher.cpp \
+	tests/test_DirectoryLister.cpp \
+	tests/test_HttpStatus.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
