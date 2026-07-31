@@ -575,6 +575,29 @@ void Server::_processRequest(Client* client) {
     // _advanceRequest() erased exactly `consumed` bytes, so whatever remains in
     // input_buf is a clean request boundary. A 404 or 405 is a normal answer to
     // a well-formed request and must not cost the client its connection.
+    // THE RULE: keep-alive requires a well-framed request AND a self-delimiting
+    // response. This line asks only the request, which is a real gap — being
+    // able to reuse a connection depends on the peer finding the end of the
+    // body without waiting for FIN, and that is a property of the response.
+    //
+    // It is sound today only because ResponseBuilder::build() emits
+    // Content-Length unconditionally (ResponseBuilder.cpp:39), computed from
+    // response.body.size(), so every response we can currently produce is
+    // self-delimiting. _startErrorResponse does the same by hand.
+    //
+    // WHEN CGI LANDS THIS MUST CHANGE. The subject allows a CGI to return no
+    // Content-Length, in which case EOF delimits the body and the response is
+    // framed by close; marking it keep-alive would make the client hang waiting
+    // for a terminator that never comes, or frame the next response out of the
+    // CGI's trailing bytes.
+    //
+    // Note for whoever does it: the fix is NOT to inspect
+    // response.headers["Content-Length"] here. build() deliberately skips the
+    // handler's copy of that key (ResponseBuilder.cpp:32) and substitutes its
+    // own, so the map is not what goes on the wire. HttpResponse currently has
+    // no way to express "body framed by EOF" at all — that concept has to exist
+    // before the check can mean anything, which is why it is not being faked
+    // now.
     client->keep_alive = requestWantsKeepAlive(client->request);
 
     const std::string wire = ResponseBuilder::build(response, client->keep_alive);
