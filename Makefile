@@ -12,6 +12,7 @@ SRCS = \
 	src/HttpVersion.cpp \
 	src/HttpStatus.cpp \
 	src/ResponseBuilder.cpp \
+	src/MimeTypes.cpp \
 	src/Client.cpp \
 	src/Server.cpp \
 	src/GetHandler.cpp \
@@ -34,6 +35,7 @@ INCLUDES = \
 	includes/HttpVersion.hpp \
 	includes/HttpStatus.hpp \
 	includes/ResponseBuilder.hpp \
+	includes/MimeTypes.hpp \
 	includes/DeleteHandler.hpp \
 	includes/Server.hpp \
 	includes/PostHandler.hpp \
