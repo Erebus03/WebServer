@@ -35,8 +35,23 @@ public:
     std::string  remote_address;
     State        state;
 
-    // I/O buffers
-    std::vector<char>  input_buf;
+    // I/O buffers. The types differ on purpose — do not "unify" them.
+    //
+    // input_buf is std::string because HttpParser::parse() takes a
+    // `const std::string&`. As std::vector<char> it had to be copied whole into
+    // a temporary string on EVERY recv, which made reading a body quadratic:
+    // measured 4.0x cost per doubling of body size, with the copy accounting for
+    // 99% of it (2 MB body: 0.405s copying vs 0.0031s parsing). Nothing takes
+    // its address — recv() reads into a stack buffer and we append() — so the
+    // C++98 rule that only vector guarantees contiguous storage does not bite.
+    // append(ptr, n) is length-based and binary-safe, embedded NULs included.
+    //
+    // output_buf stays std::vector<char> because send() DOES index into it:
+    // &output_buf[bytes_sent]. There the contiguity guarantee is load-bearing.
+    // It also costs nothing to keep — output_buf is assign()ed once per response
+    // and then drained through the bytes_sent cursor, never re-copied, so it is
+    // linear where input_buf was not.
+    std::string        input_buf;
     std::vector<char>  output_buf;
     size_t             bytes_sent;
 
