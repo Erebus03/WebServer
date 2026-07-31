@@ -1399,7 +1399,93 @@ current one's total. Exact enforcement wants the body length the parser already
 knows (`Content-Length`, or bytes decoded so far when chunked). Not urgent, but
 it is the reason the cap is soft rather than exact.
 
-### 12.10 Still open elsewhere
+### 12.10 Framing inferred from the status code — FIXED 2026-07-31
+
+Was: `_startErrorResponse()` decided reuse through `statusForcesClose()`, a
+hardcoded list — 400, 408, 413, 431, 505. But whether a connection survives is a
+property of **where the error was raised** (is the request fully framed? are
+there unread bytes left?), not of the status number.
+
+The list was correct at every call site. By hand. The failure mode was the next
+one: someone adds a pre-parse rejection — a 414 for an over-long request line,
+a 501 for an unknown method caught before the body is read — and forgets the
+list. The status defaults to "reusable", the connection stays open desynced, and
+every subsequent request on it is framed out of the previous one's leftovers.
+Which only shows up under pipelining *plus* malformed input, i.e. never in a
+simple test.
+
+Now `_startErrorResponse(client, status, framing)` takes a required
+`FramingState`, so each caller states what it knows:
+
+| Call site | Framing | Why |
+|---|---|---|
+| 431 | `FRAMING_LOST` | header section never closed |
+| 413 | `FRAMING_LOST` | we return before erasing `consumed`, peer still sending |
+| 400 / 505 (parser) | `FRAMING_LOST` | rejected mid-stream |
+| 408 (timeout) | `FRAMING_LOST` | gave up while the request was in flight |
+| 500 (`_processRequest`) | `FRAMING_INTACT` | post-parse; our config bug, not theirs |
+
+`statusForcesClose()` deleted. No behavioural change — the point is that the
+invariant is now stated by each caller instead of guessed centrally.
+
+### 12.11 Quadratic re-parse: uploads over ~2.5 MB FAIL — OPEN, live
+
+**This is the most serious open bug in the network layer, and it is a
+functional failure, not a performance nit.**
+
+`_advanceRequest()` copies the whole accumulated `input_buf` into a fresh
+`std::string` on every recv:
+
+```cpp
+const std::string bytes(client->input_buf.begin(), client->input_buf.end());
+client->parser.parse(bytes, client->request, consumed);
+```
+
+With `READ_CHUNK` = 4096, a 10 MB upload is ~2560 recvs over an average 5 MB
+buffer — about 13 GB of copying to receive 10 MB. Measured, doubling the body
+each row:
+
+| body | wall | server CPU ticks | CPU/KB | vs previous |
+|---|---|---|---|---|
+| 125 KB | 0.11 s | 7 | 0.056 | — |
+| 250 KB | 0.23 s | 20 | 0.080 | 2.85× |
+| 500 KB | 0.48 s | 48 | 0.096 | 2.40× |
+| 1 MB | 1.91 s | 190 | 0.190 | 3.95× |
+| 2 MB | 8.79 s | 778 | 0.389 | 4.09× |
+
+The ratio converges on **4.0 per doubling** — textbook quadratic. Extrapolated,
+4 MB needs ~35 s, which exceeds `REQUEST_TIMEOUT_SEC` (30). Confirmed: a 4 MB
+and a 10 MB POST both die with **408**, at 29.5 s and 30.1 s. Uploads are a
+subject requirement, so this is a graded feature that does not work.
+
+**Where the cost actually is** — this matters, because the obvious diagnosis is
+wrong. Splitting the two halves of the loop (`scratchpad/micro.cpp`):
+
+| body | vector→string copy | `parse()` |
+|---|---|---|
+| 250 KB | 0.0081 s | 0.00036 s |
+| 500 KB | 0.0386 s | 0.00099 s |
+| 1 MB | 0.1254 s | 0.00160 s |
+| 2 MB | 0.4051 s | 0.00314 s |
+
+**The copy is 99.2 % of the cost. `parse()` is 0.8 %, and it is linear.** The
+parser is already cheap on re-entry: for a `Content-Length` body it re-reads
+only the header block (a fixed cost) and then does `bytes.size() - body_start <
+expected` and returns. It never rescans the body.
+
+So the fix is **not** a `parse_offset` and **not** a parser-contract change. It
+is one field type: `Client::input_buf` from `std::vector<char>` to
+`std::string`, letting it be passed to `parse()` directly instead of copied.
+`HttpParser::parse` already takes `const std::string&` — its signature does not
+move at all.
+
+Scope: the declaration in `Client.hpp`, plus five lines in `Server.cpp`
+(`insert`→`append`, `erase(begin, begin+n)`→`erase(0, n)`, and dropping the
+copy). `Client` is a jointly-owned struct, so it needs a nod from the other two
+— but it is a far smaller ask than the parser-contract change it first appeared
+to need.
+
+### 12.12 Still open elsewhere
 
 - **`src/CgiHandler.cpp` is a 0-byte file.** CGI is a subject requirement and
   is entirely unwritten; `_handleCgiPipeRead()` is an empty stub and the CGI
