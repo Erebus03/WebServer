@@ -567,11 +567,13 @@ void Server::_processRequest(Client* client) {
     const HttpResponse response =
         Dispatcher::dispatch(client->request, *client->server_cfg);
 
-    // Unlike the _startErrorResponse path, statusForcesClose() is deliberately
-    // NOT consulted here. It exists for replies sent when framing is unknown
-    // (a malformed request, a timeout, a body cut off by the cap) — reusing the
-    // connection would then frame the next request out of garbage. None of that
-    // applies to a dispatched response: the parser reported COMPLETE and
+    // Unlike the _startErrorResponse path, this one does not go through
+    // FramingState at all — it is the FRAMING_INTACT case by construction, so
+    // there is nothing for a caller to declare. That enum exists for replies
+    // sent when framing is unknown (a malformed request, a timeout, a body cut
+    // off by the cap) — reusing the connection would then frame the next
+    // request out of garbage. None of that applies to a dispatched response:
+    // the parser reported COMPLETE and
     // _advanceRequest() erased exactly `consumed` bytes, so whatever remains in
     // input_buf is a clean request boundary. A 404 or 405 is a normal answer to
     // a well-formed request and must not cost the client its connection.
