@@ -1428,7 +1428,7 @@ Now `_startErrorResponse(client, status, framing)` takes a required
 `statusForcesClose()` deleted. No behavioural change — the point is that the
 invariant is now stated by each caller instead of guessed centrally.
 
-### 12.11 Quadratic re-parse: bodies over ~2.5 MB time out — OPEN, latent
+### 12.11 Quadratic re-parse: bodies over ~2.5 MB time out — FIXED 2026-07-31
 
 **Scope, stated carefully:** this is not "uploads are broken" — `PostHandler` is
 still a 501 stub, so nothing uploads anything yet. The cost is in the **read
@@ -1487,17 +1487,50 @@ parser is already cheap on re-entry: for a `Content-Length` body it re-reads
 only the header block (a fixed cost) and then does `bytes.size() - body_start <
 expected` and returns. It never rescans the body.
 
-So the fix is **not** a `parse_offset` and **not** a parser-contract change. It
-is one field type: `Client::input_buf` from `std::vector<char>` to
+So the fix was **not** a `parse_offset` and **not** a parser-contract change. It
+was one field type: `Client::input_buf` from `std::vector<char>` to
 `std::string`, letting it be passed to `parse()` directly instead of copied.
-`HttpParser::parse` already takes `const std::string&` — its signature does not
+`HttpParser::parse` already takes `const std::string&` — its signature did not
 move at all.
 
-Scope: the declaration in `Client.hpp`, plus five lines in `Server.cpp`
-(`insert`→`append`, `erase(begin, begin+n)`→`erase(0, n)`, and dropping the
-copy). `Client` is a jointly-owned struct, so it needs a nod from the other two
-— but it is a far smaller ask than the parser-contract change it first appeared
-to need.
+**Applied in `3bda491`.** The declaration in `Client.hpp`, plus three lines in
+`Server.cpp`: `insert`→`append(ptr, n)`, `erase(begin, begin+n)`→`erase(0, n)`,
+and dropping the copy. The "jointly-owned struct" caution turned out not to
+bite: `input_buf` is referenced in six lines of `Server.cpp` and nowhere else,
+and **no teammate file references `Client` at all** — B's parser takes
+`const std::string&` and `HttpRequest&`, C's handlers take `HttpRequest` and
+`ServerConfig`. Neither knows the type exists.
+
+After, same ladder (`Expect: 100-continue` suppressed — curl's 1 s wait for a
+`100` we never send otherwise adds a flat second to every row over 1 MB, which
+is a curl artefact, not server cost):
+
+| body | before | after |
+|---|---|---|
+| 1 MB | 1.91 s | 0.054 s |
+| 2 MB | 8.79 s | 0.020 s |
+| 4 MB | **408** @ 29.5 s | 0.037 s |
+| 10 MB | **408** @ 30.1 s | 0.081 s |
+| 20 MB | — | 0.145 s |
+| 40 MB | — | 0.243 s |
+
+Doubling the body now doubles the time — linear, and the 408 trap in front of
+`PostHandler` is gone. Regression: the full `112ad83` matrix (200 ×4, 404, 403
+on both traversal encodings, 405, 501, keep-alive ×2, pipelined ×2) unchanged,
+build clean under `-Wall -Wextra -Werror -std=c++98`.
+
+**The asymmetry is deliberate and commented.** `output_buf` stays
+`std::vector<char>` because `send()` indexes into it (`&output_buf[bytes_sent]`),
+where the C++98 guarantee that only `vector` is contiguous is load-bearing.
+`input_buf` has no such constraint — `recv()` reads into a stack `char[4096]`
+and we `append(ptr, n)`, which is length-counted and therefore binary-safe with
+embedded NULs. Both declarations say why, so nobody "unifies" them later.
+
+**Worth being able to say out loud:** neither original choice was a mistake.
+`vector<char>` signals raw bytes and was the standards-correct pick for a buffer
+in C++98; `parse(const std::string&)` is far nicer for `find("\r\n")` and
+`substr`. Two sound local decisions that composed into a full-buffer copy at the
+seam between them — and neither person could see it from inside their own file.
 
 ### 12.12 Still open elsewhere
 

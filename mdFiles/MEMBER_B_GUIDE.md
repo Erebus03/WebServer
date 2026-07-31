@@ -743,9 +743,8 @@ and C's router all working. Coordinate; don't do it alone.
 
 Roughly:
 ```cpp
-client->input_buf.insert(...);                       // A's, already there
-std::string data(client->input_buf.begin(), client->input_buf.end());
-parser.parse(data, client->request);
+client->input_buf.append(buffer, n);                 // A's, already there
+parser.parse(client->input_buf, client->request, consumed);
 
 if (client->request.state == COMPLETE) {
     HttpResponse resp = router.handle(client->request, *client->server_cfg);   // C
@@ -756,6 +755,13 @@ if (client->request.state == COMPLETE) {
     /* 400 + close */
 }
 ```
+
+`input_buf` is a `std::string` and is passed to `parse()` **by reference, not
+copied** — it used to be a `std::vector<char>` rebuilt into a temporary string
+on every recv, which made reading a body quadratic (see UNDERSTANDING_GUIDE
+12.11). Keep its type and `parse()`'s parameter the same, or the copy comes
+back. Your signature is unaffected: `parse()` already took `const std::string&`
+and did not change.
 
 Note `Client.hpp` currently has `request`/`response` **commented out** (lines 53–54) —
 they're waiting on your types being final. Uncommenting those is part of this step.
