@@ -1428,10 +1428,18 @@ Now `_startErrorResponse(client, status, framing)` takes a required
 `statusForcesClose()` deleted. No behavioural change — the point is that the
 invariant is now stated by each caller instead of guessed centrally.
 
-### 12.11 Quadratic re-parse: uploads over ~2.5 MB FAIL — OPEN, live
+### 12.11 Quadratic re-parse: bodies over ~2.5 MB time out — OPEN, latent
 
-**This is the most serious open bug in the network layer, and it is a
-functional failure, not a performance nit.**
+**Scope, stated carefully:** this is not "uploads are broken" — `PostHandler` is
+still a 501 stub, so nothing uploads anything yet. The cost is in the **read
+path**, which runs before any handler is consulted: the 408 fires while the body
+is still being accumulated, so the request never reaches COMPLETE and
+`Dispatcher` is never called. It applies to a large body on *any* method.
+
+That makes it a **pre-positioned blocker for POST**, and a nasty one. Whoever
+implements `PostHandler` will hit a 408 on their first real upload test and will
+reasonably start debugging their own handler — which never runs. Worth fixing
+before that work starts, not after.
 
 `_advanceRequest()` copies the whole accumulated `input_buf` into a fresh
 `std::string` on every recv:
@@ -1455,8 +1463,14 @@ each row:
 
 The ratio converges on **4.0 per doubling** — textbook quadratic. Extrapolated,
 4 MB needs ~35 s, which exceeds `REQUEST_TIMEOUT_SEC` (30). Confirmed: a 4 MB
-and a 10 MB POST both die with **408**, at 29.5 s and 30.1 s. Uploads are a
-subject requirement, so this is a graded feature that does not work.
+and a 10 MB POST both die with **408**, at 29.5 s and 30.1 s.
+
+The rows at 2 MB and below returned 501 — the stub's answer — which is what
+makes the numbers trustworthy: the body was fully read, framed, and dispatched
+in each of those cases. Only the timing is being measured, not the handler.
+
+Downloads are unaffected. The write path sends out of `output_buf` through a
+`bytes_sent` cursor and never re-copies, so it is linear in the response size.
 
 **Where the cost actually is** — this matters, because the obvious diagnosis is
 wrong. Splitting the two halves of the loop (`scratchpad/micro.cpp`):
