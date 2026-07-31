@@ -1501,20 +1501,31 @@ and **no teammate file references `Client` at all** — B's parser takes
 `const std::string&` and `HttpRequest&`, C's handlers take `HttpRequest` and
 `ServerConfig`. Neither knows the type exists.
 
-After, same ladder (`Expect: 100-continue` suppressed — curl's 1 s wait for a
-`100` we never send otherwise adds a flat second to every row over 1 MB, which
-is a curl artefact, not server cost):
+After, same ladder. Two measurement notes, both of which bit on the first
+attempt and are worth knowing before quoting any of these numbers:
 
-| body | before | after |
-|---|---|---|
-| 1 MB | 1.91 s | 0.054 s |
-| 2 MB | 8.79 s | 0.020 s |
-| 4 MB | **408** @ 29.5 s | 0.037 s |
-| 10 MB | **408** @ 30.1 s | 0.081 s |
-| 20 MB | — | 0.145 s |
-| 40 MB | — | 0.243 s |
+- **`Expect: 100-continue` suppressed.** curl adds that header for bodies over
+  1 MB and then waits up to 1 s for a `100` we never send, adding a flat second
+  to every large row. That is curl's wait, not server cost.
+- **Warmed, median of 7 runs.** The post-fix times are small enough that a
+  single cold sample is meaningless: the first run of a loop absorbs curl
+  startup, page-cache misses on the body file, and the server's first-accept
+  path. An earlier single-sample table reported 1 MB *slower* than 2 MB for
+  exactly that reason. At tens of milliseconds on WSL2 the noise floor is
+  comparable to the signal — repeat and take the median.
 
-Doubling the body now doubles the time — linear, and the 408 trap in front of
+| body | before | after (median of 7) | vs prev |
+|---|---|---|---|
+| 1 MB | 1.91 s | 0.009 s | — |
+| 2 MB | 8.79 s | 0.014 s | 1.56× |
+| 4 MB | **408** @ 29.5 s | 0.019 s | 1.36× |
+| 10 MB | **408** @ 30.1 s | 0.039 s | 2.05× (2.5× data) |
+| 20 MB | — | 0.069 s | 1.77× |
+| 40 MB | — | 0.156 s | 2.26× |
+
+Doubling the body now doubles the time — linear, against 4.0× per doubling
+before. 40× the data costs 17× the time; the sublinearity at the low end is
+fixed per-request overhead, not a measurement problem. The 408 trap in front of
 `PostHandler` is gone. Regression: the full `112ad83` matrix (200 ×4, 404, 403
 on both traversal encodings, 405, 501, keep-alive ×2, pipelined ×2) unchanged,
 build clean under `-Wall -Wextra -Werror -std=c++98`.
