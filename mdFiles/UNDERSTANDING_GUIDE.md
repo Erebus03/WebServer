@@ -642,7 +642,7 @@ takes, not correctness.
 *(Past the gate, `_processRequest()` is the hand-off seam: it calls
 `Dispatcher::dispatch` for the `HttpResponse` and `ResponseBuilder::build` for
 the wire bytes, and knows nothing about routing or HTTP syntax itself — see
-§12.9 for why it deliberately does not consult `statusForcesClose()`.)*
+§12.8 for why it deliberately does not consult `statusForcesClose()`.)*
 
 ### 5.4.1 Choosing the virtual host — `_resolveServerConfig(client)`
 
@@ -1087,7 +1087,7 @@ bytes in `client->output_buf`. Server (A) never learns what HTTP is; B and C
 never learn what a socket is.
 
 The seam is **joined** as of 2026-07-30 — `_processRequest()` calls
-`Dispatcher::dispatch` then `ResponseBuilder::build` (§12.9). Until that day
+`Dispatcher::dispatch` then `ResponseBuilder::build` (§12.8). Until that day
 all of B's and C's code was fully written but reachable from nothing, which is
 the failure mode this three-way split invites: each column can be complete and
 tested on its own while the product does nothing.
@@ -1295,7 +1295,7 @@ progress yet "looked idle" and was killed after IDLE_TIMEOUT_SEC. Now sending
 bytes counts as activity. The stall clock still catches peers that stop
 reading entirely — the two clocks measure different failures.
 
-### 12.9 `_processRequest()` was a 501 placeholder — FIXED 2026-07-30
+### 12.8 `_processRequest()` was a 501 placeholder — FIXED 2026-07-30
 
 Was: the integration seam answered every well-formed request with a hardcoded
 `501 Not Implemented`, waiting for `Dispatcher` to exist. It did exist —
@@ -1332,7 +1332,7 @@ percent-encoded traversal, keep-alive reuse (`num_connects=0` on request 2),
 and two pipelined requests written in a single `write()` answered with two
 responses on one connection.
 
-### 12.10 Read limits ran before the parser — FIXED 2026-07-31
+### 12.9 Read limits ran before the parser — FIXED 2026-07-31
 
 Was: `_enforceReadLimits()` was called from `_handleClientRead()`, before
 `parse()` saw the new bytes. Both of its checks consume parser output, so both
@@ -1399,7 +1399,7 @@ current one's total. Exact enforcement wants the body length the parser already
 knows (`Content-Length`, or bytes decoded so far when chunked). Not urgent, but
 it is the reason the cap is soft rather than exact.
 
-### 12.11 Still open elsewhere
+### 12.10 Still open elsewhere
 
 - **`src/CgiHandler.cpp` is a 0-byte file.** CGI is a subject requirement and
   is entirely unwritten; `_handleCgiPipeRead()` is an empty stub and the CGI
