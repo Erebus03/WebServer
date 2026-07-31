@@ -428,7 +428,7 @@ static bool requestWantsKeepAlive(const HttpRequest& request) {
     if (value.find("close") != std::string::npos)
         return false;
     if (request.version == "HTTP/1.0")
-        return value.find("keep-alive") != std::string::npos;
+        return (value.find("keep-alive") != std::string::npos);
     return true;                                   // HTTP/1.1 default
 }
 
@@ -488,9 +488,9 @@ bool Server::_enforceReadLimits(Client* client) {
         return false;
     }
 
-    // Body cap comes from config. server_cfg is bound at accept() time from the
-    // listening socket's server block; once Host-header selection lands this
-    // should be re-resolved before the body is read.
+    // Body cap comes from config. Callers must run _resolveServerConfig() first
+    // so this is the cap of the vhost the Host header actually named, not the
+    // default server's — see the ordering note in _advanceRequest().
     if (client->server_cfg) {
         const size_t max_total =
             MAX_HEADER_BYTES + client->server_cfg->client_max_body_size;
@@ -578,7 +578,7 @@ void Server::_processRequest(Client* client) {
     client->keep_alive = requestWantsKeepAlive(client->request);
 
     const std::string wire = ResponseBuilder::build(response, client->keep_alive);
-    client->output_buf.assign(wire.begin(), wire.end());
+    client->output_buf.assign(wire.begin(), wire.end()); // why assign and not another alternative, if there are even
     client->beginSending();
 
     // Same bookkeeping as _startErrorResponse: the request is fully consumed,
@@ -587,6 +587,8 @@ void Server::_processRequest(Client* client) {
     client->request_start = 0;
     client->last_activity = std::time(NULL);
 }
+
+
 void Server::_handleClientRead(int client_fd) {
     std::map<int, Client*>::iterator it = clients.find(client_fd);
     if (it == clients.end()) return;
@@ -624,8 +626,9 @@ void Server::_handleClientRead(int client_fd) {
     if (client->request_start == 0)
         client->request_start = client->last_activity;
 
-    if (!_enforceReadLimits(client)) return; // error already framed into output_buf
-
+    // Limits are NOT checked here. Both of them depend on facts only the parser
+    // can produce — which phase we are in, and which vhost's cap applies — so
+    // they live inside _advanceRequest(), after parse(). See the note there.
     _advanceRequest(client);
 }
 
@@ -660,6 +663,38 @@ void Server::_advanceRequest(Client* client) {
     // default server's. Idempotent, so calling it on every recv is harmless.
     if (client->request.state == READING_BODY || client->request.state == COMPLETE)
         _resolveServerConfig(client);
+
+    // Limits go HERE, not in _handleClientRead, and the ordering is the whole
+    // point. Both checks consume parser output: the 431 check reads
+    // request.state to know whether the bytes so far are headers or body, and
+    // the 413 check reads server_cfg->client_max_body_size — a value that only
+    // exists once the Host header has been parsed and _resolveServerConfig has
+    // run, four lines up. Running them before parse() meant judging this recv
+    // against the PREVIOUS recv's state and against the default server's cap.
+    //
+    // Two concrete failures came out of that ordering:
+    //
+    //   431 — on the recv that finally completes the header section, the stale
+    //   state still said READING_HEADERS, so body bytes were counted against
+    //   MAX_HEADER_BYTES. A request with ~8 KB of headers (fat cookies, a long
+    //   Referer) plus any body got a spurious 431 and lost its connection.
+    //
+    //   413 — on the first recv of a connection, server_cfg is still whatever
+    //   accept() installed (candidates[0], the default server), so the default
+    //   vhost's cap was enforced against a request destined for a different
+    //   vhost entirely.
+    //
+    // The 413 case could not actually fire, and it is worth being precise about
+    // why: the trigger is received > MAX_HEADER_BYTES + cap, and one recv can
+    // add at most READ_CHUNK bytes. With READ_CHUNK (4096) < MAX_HEADER_BYTES
+    // (8192), input_buf cannot reach the trigger during the single recv where
+    // the config is stale. That is a bug held shut by an accidental ratio
+    // between two constants that nothing relates and nobody documented —
+    // raising READ_CHUNK to 65536 for fewer syscalls, a change with no apparent
+    // connection to virtual hosting, would have armed it. Ordering the checks
+    // correctly removes the dependency on that coincidence instead of
+    // preserving it.
+    if (!_enforceReadLimits(client)) return; // error already framed into output_buf
 
     // The gate. A partial request stops here and waits for the next POLLIN —
     // this is what makes a request split across TCP segments produce one
