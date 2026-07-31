@@ -1332,7 +1332,74 @@ percent-encoded traversal, keep-alive reuse (`num_connects=0` on request 2),
 and two pipelined requests written in a single `write()` answered with two
 responses on one connection.
 
-### 12.10 Still open elsewhere
+### 12.10 Read limits ran before the parser — FIXED 2026-07-31
+
+Was: `_enforceReadLimits()` was called from `_handleClientRead()`, before
+`parse()` saw the new bytes. Both of its checks consume parser output, so both
+were reading one recv into the past:
+
+| Check | Reads | Why it was stale |
+|---|---|---|
+| 431 | `request.state` | left by the *previous* recv's parse |
+| 413 | `server_cfg->client_max_body_size` | `server_cfg` is only correct after `Host` is parsed and `_resolveServerConfig()` runs |
+
+The dependency ran backwards through time: the 413 check *consumed*
+`server_cfg`, and `_resolveServerConfig()` *produced* it — one function later.
+
+**The 431 half was live.** On the recv that finally completes the header
+section, the stale state still said `READING_HEADERS`, so the body bytes in
+that same recv were counted against `MAX_HEADER_BYTES`. A request with ~8 KB of
+headers — fat cookies, a long `Referer` — plus any body got a spurious 431 and
+lost its connection. Reproduced against the pre-fix binary: an 8045-byte header
+section plus a 200-byte body (total 8247) answered 431; the same request now
+reaches the handler. Genuinely oversized headers still get 431, and an
+oversized body still gets 413.
+
+**The 413 half could not fire, and *why* is the interesting part.** The trigger
+is `received > MAX_HEADER_BYTES + cap`, and one `recv()` adds at most
+`READ_CHUNK` bytes. Since `READ_CHUNK` (4096) `< MAX_HEADER_BYTES` (8192),
+`input_buf` cannot reach the trigger during the single recv where the config is
+stale. The bug was held shut by an accidental ratio between two constants that
+nothing relates and no comment mentions:
+
+```
+false 413 becomes reachable when:
+    READ_CHUNK > MAX_HEADER_BYTES + default_server_cap
+```
+
+Someone profiling a 100 MB upload, seeing 25 000 loop iterations and raising
+`READ_CHUNK` to 65536 to cut syscalls — a change with no visible connection to
+virtual hosting — would have armed it, and would never have found it. **That is
+the character worth naming: not a live failure, a live tripwire**, the kind that
+detonates during someone else's unrelated commit weeks later.
+
+Fix is one moved call: `_enforceReadLimits()` now runs inside
+`_advanceRequest()`, after `parse()` and after `_resolveServerConfig()`. Both
+symptoms go away, and the code stops depending on a coincidence nobody was
+defending.
+
+No parser change was needed. `parse()` re-parses the whole buffer from byte 0
+each call and invokes `readBody()` on the *same* call that finds the blank line,
+so `state` becomes `READING_BODY` or `COMPLETE` immediately — there is no
+one-recv lag for the reorder to miss. (Worth confirming before trusting a
+reorder like this: had the parser instead reported "headers done" one call
+later, the 431 symptom would have survived and the parser would have had to
+report the header-section length explicitly.)
+
+The honest framing for the peer eval: *"the check is ordered wrong, it happens
+to be masked by `MAX_HEADER_BYTES` being larger than `READ_CHUNK`, and I moved
+it rather than rely on that coincidence."* Knowing a bug is currently
+unreachable and fixing it anyway is a stronger answer than not having it.
+
+**Still approximate, deliberately:** the 413 check compares
+`input_buf.size()` against `MAX_HEADER_BYTES + cap`, using total buffered bytes
+as a proxy for body size. That grants a body up to `cap + 8192` before
+rejecting, and it counts pipelined bytes of the *next* request toward the
+current one's total. Exact enforcement wants the body length the parser already
+knows (`Content-Length`, or bytes decoded so far when chunked). Not urgent, but
+it is the reason the cap is soft rather than exact.
+
+### 12.11 Still open elsewhere
 
 - **`src/CgiHandler.cpp` is a 0-byte file.** CGI is a subject requirement and
   is entirely unwritten; `_handleCgiPipeRead()` is an empty stub and the CGI
