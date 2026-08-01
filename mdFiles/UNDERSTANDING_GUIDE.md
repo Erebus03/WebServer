@@ -1716,13 +1716,17 @@ request's version in only the CGI path would also make the server less
 consistent, since `ResponseBuilder` and `_startErrorResponse` both hardcode
 1.1.
 
-**Still missing** (recorded honestly rather than implied complete): the child's
-environment is empty, so no `REQUEST_METHOD`/`QUERY_STRING`/`CONTENT_LENGTH` and
-no `REDIRECT_STATUS` (php-cgi will not run without it); there is no stdin pipe,
-so POST bodies never reach a script; there is no CGI timeout, so `sleep(9999)`
-is dropped by the 60s *idle* clock with no 504 and an orphaned child; the child
-inherits the server's sockets; and there is no `chdir()` into the script's
-directory. `SUBJECT_RULES.txt` §5 carries the full list.
+**What was still missing when this section was first written** — the child's
+environment, the stdin pipe, the CGI timeout, the inherited sockets and the
+`chdir` — all landed afterwards in `485e110`, `16b1b9d`, `2c1ef3c` and
+`9d7944a`, and are written up in 12.14. The CGI ledger in `SUBJECT_RULES.txt`
+§5 is empty as of 2026-08-01, with one caveat standing in its place: none of it
+is proven against **php-cgi**, which is not installed on this machine, so
+`REDIRECT_STATUS` and the absolute `SCRIPT_FILENAME` are set-but-untested
+against the pickiest interpreter. `/bin/sh` and `python3` both work end to end.
+
+Read the current list from that file, never from here — this paragraph went
+stale three times, which is why the ledger rule exists.
 
 ### 12.14 CGI part two: stdin, environment, and four things worth being asked
 
