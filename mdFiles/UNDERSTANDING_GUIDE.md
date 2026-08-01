@@ -1689,10 +1689,16 @@ the verdict is not in yet. Two options:
   response is parked INCOMPLETE and a sweep in `_checkTimeouts()` finalizes it
   once the status exists.
 
-Chosen: hold. The cost is bounded and tiny — the sweep runs every loop and the
-window closes in microseconds in practice — while the benefit is that the
-truncation signal is never wrong. A signal that is right except under a race is
-not a signal you can defend.
+Chosen: hold. The benefit is that the truncation signal is never wrong, and a
+signal that is right except under a race is not one you can defend.
+
+Be precise about the cost, though: the sweep only runs when `poll()` returns,
+and its timeout is **5000 ms**. On a busy server the wait is microseconds
+(any event wakes the loop); on a silent one it is up to 5 s. The normal case
+never waits at all — a script that simply exits has its stdout closed BY the
+exit, so `waitpid` succeeds immediately at EOF. Only a script that closes stdout
+and lingers reaches the deferred path, and that one is bounded above by
+`CGI_TIMEOUT_SEC` regardless.
 
 The consequence to notice: those clients must be skipped by the idle and stall
 timeout branches. A client waiting on us to reap its child is **mid-response,

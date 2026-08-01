@@ -1027,6 +1027,10 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
             close(it->first);                        // that client's socket
             if (it->second->cgi_pipe_fd != -1)
                 close(it->second->cgi_pipe_fd);      // another script's pipe
+            // V4: when the stdin pipe lands, close other clients' stdin WRITE
+            // ends here too. Holding one open means that script never sees EOF
+            // on its stdin and blocks forever waiting for a body we finished
+            // sending — the same class of bug as the fds above, one level over.
         }
         if (reserve_fd >= 0) close(reserve_fd);
         close(fds[1]);
@@ -1102,6 +1106,12 @@ bool Server::_reapCgi(Client* client, int& status) {
 // This is the ONLY signal that separates the two. A script that crashes has its
 // stdout closed by the kernel exactly like one that returns, so the parent sees
 // an identical EOF — reading the pipe can never tell them apart.
+// Judgment call, stated because it is arguable: a nonzero exit counts as
+// failure even when the script printed a COMPLETE body first. CGI never blessed
+// exit codes as protocol, and nginx would neither notice nor care — so this is
+// the stricter reading. Chosen because the alternative is to ignore the only
+// health signal the script gives us, and a response that is whole but whose
+// producer reported failure is not something to certify as fine.
 static bool cgiExitedCleanly(int status) {
     if (WIFSIGNALED(status)) return false;          // segfault, SIGKILL, ...
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -1113,7 +1123,10 @@ static bool cgiExitedCleanly(int status) {
 // The waitpid here is BLOCKING, deliberately, and it is the one place in this
 // file where that is defensible: SIGKILL cannot be caught, blocked or ignored,
 // so the child is already dead or dying and the wait is bounded by scheduler
-// latency rather than by anything the script controls. The alternative — a
+// latency rather than by anything the script controls. The honest caveat: a
+// child wedged in uninterruptible sleep (D state — a hung NFS read, say) defers
+// even SIGKILL, so the bound assumes it is not stuck in the kernel. Accepted
+// knowingly: the alternative leaks a zombie with no owner left to reap it. The alternative — a
 // WNOHANG that may return 0 and leave the pid behind — is how the client-death
 // path leaks zombies, since after _removeClient there is no Client left to
 // carry the pid and no sweep that could retry.
@@ -1121,6 +1134,11 @@ static bool cgiExitedCleanly(int status) {
 // The kill is guarded on `> 0`, not `!= -1`: kill(-1, SIGKILL) signals EVERY
 // process this user may signal, which includes this server and the shell that
 // launched it. -1 is exactly the sentinel these fields hold when idle.
+// Scope note: this kills OUR child, not its descendants. A script that spawned
+// something of its own leaves that grandchild running; it is reparented to init
+// and is no longer ours to account for. So "0 children" after a kill means zero
+// children OF THIS SERVER — an evaluator watching `ps` may still see the
+// grandchild for a moment, correctly.
 void Server::_killCgi(Client* client) {
     if (client->cgi_pid > 0) {
         kill(client->cgi_pid, SIGKILL);

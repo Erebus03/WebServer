@@ -127,11 +127,12 @@ algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
 
   502 — the CGI script produced nothing usable: it exited without emitting a
         header block, or its pipe failed. Emitted by _handleCgiPipeRead().
-  504 — NOT YET IMPLEMENTED (see section 5). Intended answer when a CGI script
-        exceeds its timeout and is killed. This is what an evaluator tests with
-        a script containing sleep(9999): 504 and a server still serving, NOT a
-        hang. Today such a script is dropped by the 60s IDLE timer with no
-        response and its child is orphaned — wrong timer, wrong answer.
+  504 — a CGI script exceeded CGI_TIMEOUT_SEC (30s) and was SIGKILLed before
+        emitting any header. Implemented in 485e110 and measured: a script
+        containing sleep(9999) returns 504 with the server still serving.
+        Once headers are already on the wire a status code can no longer be
+        sent, so a timeout there ends as a withheld terminator instead — the
+        truncation signal, not a code.
   505 — request line named a version we do not speak. The parser seeds
         request.status with it; _advanceRequest forwards that code rather
         than a blanket 400.
@@ -169,7 +170,13 @@ COMPLIANT:
   - parent's pipe read end non-blocking via the exact allowed fcntl form
   - no errno inspected after the pipe read; >0 / 0 / <0 only
   - child ends in execve or _exit(1) — never exit(), never a return
-  - waitpid(WNOHANG) only; no blocking wait anywhere in the loop
+  - waitpid(WNOHANG) on every path driven by the script's own pace. The ONE
+    deliberate exception is _killCgi(): after SIGKILL it waits blocking, which
+    is safe because SIGKILL cannot be caught or ignored, so the wait is bounded
+    by scheduler latency rather than by the script. WNOHANG there would leave
+    the pid behind on the client-death path, where no Client remains to carry
+    it and no sweep can retry -- a zombie with no owner. Known caveat: a child
+    in uninterruptible sleep (D state) defers even SIGKILL; accepted knowingly
   - parent closes its copy of the child's write end immediately after fork,
     so EOF on the read end is reachable at all
   - POLLHUP is not treated as terminal: the read runs first and only a
@@ -179,21 +186,36 @@ COMPLIANT:
   - framing chosen by request version: 1.1 -> chunked (self-delimiting, may
     keep-alive), 1.0 -> close-delimited and keep_alive forced false
 
+THIS LIST IS THE LEDGER. A commit that closes an item MUST move it below in the
+SAME commit, and any "what is left" statement anywhere — chat summary, guide,
+message to a teammate — must be READ FROM HERE, never recalled from memory. The
+narrative list has silently dropped open items twice; this file is the fix.
+
+CLOSED (with the commit that closed it):
+  - V1 zombie: cgi_pid was cleared even when waitpid reported the child still
+    running, so that child was never reaped.                        221c97e
+  - truncation signal: a crashed script produced a clean EOF and still got a
+    terminating chunk, announcing a half-response as whole.          221c97e
+  - V2 client death mid-script closed the pipe but never kill()ed.   485e110
+  - V3 no CGI timeout / 504. Worse, the parked-response state was exempt from
+    every timer, so a script that closed stdout without exiting held its
+    connection forever.                                              485e110
+  - V6 child inherited every listen and client socket. NOT hygiene: it made
+    the V3 timeout unenforceable, because an orphaned grandchild kept the
+    client fd open and the server's own close() closed nothing.      485e110
+
 OPEN (must be fixed before this section can claim CGI compliance):
-  - no CONTENT to the script: envp is empty. No REQUEST_METHOD, QUERY_STRING,
-    CONTENT_LENGTH, SCRIPT_FILENAME, PATH_INFO, HTTP_*, and no
+  - V5 no CONTENT to the script: envp is empty. No REQUEST_METHOD,
+    QUERY_STRING, CONTENT_LENGTH, SCRIPT_FILENAME, PATH_INFO, HTTP_*, and no
     REDIRECT_STATUS=200 — php-cgi refuses to run without the last one.
-  - no stdin pipe at all: POST bodies never reach the script.
-  - no CGI timeout / 504 (see section 4). A client in WAITING_FOR_CGI is
-    currently judged by the 60s idle clock, which section 9 of the CGI brief
-    calls out as the wrong timer.
-  - _closeCgi() clears cgi_pid even when waitpid(WNOHANG) reported the child
-    still running, so that pid is never reaped -> zombie under a race.
-  - client death mid-script closes the pipe but never kill()s the child.
-  - the child inherits every listen and client socket and does not close them.
-  - no chdir() into the script's directory, so relative paths break.
-  - preflight uses file_exists() only: no stat() regular-file check and no
-    access() permission check, so a non-executable script yields 502 not 403.
+  - V4 no stdin pipe at all: POST bodies never reach the script. When it
+    lands, the child's fd-closing loop must ALSO close other clients' stdin
+    write ends, or one script holds another's stdin open and that script
+    never sees EOF (marked `// V4:` at the loop).
+  - V7 no chdir() into the script's directory, so relative paths break.
+  - V8 preflight uses file_exists() only: no stat() regular-file check (a
+    directory named *.sh would be exec'd) and no access() permission check,
+    so a non-executable script yields 502 instead of 403.
 
 ===============================================================================
  Source of truth: the official 42 "Webserv" subject PDF. If the evaluation
