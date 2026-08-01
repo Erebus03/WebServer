@@ -8,40 +8,41 @@ static std::string lower(std::string s)
     return s;
 }
 
-// a CGI "Status: 404 Not Found" line -> response code (+ message if given)
-static void applyStatus(const std::string& value, HttpResponse& resp)
+// a CGI "Status: 404 Not Found" line -> code (+ message if given)
+static void applyStatus(const std::string& value, CgiHeaders& out)
 {
     size_t i = 0;
     int code = 0;
     while (i < value.size() && value[i] >= '0' && value[i] <= '9')
         code = code * 10 + (value[i++] - '0');
     if (code >= 100 && code <= 599)
-        resp.status_code = code;
-    size_t s = value.find_first_not_of(" \t", i);   // the rest is the reason text
+        out.status_code = code;
+    size_t s = value.find_first_not_of(" \t", i);
     if (s != std::string::npos)
-        resp.status_message = value.substr(s);
+        out.status_message = value.substr(s);
 }
 
-HttpResponse CgiResponse::parse(const std::string& out)
+bool CgiResponse::parseHead(const std::string& leading, CgiHeaders& out)
 {
-    HttpResponse resp;
-    resp.status_code = 200;   // CGI default when no Status header
+    out.status_code = 200;   // CGI default when no Status header
+    out.status_message.clear();
+    out.headers.clear();
+    out.body_offset = 0;
 
-    // find the blank line splitting headers from body. scripts use \n\n or \r\n\r\n.
-    size_t sep, body_start;
-    size_t p1 = out.find("\r\n\r\n");
-    size_t p2 = out.find("\n\n");
+    // the blank line ends the CGI headers. scripts use \n\n or \r\n\r\n.
+    size_t sep, skip;
+    size_t p1 = leading.find("\r\n\r\n");
+    size_t p2 = leading.find("\n\n");
     if (p1 != std::string::npos && (p2 == std::string::npos || p1 <= p2)) {
-        sep = p1; body_start = p1 + 4;
+        sep = p1; skip = 4;
     } else if (p2 != std::string::npos) {
-        sep = p2; body_start = p2 + 2;
+        sep = p2; skip = 2;
     } else {
-        resp.body = out;      // no blank line -> no CGI headers, it's all body
-        return resp;
+        return false;   // headers not fully here yet -> read more from the pipe
     }
 
-    std::string headers = out.substr(0, sep);
-    resp.body = out.substr(body_start);
+    out.body_offset = sep + skip;
+    std::string headers = leading.substr(0, sep);
 
     // walk header lines (split on \n, drop a trailing \r so \r\n works too)
     size_t pos = 0;
@@ -61,17 +62,17 @@ HttpResponse CgiResponse::parse(const std::string& out)
 
             std::string lname = lower(name);
             if (lname == "status")
-                applyStatus(value, resp);                 // consumed, not a real header
+                applyStatus(value, out);                  // consumed, not a real header
             else if (lname == "content-type")
-                resp.headers["Content-Type"] = value;     // canonical case for ResponseBuilder
+                out.headers["Content-Type"] = value;      // canonical case
             else if (lname == "content-length")
-                resp.headers["Content-Length"] = value;   // ResponseBuilder recomputes anyway
+                out.headers["Content-Length"] = value;
             else
-                resp.headers[name] = value;               // Location, Set-Cookie, ...
+                out.headers[name] = value;                // Location, Set-Cookie, ...
         }
         if (nl == std::string::npos)
             break;
         pos = nl + 1;
     }
-    return resp;
+    return true;
 }
