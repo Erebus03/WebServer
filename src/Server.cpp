@@ -685,11 +685,17 @@ void Server::_processRequest(Client* client) {
         const LocationConfig* loc =
             Router::match(client->request.uri, *client->server_cfg);
         if (loc) {
-            const std::string interpreter = _cgiInterpreterFor(client->request, *loc);
+            std::string script_name, path_info;
+            const std::string interpreter =
+                _cgiSplitPath(client->request.uri, *loc, script_name, path_info);
             if (!interpreter.empty()) {
                 std::string script_path;
+                // Resolve the SCRIPT part only. PATH_INFO is data for the
+                // script, not filesystem path — resolving the whole URI would
+                // look for a file at /cgi-bin/x.py/extra and 404 every request
+                // that carries extra path.
                 if (!FileUtils::is_path_safe(client->request.uri) ||
-                    !FileUtils::resolve_path(loc->root, client->request.uri, script_path)) {
+                    !FileUtils::resolve_path(loc->root, script_name, script_path)) {
                     _startErrorResponse(client, 403, FRAMING_INTACT);
                     return;
                 }
@@ -698,7 +704,7 @@ void Server::_processRequest(Client* client) {
                     return;
                 }
                 // _startCgi queues its own error response on failure.
-                _startCgi(client, interpreter, script_path);
+                _startCgi(client, interpreter, script_path, script_name, path_info);
                 return;
             }
         }
@@ -993,25 +999,136 @@ void Server::_finishResponse(int client_fd) {
 // ---------------------------------------------------------------------------
 
 // Does the matched location declare a handler for this URI's extension?
-std::string Server::_cgiInterpreterFor(const HttpRequest& request,
-                                       const LocationConfig& loc) const {
+std::string Server::_cgiSplitPath(const std::string& uri, const LocationConfig& loc,
+                                  std::string& script_name, std::string& path_info) const {
+    script_name.clear();
+    path_info.clear();
     if (loc.cgi_ext.empty()) return "";
 
-    // Extension of the last path segment only. A dot in a directory name
-    // ("/v1.2/index.html") must not be mistaken for the script's suffix.
-    const std::string& uri = request.uri;
-    const size_t slash = uri.find_last_of('/');
-    const size_t dot   = uri.find_last_of('.');
-    if (dot == std::string::npos) return "";
-    if (slash != std::string::npos && dot < slash) return "";
+    // Walk segments left to right and stop at the FIRST one whose extension is
+    // configured. Taking the last dot instead would miss /cgi-bin/x.py/extra
+    // entirely — the last dot there sits before the final slash, so the request
+    // would not even register as CGI, and PATH_INFO could never exist.
+    size_t pos = 0;
+    while (pos < uri.size()) {
+        size_t slash = uri.find('/', pos + 1);
+        const std::string segment_end_at =
+            uri.substr(0, (slash == std::string::npos) ? uri.size() : slash);
 
-    std::map<std::string, std::string>::const_iterator it =
-        loc.cgi_ext.find(uri.substr(dot));
-    return (it == loc.cgi_ext.end()) ? "" : it->second;
+        const size_t dot = segment_end_at.find_last_of('.');
+        const size_t seg_start = segment_end_at.find_last_of('/');
+        if (dot != std::string::npos &&
+            (seg_start == std::string::npos || dot > seg_start)) {
+            std::map<std::string, std::string>::const_iterator it =
+                loc.cgi_ext.find(segment_end_at.substr(dot));
+            if (it != loc.cgi_ext.end()) {
+                script_name = segment_end_at;
+                path_info   = (slash == std::string::npos) ? "" : uri.substr(slash);
+                return it->second;
+            }
+        }
+        if (slash == std::string::npos) break;
+        pos = slash;
+    }
+    return "";
+}
+
+// CGI/1.1 environment. Subject: "the full request and arguments provided by the
+// client must be available to the CGI."
+std::vector<std::string> Server::_cgiEnv(const Client* client,
+                                         const std::string& script_filename,
+                                         const std::string& script_name,
+                                         const std::string& path_info) const {
+    const HttpRequest& rq = client->request;
+    std::vector<std::string> env;
+
+    env.push_back("GATEWAY_INTERFACE=CGI/1.1");
+    env.push_back("SERVER_SOFTWARE=webserv/1.0");
+    env.push_back("SERVER_PROTOCOL=" + rq.version);
+    env.push_back("REQUEST_METHOD=" + rq.method);
+    env.push_back("SCRIPT_FILENAME=" + script_filename);   // php-cgi reads THIS
+    env.push_back("SCRIPT_NAME=" + script_name);
+    env.push_back("PATH_INFO=" + path_info);               // may be empty, must exist
+    env.push_back("QUERY_STRING=" + rq.query_string);      // raw; decoding is the script's job
+    // remote_address is stored as "ip:port" for logging. REMOTE_ADDR is the
+    // ADDRESS only — leaving the port on it makes scripts that compare against
+    // an allow-list, or hand it to a resolver, silently fail on every request.
+    // The port has its own variable.
+    {
+        const std::string& peer = client->remote_address;
+        const size_t colon = peer.find_last_of(':');
+        if (colon == std::string::npos) {
+            env.push_back("REMOTE_ADDR=" + peer);
+        } else {
+            env.push_back("REMOTE_ADDR=" + peer.substr(0, colon));
+            env.push_back("REMOTE_PORT=" + peer.substr(colon + 1));
+        }
+    }
+    // php-cgi's force-cgi-redirect check refuses to run without this. Harmless
+    // to every other interpreter, so it is set unconditionally.
+    env.push_back("REDIRECT_STATUS=200");
+
+    // Omitted, not zeroed, when there is no body: RFC 3875 section 4.1.2 says
+    // CONTENT_LENGTH is set only when a message body is present. A POST with
+    // Content-Length: 0 lands here too — no body, no variable.
+    if (!rq.body.empty()) {
+        std::ostringstream len;
+        len << rq.body.size();   // DECODED size: the parser un-chunks before this
+        env.push_back("CONTENT_LENGTH=" + len.str());
+    }
+    std::map<std::string, std::string>::const_iterator ct = rq.headers.find("content-type");
+    if (ct != rq.headers.end())
+        env.push_back("CONTENT_TYPE=" + ct->second);
+
+    if (client->server_cfg) {
+        env.push_back("SERVER_NAME=" + (client->server_cfg->server_names.empty()
+                                        ? client->server_cfg->host
+                                        : client->server_cfg->server_names[0]));
+        std::ostringstream port;
+        port << client->server_cfg->port;
+        env.push_back("SERVER_PORT=" + port.str());
+    }
+
+    // HTTP_* : uppercase the name, '-' -> '_', prefix HTTP_.
+    for (std::map<std::string, std::string>::const_iterator it = rq.headers.begin();
+         it != rq.headers.end(); ++it) {
+        const std::string& name = it->first;   // parser stores these lowercased
+
+        // Already carried as dedicated variables; duplicating them as HTTP_* is
+        // spec-noncompliant and confuses picky scripts.
+        if (name == "content-type" || name == "content-length") continue;
+
+        // Hop-by-hop headers describe a connection the script is not on.
+        // Transfer-Encoding additionally describes framing we ALREADY REMOVED:
+        // the body was un-chunked before it reached the pipe, so telling the
+        // script "chunked" would make a conforming one try to de-chunk decoded
+        // bytes and corrupt its own input.
+        if (name == "transfer-encoding" || name == "connection" ||
+            name == "keep-alive" || name == "te" || name == "upgrade") continue;
+
+        // A header name containing '_' would transform into the same variable
+        // as its '-' twin, letting a client shadow or spoof one (X_Evil vs
+        // X-Evil). nginx drops underscore headers by default for this reason.
+        if (name.find('_') != std::string::npos) continue;
+
+        std::string var = "HTTP_";
+        for (size_t i = 0; i < name.size(); ++i) {
+            const char c = name[i];
+            var += (c == '-') ? '_' : static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        env.push_back(var + "=" + it->second);
+    }
+    return env;
 }
 
 bool Server::_startCgi(Client* client, const std::string& interpreter,
-                       const std::string& script_path) {
+                       const std::string& script_path,
+                       const std::string& script_name,
+                       const std::string& path_info) {
+    // Built BEFORE fork: allocating in the child after fork is asking for
+    // trouble, and this cannot fail in a way the child could report.
+    const std::vector<std::string> env_storage =
+        _cgiEnv(client, script_path, script_name, path_info);
     int fds[2];                       // script stdout -> us
     if (pipe(fds) < 0) {
         _startErrorResponse(client, 500, FRAMING_INTACT);
@@ -1084,10 +1201,17 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
         argv[0] = const_cast<char*>(interpreter.c_str());
         argv[1] = const_cast<char*>(script_path.c_str());
         argv[2] = NULL;
-        char* envp[1];
-        envp[0] = NULL;                      // request metadata comes next slice
 
-        execve(interpreter.c_str(), argv, envp);
+        // Pointers are taken only now that env_storage is fully built and will
+        // not grow again. Taking them during construction would leave every
+        // pointer dangling after the vector's next reallocation — the classic
+        // version of this bug.
+        std::vector<char*> envp;
+        for (size_t i = 0; i < env_storage.size(); ++i)
+            envp.push_back(const_cast<char*>(env_storage[i].c_str()));
+        envp.push_back(NULL);
+
+        execve(interpreter.c_str(), argv, &envp[0]);
         _exit(1);                            // exec failed; parent sees EOF
     }
 

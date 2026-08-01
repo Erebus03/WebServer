@@ -122,13 +122,25 @@ private:
     // Is this request handled by a script? Returns the interpreter to exec when
     // the matched location declares a cgi_extension for the URI's suffix.
     // Empty string means "not CGI, hand it to Dispatcher as usual".
-    std::string _cgiInterpreterFor(const HttpRequest& request,
-                                   const LocationConfig& loc) const;
+    // Splits the URI at the first path segment carrying a configured CGI
+    // extension: everything up to and including it is SCRIPT_NAME, the rest is
+    // PATH_INFO. Returns the interpreter, or "" when no segment matches (not a
+    // CGI request). Walking segments rather than taking the last dot is what
+    // makes /cgi-bin/x.py/extra work at all.
+    std::string _cgiSplitPath(const std::string& uri, const LocationConfig& loc,
+                              std::string& script_name, std::string& path_info) const;
+    // CGI/1.1 environment for the child. Built before fork.
+    std::vector<std::string> _cgiEnv(const Client* client,
+                                     const std::string& script_filename,
+                                     const std::string& script_name,
+                                     const std::string& path_info) const;
     // fork()s the script with its stdout on a pipe and parks the client in
     // WAITING_FOR_CGI. False means the script could not be started and an error
     // response is already queued.
     bool _startCgi(Client* client, const std::string& interpreter,
-                   const std::string& script_path);
+                   const std::string& script_path,
+                   const std::string& script_name,
+                   const std::string& path_info);
     // Drains whatever the script has printed so far. Parses the header block on
     // the way through, then streams the body out as chunks.
     void _handleCgiPipeRead(int cgi_fd);
