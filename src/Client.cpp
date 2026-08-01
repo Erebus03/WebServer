@@ -9,6 +9,7 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
       listen_fd(accepted_on),
       cgi_pipe_fd(-1),
       cgi_pid(-1),
+      cgi_start_time(0),
       remote_address(remote_addr),
       state(READING),
       bytes_sent(0),
@@ -73,6 +74,7 @@ void Client::resetForNextRequest() {
     response_complete = false;
     cgi_headers_sent = false;
     cgi_chunked = false;
+    // cgi_start_time is cleared by _closeCgi/_killCgi with the pid it belongs to.
     cgi_head_buf.clear();
 
     request = HttpRequest();        // drop every header/body of the old request

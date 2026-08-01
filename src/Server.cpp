@@ -422,6 +422,10 @@ static const size_t MAX_HEADER_BYTES = 8192;
 static const time_t IDLE_TIMEOUT_SEC    = 60;
 static const time_t REQUEST_TIMEOUT_SEC = 30;
 static const time_t SEND_STALL_SEC      = 30;
+// A script gets this long from fork() to being fully done. Its OWN clock: a
+// client waiting on a script is neither idle nor late, so the other timers
+// deliberately skip it — which means without this one nothing bounds it at all.
+static const time_t CGI_TIMEOUT_SEC     = 30;
 
 static std::string reasonPhrase(int code) {
     switch (code) {
@@ -1000,6 +1004,31 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
         // second copy of the server running its own event loop.
         close(fds[0]);                       // not reading
         if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(1);
+
+        // Close every socket this fork inherited. NOT hygiene — load-bearing.
+        //
+        // fork() copies the whole descriptor table, so the script (and anything
+        // it spawns) holds a duplicate of the listening socket and of EVERY live
+        // client socket. A connection then stays open as long as any copy does,
+        // so the server closing its own descriptor closes nothing: measured, a
+        // timed-out script was killed correctly, the server closed the client
+        // fd, and curl still hung — because the script's orphaned `sleep`
+        // grandchild was holding fd 4 (listen) and fd 5 (client). The CGI
+        // timeout is unenforceable without this.
+        //
+        // Done by hand rather than with FD_CLOEXEC: the subject's fcntl rule
+        // permits exactly F_SETFL/O_NONBLOCK, and the PDF's mention of
+        // FD_CLOEXEC is self-inconsistent (that flag is F_SETFD). Closing
+        // explicitly needs no ruling from anyone. See SUBJECT_RULES.txt.
+        for (size_t i = 0; i < listening_sockets.size(); ++i)
+            close(listening_sockets[i]);
+        for (std::map<int, Client*>::iterator it = clients.begin();
+             it != clients.end(); ++it) {
+            close(it->first);                        // that client's socket
+            if (it->second->cgi_pipe_fd != -1)
+                close(it->second->cgi_pipe_fd);      // another script's pipe
+        }
+        if (reserve_fd >= 0) close(reserve_fd);
         close(fds[1]);
 
         char* argv[3];
@@ -1019,6 +1048,7 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
 
     client->cgi_pipe_fd      = fds[0];
     client->cgi_pid          = pid;
+    client->cgi_start_time   = std::time(NULL);   // starts the CGI clock
     client->cgi_head_buf.clear();
     client->cgi_headers_sent = false;
     cgi_fd_to_client_fd[fds[0]] = client->fd;
@@ -1077,27 +1107,35 @@ static bool cgiExitedCleanly(int status) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-// Closes the pipe and reaps the child, discarding the status. For teardown
-// only, where there is no longer a client to report an outcome to.
-void Server::_closeCgi(Client* client) {
-    _closeCgiPipe(client);
+// SIGKILL the child and reap it. Used when we have decided the script is over:
+// a timeout, or a client that died while its script was still running.
+//
+// The waitpid here is BLOCKING, deliberately, and it is the one place in this
+// file where that is defensible: SIGKILL cannot be caught, blocked or ignored,
+// so the child is already dead or dying and the wait is bounded by scheduler
+// latency rather than by anything the script controls. The alternative — a
+// WNOHANG that may return 0 and leave the pid behind — is how the client-death
+// path leaks zombies, since after _removeClient there is no Client left to
+// carry the pid and no sweep that could retry.
+//
+// The kill is guarded on `> 0`, not `!= -1`: kill(-1, SIGKILL) signals EVERY
+// process this user may signal, which includes this server and the shell that
+// launched it. -1 is exactly the sentinel these fields hold when idle.
+void Server::_killCgi(Client* client) {
     if (client->cgi_pid > 0) {
-        // Guarded with > 0, not != -1, and this is not pedantry: every pid-taking
-        // call here is one typo away from catastrophe. kill(-1, SIGKILL) signals
-        // EVERY process the user may signal — it would kill this server, and the
-        // shell that launched it. waitpid(-1) reaps an arbitrary child. A sentinel
-        // of -1 is exactly the value that turns both into wildcards, so no pid
-        // from a Client may ever reach them unchecked. Any kill() added later
-        // (killing a hung script on timeout, or on client death) MUST sit inside
-        // a guard of this shape.
-        //
-        // WNOHANG: the child has normally already exited (its pipe hit EOF), and
-        // blocking here would hand a hung script the ability to stop the entire
-        // event loop — the one thing the subject forbids outright.
+        kill(client->cgi_pid, SIGKILL);
         int status = 0;
-        waitpid(client->cgi_pid, &status, WNOHANG);
+        waitpid(client->cgi_pid, &status, 0);
         client->cgi_pid = -1;
     }
+    client->cgi_start_time = 0;
+}
+
+// Full teardown: pipe + child, outcome discarded. For client destruction, where
+// there is nobody left to report to.
+void Server::_closeCgi(Client* client) {
+    _closeCgiPipe(client);
+    _killCgi(client);
 }
 
 // Appends one chunked-encoding piece: <hex size> CRLF <data> CRLF.
@@ -1325,15 +1363,36 @@ void Server::_checkTimeouts() {
     std::vector<int> stalled;   // stopped reading its response -> drop
     std::vector<int> idle;      // said nothing at all -> just drop
     std::vector<int> awaiting;  // CGI hit EOF but its child was not reapable yet
+    std::vector<int> cgi_late;  // script blew its deadline -> kill it
+
+    const time_t now = std::time(NULL);
 
     for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
         Client* c = it->second;
 
+        // Any live CGI, past its deadline. Checked FIRST and for every CGI
+        // state — still streaming, or parked waiting on a reap — because this
+        // is the only clock that bounds either of them.
+        //
+        // The parked case is why this cannot wait for a later commit. Those
+        // clients are skipped by the idle and stall branches below (they are
+        // mid-response, not late), their pipe is closed so it is out of the
+        // poll set, and their buffer is drained so no POLLOUT is requested.
+        // Nothing else in the server watches them. A script that closes stdout
+        // and then never exits (`exec 1>&-; sleep 9999`) held its connection
+        // FOREVER, which is a hard subject violation — measured: still hung
+        // after 25s, child alive.
+        if (c->cgi_pid > 0 && c->cgi_start_time != 0 &&
+            (now - c->cgi_start_time) >= CGI_TIMEOUT_SEC) {
+            cgi_late.push_back(it->first);
+            continue;
+        }
+
         // A CGI whose pipe closed while the child was still exiting. Its
         // response is deliberately parked as incomplete until the exit status
         // exists, because that status is the only thing separating a finished
-        // script from a crashed one. Retried every loop; it resolves in
-        // microseconds in practice.
+        // script from a crashed one. Retried on every sweep, and now bounded
+        // above by CGI_TIMEOUT_SEC.
         if (c->cgi_pid > 0 && c->cgi_pipe_fd == -1 &&
             c->cgi_headers_sent && !c->response_complete) {
             awaiting.push_back(it->first);
@@ -1348,6 +1407,26 @@ void Server::_checkTimeouts() {
             stalled.push_back(it->first);
         else if (c->isTimedOut(IDLE_TIMEOUT_SEC))
             idle.push_back(it->first);
+    }
+
+    // Killed first: these are the ones actively holding a connection hostage.
+    for (size_t i = 0; i < cgi_late.size(); ++i) {
+        std::map<int, Client*>::iterator it = clients.find(cgi_late[i]);
+        if (it == clients.end()) continue;
+        Client* c = it->second;
+        std::cerr << "CGI for client " << cgi_late[i] << " exceeded "
+                  << CGI_TIMEOUT_SEC << "s, killing it" << std::endl;
+        _closeCgiPipe(c);
+        _killCgi(c);            // SIGKILL + blocking reap; guarded on pid > 0
+
+        // Nothing is on the wire yet -> a real status code is still possible,
+        // and 504 is the one that says "the upstream did not answer in time".
+        // Once headers are out that option is gone, so the only honest ending
+        // left is the truncation signal.
+        if (!c->cgi_headers_sent)
+            _startErrorResponse(c, 504, FRAMING_INTACT);
+        else
+            _finalizeCgi(c, false);   // may delete the client
     }
 
     // Before the timeout branches: these clients are mid-response, not late.

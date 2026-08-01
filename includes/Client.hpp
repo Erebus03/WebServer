@@ -32,6 +32,11 @@ public:
     int          listen_fd;       // socket we were accepted on; picks the vhost candidates
     int          cgi_pipe_fd;     // CGI stdout pipe read end; -1 if none
     pid_t        cgi_pid;         // CGI child pid for waitpid(); -1 if none
+    // When the script was forked; 0 = none running. Its own clock, separate
+    // from every request/idle timer: a client waiting on a script is neither
+    // idle nor late, but it must still be bounded or a script that never exits
+    // holds the connection forever.
+    time_t       cgi_start_time;
     std::string  remote_address;
     State        state;
 

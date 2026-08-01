@@ -146,6 +146,10 @@ private:
     // forced closed, so the peer sees a truncated transfer instead of being told
     // a half-response was complete.
     void _finalizeCgi(Client* client, bool ok);
+    // SIGKILL the child and reap it. For a timeout, or a client that died while
+    // its script ran. The wait is blocking on purpose — SIGKILL cannot be caught,
+    // so it is bounded by scheduler latency, not by the script.
+    void _killCgi(Client* client);
     // Full teardown: pipe + child. Used by client destruction, where nothing is
     // left to report to.
     void _closeCgi(Client* client);
