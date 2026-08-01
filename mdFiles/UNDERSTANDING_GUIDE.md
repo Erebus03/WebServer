@@ -1651,6 +1651,65 @@ re-parsed only on the keep-alive branch, which a close-delimited response has
 already forced false — so a 1.0 client pipelining behind one loses its second
 request, as it must, having been told the connection ends.
 
+#### Telling a finished script from a crashed one
+
+A script that segfaults has its stdout closed by the kernel **exactly** as one
+that returns cleanly does. The parent reads an identical EOF. Reading the pipe
+can never distinguish them — the exit status is the only signal that exists.
+
+The first version threw it away (`waitpid`'s return discarded) and appended the
+terminating chunk unconditionally, so a half-response was announced as whole.
+Demonstrated on the pre-fix binary: a script printing half its body and raising
+SIGKILL produced `curl exit=0, HTTP 200`, with the wire ending
+`first-half\n\r\n0\r\n\r\n`. After the fix, the same request ends at
+`first-half\n\r\n` and curl reports **"transfer closed with outstanding read
+data remaining."**
+
+The rule: headers are already on the wire, so no status code can be retracted.
+The only honest signal left is to make the transfer *visibly incomplete* — the
+peer waits for a terminator and gets a closed connection instead. `keep_alive`
+is forced off too, since the next response on that connection would be read as
+a continuation of this chunk stream.
+
+**Close-delimited (HTTP/1.0) responses cannot carry this signal at all.** A
+clean close is what success looks like. That is a genuine limitation of the
+framing, not an oversight — worth saying plainly rather than implying the
+detection is universal.
+
+#### The deferred-verdict decision (worth being asked about)
+
+Closing stdout and exiting are separate events, so at EOF `waitpid(WNOHANG)`
+can legally return 0: the pipe is done, the child is still winding down, and
+the verdict is not in yet. Two options:
+
+- **Optimistically clean-end** — assume success, send the terminator, finish
+  now. Lowest latency, but it guesses the exact fact this whole path exists to
+  establish, and it guesses in the direction that hides crashes.
+- **Hold the response until the child is reaped** — what this server does. The
+  response is parked INCOMPLETE and a sweep in `_checkTimeouts()` finalizes it
+  once the status exists.
+
+Chosen: hold. The cost is bounded and tiny — the sweep runs every loop and the
+window closes in microseconds in practice — while the benefit is that the
+truncation signal is never wrong. A signal that is right except under a race is
+not a signal you can defend.
+
+The consequence to notice: those clients must be skipped by the idle and stall
+timeout branches. A client waiting on us to reap its child is **mid-response,
+not late**, and letting the 60s idle clock reap it would reintroduce exactly
+the wrong-timer bug described for CGI timeouts below.
+
+#### Why a 1.0 request gets an `HTTP/1.1` status line
+
+Deliberate, not an oversight. RFC 7230 §2.6: a server SHOULD send the highest
+version it conforms to within the same major version, regardless of what the
+request used — and nginx does exactly this, answering `HTTP/1.1` to 1.0
+requests while avoiding 1.1-only *features*. That is precisely the shape here:
+1.1 status line, no chunked encoding, close-delimited body. Mirroring the
+request's version in only the CGI path would also make the server less
+consistent, since `ResponseBuilder` and `_startErrorResponse` both hardcode
+1.1.
+
 **Still missing** (recorded honestly rather than implied complete): the child's
 environment is empty, so no `REQUEST_METHOD`/`QUERY_STRING`/`CONTENT_LENGTH` and
 no `REDIRECT_STATUS` (php-cgi will not run without it); there is no stdin pipe,
