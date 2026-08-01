@@ -132,8 +132,22 @@ private:
     // Drains whatever the script has printed so far. Parses the header block on
     // the way through, then streams the body out as chunks.
     void _handleCgiPipeRead(int cgi_fd);
-    // Closes the pipe, reaps the child, and clears the fd bookkeeping. Safe to
-    // call more than once; used by both the EOF path and client teardown.
+    // Closes the read pipe and drops it from the reverse map. Does NOT touch the
+    // child — EOF on the pipe and the child's exit are separate events, and the
+    // exit status is the only thing that distinguishes a finished script from a
+    // crashed one.
+    void _closeCgiPipe(Client* client);
+    // Non-blocking reap. True means the child was collected and `status` is
+    // valid; false means it is still running and cgi_pid is deliberately kept so
+    // a later sweep can try again — clearing it here is how zombies are made.
+    bool _reapCgi(Client* client, int& status);
+    // Ends a CGI response that already sent its headers. `ok` false means the
+    // script died mid-body: the terminating chunk is withheld and the connection
+    // forced closed, so the peer sees a truncated transfer instead of being told
+    // a half-response was complete.
+    void _finalizeCgi(Client* client, bool ok);
+    // Full teardown: pipe + child. Used by client destruction, where nothing is
+    // left to report to.
     void _closeCgi(Client* client);
 
     // Recycle or close once the response is complete AND drained. Called from

@@ -1033,14 +1033,54 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
     return true;
 }
 
-// Closes the pipe and reaps the child. Idempotent: the EOF path and client
-// teardown both call it, and a client may be destroyed mid-script.
-void Server::_closeCgi(Client* client) {
+void Server::_closeCgiPipe(Client* client) {
     if (client->cgi_pipe_fd != -1) {
         cgi_fd_to_client_fd.erase(client->cgi_pipe_fd);
         close(client->cgi_pipe_fd);
         client->cgi_pipe_fd = -1;
     }
+}
+
+// True when the child was collected; `status` is then valid.
+//
+// A pid is cleared ONLY on a successful reap. The previous version discarded
+// waitpid's return and cleared unconditionally, which forgot any child that had
+// closed stdout but not yet exited — a permanent zombie, and trivially
+// reachable since the pipe's EOF and the process's exit are separate events.
+bool Server::_reapCgi(Client* client, int& status) {
+    status = 0;
+    if (client->cgi_pid <= 0) return false;
+
+    // WNOHANG: blocking here would hand a hung script the ability to stop the
+    // entire event loop — the one thing the subject forbids outright.
+    const pid_t r = waitpid(client->cgi_pid, &status, WNOHANG);
+    if (r == client->cgi_pid) {
+        client->cgi_pid = -1;
+        return true;
+    }
+    if (r < 0) {
+        // Already reaped or never ours. Nothing to collect, and keeping the pid
+        // would make the sweep retry forever.
+        client->cgi_pid = -1;
+        return false;
+    }
+    return false;                 // r == 0: still running, keep the pid
+}
+
+// Did the script finish cleanly, or die partway through its output?
+//
+// This is the ONLY signal that separates the two. A script that crashes has its
+// stdout closed by the kernel exactly like one that returns, so the parent sees
+// an identical EOF — reading the pipe can never tell them apart.
+static bool cgiExitedCleanly(int status) {
+    if (WIFSIGNALED(status)) return false;          // segfault, SIGKILL, ...
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// Closes the pipe and reaps the child, discarding the status. For teardown
+// only, where there is no longer a client to report an outcome to.
+void Server::_closeCgi(Client* client) {
+    _closeCgiPipe(client);
     if (client->cgi_pid > 0) {
         // Guarded with > 0, not != -1, and this is not pedantry: every pid-taking
         // call here is one typo away from catastrophe. kill(-1, SIGKILL) signals
@@ -1094,6 +1134,41 @@ static void appendBodyEnd(Client* client) {
         appendRaw(client->output_buf, "0\r\n\r\n");
 }
 
+// Ends a CGI response whose headers already went out.
+//
+// `ok` false means the script died partway through its body. There is no way to
+// retract headers already on the wire, so the response cannot become an error
+// code — the only honest signal left is to make the transfer visibly incomplete:
+//
+//   chunked : withhold the terminating 0-chunk. The peer is waiting for it and
+//             instead gets a closed connection, which every HTTP client reports
+//             as a truncated transfer (curl: "transfer closed with outstanding
+//             read data remaining"). Sending it would assert the half-response
+//             was whole.
+//   close   : the body was already close-delimited, so a clean close is
+//             indistinguishable from success. Nothing better exists; this is a
+//             real limitation of close-delimited framing, not an oversight.
+//
+// Either way keep_alive is forced off. A connection carrying an unterminated
+// body cannot be reused: the next response would be read as a continuation of
+// this one's chunk stream.
+void Server::_finalizeCgi(Client* client, bool ok) {
+    if (ok) {
+        appendBodyEnd(client);
+    } else {
+        std::cerr << "CGI for client " << client->fd
+                  << " died mid-body; withholding the terminator" << std::endl;
+        client->keep_alive = false;
+    }
+
+    client->response_complete = true;
+    client->state = Client::SENDING;
+
+    // MUST BE LAST — _finishResponse() may delete the client. See its header.
+    if (client->bytes_sent >= client->output_buf.size())
+        _finishResponse(client->fd);
+}
+
 void Server::_handleCgiPipeRead(int cgi_fd) {
     std::map<int, int>::iterator link = cgi_fd_to_client_fd.find(cgi_fd);
     if (link == cgi_fd_to_client_fd.end()) return;
@@ -1106,15 +1181,14 @@ void Server::_handleCgiPipeRead(int cgi_fd) {
 
     if (n < 0) {
         // Same rule as every other read in this file: no errno inspection
-        // (subject:19). Treat it as the script failing and end the response.
+        // (subject:19). The read failed, so the body is definitionally
+        // incomplete — finalize as a failure, never with a terminator. The old
+        // version appended one here, which announced a truncated body as whole.
         _closeCgi(client);
-        if (!client->cgi_headers_sent) {
+        if (!client->cgi_headers_sent)
             _startErrorResponse(client, 502, FRAMING_INTACT);
-        } else {
-            appendBodyEnd(client);
-            client->response_complete = true;
-            client->state = Client::SENDING;
-        }
+        else
+            _finalizeCgi(client, false);
         return;
     }
 
@@ -1196,31 +1270,32 @@ void Server::_handleCgiPipeRead(int cgi_fd) {
     // n == 0: EOF. The script is done — this is the ONLY thing that ends the
     // response, which is why the write path may not infer completion from an
     // empty buffer.
-    _closeCgi(client);
+    _closeCgiPipe(client);        // the pipe is done; the CHILD may not be
 
     if (!client->cgi_headers_sent) {
         // Exited without ever emitting a header block (a failed execve lands
         // here, since the child _exit()s and we just see the pipe close).
+        // Nothing is on the wire yet, so a real status code is still possible.
+        _closeCgi(client);
         _startErrorResponse(client, 502, FRAMING_INTACT);
         return;
     }
-    appendBodyEnd(client);
-    client->response_complete = true;
-    client->state = Client::SENDING;
 
-    // If the buffer is already drained there will be no further POLLOUT to
-    // finish on — _rebuildPollFds only asks for it while unsent bytes remain.
-    // A close-delimited response reaches this state routinely, because it
-    // queues no terminating chunk. Without this the connection would stay open
-    // until a timer reaped it, and the peer, whose only end-of-body signal IS
-    // the close, would wait exactly that long.
-    //
-    // MUST BE THE LAST STATEMENT. _finishResponse() may delete this Client via
-    // _removeClient(), so `client` is a dangling pointer once it returns. The
-    // fd is read into the argument before the call, which is why passing
-    // client->fd is safe; nothing may be added below this line.
-    if (client->bytes_sent >= client->output_buf.size())
-        _finishResponse(client->fd);
+    // Headers are already out, so how this ends depends entirely on HOW the
+    // script finished — and EOF alone cannot say. A crash closes stdout exactly
+    // like a clean return does; only the exit status separates them.
+    int status = 0;
+    if (!_reapCgi(client, status)) {
+        // Not collectable yet: closing stdout and exiting are distinct events,
+        // so the child can outlive its own EOF by a moment. Leave the response
+        // INCOMPLETE and let the sweep in _checkTimeouts() finish it once the
+        // status exists. Deciding now would mean guessing the very thing this
+        // whole path is about.
+        return;
+    }
+
+    // MUST BE THE LAST STATEMENT — _finalizeCgi() may delete the client.
+    _finalizeCgi(client, cgiExitedCleanly(status));
     return;
 }
 
@@ -1249,9 +1324,21 @@ void Server::_checkTimeouts() {
     std::vector<int> overdue;   // began a request, never finished it -> 408
     std::vector<int> stalled;   // stopped reading its response -> drop
     std::vector<int> idle;      // said nothing at all -> just drop
+    std::vector<int> awaiting;  // CGI hit EOF but its child was not reapable yet
 
     for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
         Client* c = it->second;
+
+        // A CGI whose pipe closed while the child was still exiting. Its
+        // response is deliberately parked as incomplete until the exit status
+        // exists, because that status is the only thing separating a finished
+        // script from a crashed one. Retried every loop; it resolves in
+        // microseconds in practice.
+        if (c->cgi_pid > 0 && c->cgi_pipe_fd == -1 &&
+            c->cgi_headers_sent && !c->response_complete) {
+            awaiting.push_back(it->first);
+            continue;   // not idle, not stalled — it is waiting on us
+        }
         // Specific clocks before the general one: a client that is overdue or
         // stalled usually still looks "active" to the idle clock, which is the
         // whole reason each of these needs its own measurement.
@@ -1261,6 +1348,15 @@ void Server::_checkTimeouts() {
             stalled.push_back(it->first);
         else if (c->isTimedOut(IDLE_TIMEOUT_SEC))
             idle.push_back(it->first);
+    }
+
+    // Before the timeout branches: these clients are mid-response, not late.
+    for (size_t i = 0; i < awaiting.size(); ++i) {
+        std::map<int, Client*>::iterator it = clients.find(awaiting[i]);
+        if (it == clients.end()) continue;
+        int status = 0;
+        if (_reapCgi(it->second, status))
+            _finalizeCgi(it->second, cgiExitedCleanly(status));  // may delete it
     }
 
     for (size_t i = 0; i < overdue.size(); ++i) {
