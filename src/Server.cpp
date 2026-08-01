@@ -296,13 +296,26 @@ void Server::_rebuildPollFds(std::vector<struct pollfd>& pollfds) {
         // write() until we catch up. poll() is level-triggered, so the moment
         // the backlog drains below the mark this asks for POLLIN again and no
         // readiness is lost.
-        const size_t pending = cit->second->output_buf.size() - cit->second->bytes_sent;
-        if (pending >= CGI_BACKLOG_HIGH) continue;
-
+        Client* c = cit->second;
         struct pollfd pfd;
         pfd.fd = it->first;
-        pfd.events = POLLIN;
         pfd.revents = 0;
+
+        if (it->first == c->cgi_stdin_fd) {
+            // Write end: POLLOUT ONLY while body bytes remain. Asking
+            // unconditionally would make poll() return instantly forever on a
+            // pipe we have nothing to write to — the same 100%-CPU spin the
+            // client sockets already guard against.
+            if (c->cgi_body_sent >= c->request.body.size()) continue;
+            pfd.events = POLLOUT;
+        } else {
+            // Read end. Backpressure: stop reading the script while the client
+            // is behind on what we already produced, or a fast script and a
+            // slow peer accumulate the whole output in output_buf.
+            const size_t pending = c->output_buf.size() - c->bytes_sent;
+            if (pending >= CGI_BACKLOG_HIGH) continue;
+            pfd.events = POLLIN;
+        }
         pollfds.push_back(pfd);
     }
 }
@@ -325,9 +338,24 @@ void Server::_handlePollEvents(const std::vector<struct pollfd>& pollfds) {
         // in `clients` at all — POLLHUP is normal here (it is how a finished
         // script announces itself) and must reach the read path, which drains
         // the remaining bytes and only then treats the read of 0 as EOF.
-        if (cgi_fd_to_client_fd.count(fd)) {
-            if (pollfds[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+        std::map<int, int>::iterator cgi_link = cgi_fd_to_client_fd.find(fd);
+        if (cgi_link != cgi_fd_to_client_fd.end()) {
+            // The map says WHICH client owns this fd; the client says which of
+            // its two pipe ends it is. One source of truth for ownership and no
+            // direction tag to keep in sync — and it matters: routing a POLLOUT
+            // on the write end into the read path would read() a write-only fd,
+            // get -1, and take the script-failed branch. A self-inflicted 502
+            // on every POST, wearing the costume of a script bug.
+            std::map<int, Client*>::iterator owner = clients.find(cgi_link->second);
+            if (owner == clients.end()) { continue; }
+            Client* c = owner->second;
+
+            if (fd == c->cgi_stdin_fd) {
+                if (pollfds[i].revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL))
+                    _handleCgiStdinWrite(c);   // HUP/ERR handled as the -1 case
+            } else if (pollfds[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
                 _handleCgiPipeRead(fd);
+            }
             continue;
         }
 
@@ -984,8 +1012,17 @@ std::string Server::_cgiInterpreterFor(const HttpRequest& request,
 
 bool Server::_startCgi(Client* client, const std::string& interpreter,
                        const std::string& script_path) {
-    int fds[2];
+    int fds[2];                       // script stdout -> us
     if (pipe(fds) < 0) {
+        _startErrorResponse(client, 500, FRAMING_INTACT);
+        return false;
+    }
+    int in_fds[2];                    // us -> script stdin
+    if (pipe(in_fds) < 0) {
+        // The first pair is already open; leaking it here would burn two fds
+        // per failed CGI until the process hits its limit.
+        close(fds[0]);
+        close(fds[1]);
         _startErrorResponse(client, 500, FRAMING_INTACT);
         return false;
     }
@@ -994,6 +1031,8 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
     if (pid < 0) {
         close(fds[0]);
         close(fds[1]);
+        close(in_fds[0]);
+        close(in_fds[1]);
         _startErrorResponse(client, 500, FRAMING_INTACT);
         return false;
     }
@@ -1002,8 +1041,12 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
         // --- child ---
         // Everything here must end in exec or _exit. Returning would give us a
         // second copy of the server running its own event loop.
-        close(fds[0]);                       // not reading
+        close(fds[0]);                       // not reading our own stdout pipe
+        close(in_fds[1]);                    // not writing our own stdin pipe
         if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(1);
+        if (dup2(in_fds[0], STDIN_FILENO) < 0) _exit(1);
+        close(fds[1]);
+        close(in_fds[0]);
 
         // Close every socket this fork inherited. NOT hygiene — load-bearing.
         //
@@ -1027,10 +1070,12 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
             close(it->first);                        // that client's socket
             if (it->second->cgi_pipe_fd != -1)
                 close(it->second->cgi_pipe_fd);      // another script's pipe
-            // V4: when the stdin pipe lands, close other clients' stdin WRITE
-            // ends here too. Holding one open means that script never sees EOF
-            // on its stdin and blocks forever waiting for a body we finished
-            // sending — the same class of bug as the fds above, one level over.
+            // Other clients' stdin write ends. Holding one open means THAT
+            // script never sees EOF on its stdin and blocks forever waiting for
+            // a body we already finished sending — the same class of bug as the
+            // sockets above, one hop over.
+            if (it->second->cgi_stdin_fd != -1)
+                close(it->second->cgi_stdin_fd);
         }
         if (reserve_fd >= 0) close(reserve_fd);
         close(fds[1]);
@@ -1047,15 +1092,29 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
     }
 
     // --- parent ---
-    close(fds[1]);                           // we only read
+    close(fds[1]);                           // we only read the stdout pipe
+    close(in_fds[0]);                        // we only write the stdin pipe
     _setNonBlocking(fds[0]);
+    _setNonBlocking(in_fds[1]);
 
     client->cgi_pipe_fd      = fds[0];
     client->cgi_pid          = pid;
     client->cgi_start_time   = std::time(NULL);   // starts the CGI clock
     client->cgi_head_buf.clear();
     client->cgi_headers_sent = false;
+    client->cgi_body_sent    = 0;
     cgi_fd_to_client_fd[fds[0]] = client->fd;
+
+    if (client->request.body.empty()) {
+        // No body: close the write end NOW so the child sees EOF immediately.
+        // A GET must not leave a dangling open pipe that its script would sit
+        // waiting on, and no POLLOUT is ever requested for it.
+        close(in_fds[1]);
+        client->cgi_stdin_fd = -1;
+    } else {
+        client->cgi_stdin_fd = in_fds[1];
+        cgi_fd_to_client_fd[in_fds[1]] = client->fd;
+    }
 
     // Start sending now, with nothing to send yet. beginSending() marks the
     // response complete because that is true for every other caller; for a
@@ -1065,6 +1124,14 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
     client->response_complete = false;
     client->state             = Client::WAITING_FOR_CGI;
     return true;
+}
+
+void Server::_closeCgiStdin(Client* client) {
+    if (client->cgi_stdin_fd != -1) {
+        cgi_fd_to_client_fd.erase(client->cgi_stdin_fd);
+        close(client->cgi_stdin_fd);
+        client->cgi_stdin_fd = -1;
+    }
 }
 
 void Server::_closeCgiPipe(Client* client) {
@@ -1152,7 +1219,10 @@ void Server::_killCgi(Client* client) {
 // Full teardown: pipe + child, outcome discarded. For client destruction, where
 // there is nobody left to report to.
 void Server::_closeCgi(Client* client) {
+    // BOTH ends. Missing either leaves a registered fd pointing at a dead child,
+    // which _rebuildPollFds would keep polling forever.
     _closeCgiPipe(client);
+    _closeCgiStdin(client);
     _killCgi(client);
 }
 
@@ -1223,6 +1293,40 @@ void Server::_finalizeCgi(Client* client, bool ok) {
     // MUST BE LAST — _finishResponse() may delete the client. See its header.
     if (client->bytes_sent >= client->output_buf.size())
         _finishResponse(client->fd);
+}
+
+// Feed the script its body. One write per POLLOUT, same discipline as the
+// client socket: poll says ready, we write once, we never loop until EAGAIN.
+void Server::_handleCgiStdinWrite(Client* client) {
+    if (client->cgi_stdin_fd == -1) return;
+
+    const std::string& body = client->request.body;
+    const size_t remaining = body.size() - client->cgi_body_sent;
+    if (remaining == 0) { _closeCgiStdin(client); return; }
+
+    const ssize_t n = write(client->cgi_stdin_fd,
+                            body.data() + client->cgi_body_sent, remaining);
+
+    if (n < 0) {
+        // No errno inspection (subject:19). This is NOT an error to abort on:
+        // a script may legally ignore its body and close stdin early, and with
+        // SIGPIPE ignored (Server.cpp:102) that arrives here as -1 rather than
+        // killing us. Stop writing, keep reading stdout — the child may already
+        // have produced a perfectly good answer without reading a byte.
+        _closeCgiStdin(client);
+        return;
+    }
+
+    client->cgi_body_sent += static_cast<size_t>(n);
+
+    if (client->cgi_body_sent >= body.size()) {
+        // THE EOF. A pipe read returns 0 only once every write end is closed,
+        // so this close is the only thing that tells a script reading to EOF
+        // that the body is over. Forget it and every such script hangs until
+        // the CGI timeout kills it — which presents as "the timeout is buggy"
+        // and is actually "we never let go of the pipe".
+        _closeCgiStdin(client);
+    }
 }
 
 void Server::_handleCgiPipeRead(int cgi_fd) {

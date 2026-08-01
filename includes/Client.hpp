@@ -31,6 +31,12 @@ public:
     int          fd;
     int          listen_fd;       // socket we were accepted on; picks the vhost candidates
     int          cgi_pipe_fd;     // CGI stdout pipe read end; -1 if none
+    // CGI stdin pipe WRITE end; -1 if none or already drained. Closing this is
+    // how the child learns the body is over: a pipe read returns EOF only when
+    // every write end is shut, so holding it open makes a script that reads its
+    // body to EOF hang until our own timeout kills it.
+    int          cgi_stdin_fd;
+    size_t       cgi_body_sent;   // bytes of request.body handed to the child
     pid_t        cgi_pid;         // CGI child pid for waitpid(); -1 if none
     // When the script was forked; 0 = none running. Its own clock, separate
     // from every request/idle timer: a client waiting on a script is neither

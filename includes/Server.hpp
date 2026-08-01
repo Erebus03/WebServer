@@ -137,6 +137,12 @@ private:
     // exit status is the only thing that distinguishes a finished script from a
     // crashed one.
     void _closeCgiPipe(Client* client);
+    // Feeds request.body to the script. Dispatched on POLLOUT for the stdin
+    // write end; closes that end the moment the body drains, because that close
+    // IS the EOF the child is waiting for.
+    void _handleCgiStdinWrite(Client* client);
+    // Closes the stdin write end and purges its map entry. Idempotent.
+    void _closeCgiStdin(Client* client);
     // Non-blocking reap. True means the child was collected and `status` is
     // valid; false means it is still running and cgi_pid is deliberately kept so
     // a later sweep can try again — clearing it here is how zombies are made.

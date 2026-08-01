@@ -8,6 +8,8 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
     : fd(socket_fd),
       listen_fd(accepted_on),
       cgi_pipe_fd(-1),
+      cgi_stdin_fd(-1),
+      cgi_body_sent(0),
       cgi_pid(-1),
       cgi_start_time(0),
       remote_address(remote_addr),
@@ -74,7 +76,9 @@ void Client::resetForNextRequest() {
     response_complete = false;
     cgi_headers_sent = false;
     cgi_chunked = false;
-    // cgi_start_time is cleared by _closeCgi/_killCgi with the pid it belongs to.
+    // cgi_start_time, cgi_pipe_fd and cgi_stdin_fd are cleared by the server
+    // as it closes/reaps them — same ownership split as the comment above.
+    cgi_body_sent = 0;
     cgi_head_buf.clear();
 
     request = HttpRequest();        // drop every header/body of the old request

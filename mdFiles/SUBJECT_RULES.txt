@@ -203,15 +203,17 @@ CLOSED (with the commit that closed it):
   - V6 child inherited every listen and client socket. NOT hygiene: it made
     the V3 timeout unenforceable, because an orphaned grandchild kept the
     client fd open and the server's own close() closed nothing.      485e110
+  - V4 stdin pipe: POST bodies now reach the script, written one POLLOUT at a
+    time and closed on drain (that close IS the child's EOF). Includes the
+    dispatch fix: the reverse map was type-blind, so a POLLOUT on the write
+    end would have been routed to the read path, read() a write-only fd, get
+    -1 and take the script-failed branch — a self-inflicted 502 on every POST
+    wearing the costume of a script bug.                             (this commit)
 
 OPEN (must be fixed before this section can claim CGI compliance):
   - V5 no CONTENT to the script: envp is empty. No REQUEST_METHOD,
     QUERY_STRING, CONTENT_LENGTH, SCRIPT_FILENAME, PATH_INFO, HTTP_*, and no
     REDIRECT_STATUS=200 — php-cgi refuses to run without the last one.
-  - V4 no stdin pipe at all: POST bodies never reach the script. When it
-    lands, the child's fd-closing loop must ALSO close other clients' stdin
-    write ends, or one script holds another's stdin open and that script
-    never sees EOF (marked `// V4:` at the loop).
   - V7 no chdir() into the script's directory, so relative paths break.
   - V8 preflight uses file_exists() only: no stat() regular-file check (a
     directory named *.sh would be exec'd) and no access() permission check,
