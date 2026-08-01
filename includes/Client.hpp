@@ -67,6 +67,29 @@ public:
     // the response is framed, from the request's version and Connection header.
     bool    keep_alive;
 
+    // --- response completion ---
+    // Is every byte of this response now in output_buf? For an ordinary response
+    // that is true the moment it is framed. For a STREAMING CGI it stays false
+    // until the script's pipe hits EOF, because output_buf running empty only
+    // means "the script has not printed the next piece yet".
+    //
+    // The write path must consult this and NOT the buffer level: treating a
+    // drained buffer as a finished response would recycle or close the
+    // connection mid-script, truncating every CGI response at its first pause.
+    bool    response_complete;
+
+    // --- CGI streaming state (all unused when cgi_pipe_fd == -1) ---
+    // Script output that has not yet formed a complete header block. Parsed by
+    // CgiResponse::parseHead() on each read; once that succeeds this is dropped
+    // and everything after body_offset streams straight through. Capped by
+    // MAX_HEADER_BYTES so a script that never emits a blank line cannot grow it
+    // without bound.
+    std::string cgi_head_buf;
+    // Have we written this response's status line and headers into output_buf?
+    // Until then nothing of the body may be emitted — the framing headers must
+    // precede the first chunk.
+    bool        cgi_headers_sent;
+
     // --- config + parsed data ---
     ServerConfig*  server_cfg;  // server block that accepted this client; never owns
 

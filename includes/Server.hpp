@@ -91,7 +91,6 @@ private:
     void _acceptNewClient(int listen_fd);
     void _handleClientRead(int client_fd);
     void _handleClientWrite(int client_fd);
-    void _handleCgiPipeRead(int cgi_fd);
     void _handleError(int fd);
     
     // Read-side request pipeline
@@ -118,6 +117,24 @@ private:
 
     // Frames a status-only response into output_buf and flips to SENDING.
     void _startErrorResponse(Client* client, int status_code, FramingState framing);
+
+    // --- CGI (streaming) ---
+    // Is this request handled by a script? Returns the interpreter to exec when
+    // the matched location declares a cgi_extension for the URI's suffix.
+    // Empty string means "not CGI, hand it to Dispatcher as usual".
+    std::string _cgiInterpreterFor(const HttpRequest& request,
+                                   const LocationConfig& loc) const;
+    // fork()s the script with its stdout on a pipe and parks the client in
+    // WAITING_FOR_CGI. False means the script could not be started and an error
+    // response is already queued.
+    bool _startCgi(Client* client, const std::string& interpreter,
+                   const std::string& script_path);
+    // Drains whatever the script has printed so far. Parses the header block on
+    // the way through, then streams the body out as chunks.
+    void _handleCgiPipeRead(int cgi_fd);
+    // Closes the pipe, reaps the child, and clears the fd bookkeeping. Safe to
+    // call more than once; used by both the EOF path and client teardown.
+    void _closeCgi(Client* client);
 
     // Client lifecycle
     void _removeClient(int client_fd);
