@@ -1164,7 +1164,7 @@ Practice answering these out loud, from memory, then check against the section.
 **Design & honesty** *(the differentiators)*
 23. How would you scale this to 100k connections? *("swap poll for epoll behind the same seam; then sharded event loops per core — the nginx model")*
 24. What would you do differently in modern C++? *(unique_ptr in the client map, std::atomic for the signal flag, string_view in the parser, std::expected instead of throw-a-string)*
-25. What's the weakest part of your current code? *(honest options: CGI is entirely unwritten and POST is a 501 stub; no MIME table, so everything is served as `text/html`; plain bool vs sig_atomic_t; timeout constants not configurable; a failed listen doesn't abort startup)*
+25. What's the weakest part of your current code? *(honest options: CGI runs and streams but scripts get an EMPTY environment — no `REQUEST_METHOD`/`QUERY_STRING`/`CONTENT_LENGTH`, and no `REDIRECT_STATUS`, so php-cgi refuses outright; there is no stdin pipe, so POST bodies never reach a script; no CGI timeout, so `sleep(9999)` is dropped by the idle clock with no 504 and an orphaned child; POST is a 501 stub; plain bool vs sig_atomic_t; timeout constants not configurable; a failed listen doesn't abort startup — see 12.13 and `SUBJECT_RULES.txt` §5 for the full list)*
 
 Question 25 matters most. Interviewers trust people who know their own
 code's limits far more than people who claim it's perfect.
