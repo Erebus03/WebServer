@@ -18,6 +18,7 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
       keep_alive(false),
       response_complete(false),
       cgi_headers_sent(false),
+      cgi_chunked(false),
       server_cfg(NULL)
 {
     // HttpRequest is a plain struct with no constructor, so its scalars are
@@ -71,6 +72,7 @@ void Client::resetForNextRequest() {
     // the finished response.
     response_complete = false;
     cgi_headers_sent = false;
+    cgi_chunked = false;
     cgi_head_buf.clear();
 
     request = HttpRequest();        // drop every header/body of the old request

@@ -5,13 +5,6 @@
 #include "../includes/ResponseBuilder.hpp"
 #include "../includes/CgiResponse.hpp"
 #include <sys/wait.h>
-
-// How far the client may fall behind before we stop reading the CGI pipe. Not a
-// cap on response size — it is the depth of the in-flight window, so a 1 GB
-// script output still only ever occupies this much of our memory at a time.
-// Defined up here because _rebuildPollFds() needs it and sits above the other
-// tuning constants.
-static const size_t CGI_BACKLOG_HIGH = 256 * 1024;
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -26,6 +19,13 @@ static const size_t CGI_BACKLOG_HIGH = 256 * 1024;
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+// How far the client may fall behind before we stop reading the CGI pipe. Not a
+// cap on response size — it is the depth of the in-flight window, so a 1 GB
+// script output still only ever occupies this much of our memory at a time.
+// Lives here rather than with the other tuning constants because
+// _rebuildPollFds() needs it and sits above them.
+static const size_t CGI_BACKLOG_HIGH = 256 * 1024;
 
 
 // ── Allowed-function-safe IPv4 helpers ───────────────────────────────────────
@@ -902,24 +902,47 @@ void Server::_handleClientWrite(int client_fd) {
             return;
         }
 
-        if (client->keep_alive) {
-            // Recycle instead of destroy. state goes back to READING, which is
-            // what makes _rebuildPollFds ask for POLLIN again — the event mask
-            // follows the state machine, so a connection can cycle
-            // READING -> SENDING -> READING indefinitely.
-            std::cout << "Response sent to client " << client_fd << ", keeping connection alive" << std::endl;
-            client->resetForNextRequest();
-            // A pipelined next request may already be sitting in input_buf —
-            // its bytes arrived while we were SENDING, so its POLLIN is long
-            // gone and recv() will never be our trigger. Parse it now.
-            if (!client->input_buf.empty()) {
-                client->request_start = std::time(NULL); // deadline clock restarts
-                _advanceRequest(client);
-            }
-        } else {
-            std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
-            _removeClient(client_fd);
+        _finishResponse(client_fd);
+    }
+}
+
+// Recycle or close, once the response is both complete and fully drained.
+//
+// Extracted because _handleClientWrite is NOT the only way to arrive here. It
+// runs on POLLOUT, and POLLOUT is only requested while unsent bytes remain — so
+// a response that completes with its buffer ALREADY empty never gets another
+// write event, and without this call from the CGI EOF path the connection would
+// sit open until a timer reaped it. A close-delimited CGI response hits that
+// exact case: it has no terminating chunk to queue, so the last byte is often
+// long gone by the time the script exits.
+void Server::_finishResponse(int client_fd) {
+    std::map<int, Client*>::iterator it = clients.find(client_fd);
+    if (it == clients.end()) return;
+    Client* client = it->second;
+
+    if (client->keep_alive) {
+        // Recycle instead of destroy. state goes back to READING, which is
+        // what makes _rebuildPollFds ask for POLLIN again — the event mask
+        // follows the state machine, so a connection can cycle
+        // READING -> SENDING -> READING indefinitely.
+        std::cout << "Response sent to client " << client_fd << ", keeping connection alive" << std::endl;
+        client->resetForNextRequest();
+        // A pipelined next request may already be sitting in input_buf —
+        // its bytes arrived while we were SENDING, so its POLLIN is long
+        // gone and recv() will never be our trigger. Parse it now.
+        //
+        // Only reachable on a keep-alive connection, which is what keeps the
+        // close-delimited case correct: such a response forces keep_alive off
+        // when its headers are framed, so we take the branch below and the
+        // leftover bytes die with the connection — as they must, since the peer
+        // was told the connection ends here.
+        if (!client->input_buf.empty()) {
+            client->request_start = std::time(NULL); // deadline clock restarts
+            _advanceRequest(client);
         }
+    } else {
+        std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
+        _removeClient(client_fd);
     }
 }
 // ---------------------------------------------------------------------------
@@ -1044,6 +1067,24 @@ static void appendRaw(std::vector<char>& out, const std::string& s) {
     out.insert(out.end(), s.begin(), s.end());
 }
 
+// Queues body bytes in whichever framing this response settled on. Every body
+// write goes through here so the chunked/close choice cannot be applied in one
+// place and forgotten in another.
+static void appendBody(Client* client, const char* data, size_t n) {
+    if (n == 0) return;
+    if (client->cgi_chunked)
+        appendChunk(client->output_buf, data, n);
+    else
+        client->output_buf.insert(client->output_buf.end(), data, data + n);
+}
+
+// The chunked terminator, and nothing at all for a close-delimited body — there
+// the close itself is the terminator.
+static void appendBodyEnd(Client* client) {
+    if (client->cgi_chunked)
+        appendRaw(client->output_buf, "0\r\n\r\n");
+}
+
 void Server::_handleCgiPipeRead(int cgi_fd) {
     std::map<int, int>::iterator link = cgi_fd_to_client_fd.find(cgi_fd);
     if (link == cgi_fd_to_client_fd.end()) return;
@@ -1061,7 +1102,7 @@ void Server::_handleCgiPipeRead(int cgi_fd) {
         if (!client->cgi_headers_sent) {
             _startErrorResponse(client, 502, FRAMING_INTACT);
         } else {
-            appendRaw(client->output_buf, "0\r\n\r\n");
+            appendBodyEnd(client);
             client->response_complete = true;
             client->state = Client::SENDING;
         }
@@ -1102,21 +1143,43 @@ void Server::_handleCgiPipeRead(int cgi_fd) {
                     continue;
                 out << it->first << ": " << it->second << "\r\n";
             }
-            out << "Transfer-Encoding: chunked\r\n"
-                << "Connection: " << (client->keep_alive ? "keep-alive" : "close") << "\r\n"
+            // FRAMING. Chunked is an HTTP/1.1 feature: 1.0 defines no
+            // Transfer-Encoding, so a 1.0 client would take the hex sizes for
+            // body text. Those responses are delimited by the close instead.
+            //
+            // And a close-delimited body FORCES keep_alive off, overriding what
+            // the request asked for. That override matters here specifically:
+            // requestWantsKeepAlive() honours an HTTP/1.0 request that sent an
+            // explicit `Connection: keep-alive`, so without this a 1.0 client
+            // opting into reuse would get a body whose only terminator is the
+            // close we then refuse to perform — an unterminated response on a
+            // recycled connection. Framing beats preference; the peer cannot
+            // consent to a body it has no way to find the end of.
+            //
+            // This is the one place the decision is made. keep_alive was set at
+            // the top of _processRequest from the request alone; this is the
+            // response half of the same rule, applied before a single body byte
+            // is queued.
+            client->cgi_chunked = (client->request.version == "HTTP/1.1");
+            if (!client->cgi_chunked)
+                client->keep_alive = false;
+
+            if (client->cgi_chunked)
+                out << "Transfer-Encoding: chunked\r\n";
+            out << "Connection: " << (client->keep_alive ? "keep-alive" : "close") << "\r\n"
                 << "\r\n";
             appendRaw(client->output_buf, out.str());
             client->cgi_headers_sent = true;
 
             // Whatever followed the blank line in this same read is already body.
             if (head.body_offset < client->cgi_head_buf.size()) {
-                appendChunk(client->output_buf,
-                            client->cgi_head_buf.data() + head.body_offset,
-                            client->cgi_head_buf.size() - head.body_offset);
+                appendBody(client,
+                           client->cgi_head_buf.data() + head.body_offset,
+                           client->cgi_head_buf.size() - head.body_offset);
             }
             std::string().swap(client->cgi_head_buf);   // release it for good
         } else {
-            appendChunk(client->output_buf, buffer, static_cast<size_t>(n));
+            appendBody(client, buffer, static_cast<size_t>(n));
         }
         return;
     }
@@ -1132,9 +1195,18 @@ void Server::_handleCgiPipeRead(int cgi_fd) {
         _startErrorResponse(client, 502, FRAMING_INTACT);
         return;
     }
-    appendRaw(client->output_buf, "0\r\n\r\n");   // terminating chunk
+    appendBodyEnd(client);
     client->response_complete = true;
     client->state = Client::SENDING;
+
+    // If the buffer is already drained there will be no further POLLOUT to
+    // finish on — _rebuildPollFds only asks for it while unsent bytes remain.
+    // A close-delimited response reaches this state routinely, because it
+    // queues no terminating chunk. Without this the connection would stay open
+    // until a timer reaped it, and the peer, whose only end-of-body signal IS
+    // the close, would wait exactly that long.
+    if (client->bytes_sent >= client->output_buf.size())
+        _finishResponse(client->fd);
 }
 
 void Server::_handleError(int fd) {

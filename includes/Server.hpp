@@ -136,6 +136,11 @@ private:
     // call more than once; used by both the EOF path and client teardown.
     void _closeCgi(Client* client);
 
+    // Recycle or close once the response is complete AND drained. Called from
+    // the write path and from the CGI EOF path, which can complete a response
+    // whose buffer is already empty and would otherwise never see POLLOUT again.
+    void _finishResponse(int client_fd);
+
     // Client lifecycle
     void _removeClient(int client_fd);
     void _checkTimeouts();

@@ -89,6 +89,15 @@ public:
     // Until then nothing of the body may be emitted — the framing headers must
     // precede the first chunk.
     bool        cgi_headers_sent;
+    // Is this CGI body framed with chunked encoding, or by closing?
+    //
+    // Chunked is HTTP/1.1 ONLY — 1.0 has no Transfer-Encoding, so a 1.0 client
+    // would render the hex sizes as body text. For those the body is delimited
+    // by the close instead, which forces keep_alive off no matter what the
+    // request asked for: the close IS the terminator, so reusing the connection
+    // would leave the body unterminated. Decided once, when the headers are
+    // framed, and read by both the body-append and EOF paths.
+    bool        cgi_chunked;
 
     // --- config + parsed data ---
     ServerConfig*  server_cfg;  // server block that accepted this client; never owns
