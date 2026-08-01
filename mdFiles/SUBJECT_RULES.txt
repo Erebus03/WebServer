@@ -211,13 +211,19 @@ CLOSED (with the commit that closed it):
     wearing the costume of a script bug.                             16b1b9d
   - V5 CGI/1.1 environment: the full table plus HTTP_* transform, and the
     URI now splits at the first segment carrying a configured extension so
-    PATH_INFO exists at all.                                         (this commit)
+    PATH_INFO exists at all.                                         2c1ef3c
 
-OPEN (must be fixed before this section can claim CGI compliance):
-  - V7 no chdir() into the script's directory, so relative paths break.
-  - V8 preflight uses file_exists() only: no stat() regular-file check (a
-    directory named *.sh would be exec'd) and no access() permission check,
-    so a non-executable script yields 502 instead of 403.
+  - V7 chdir() into the script's own directory, in the child, derived from
+    the same absolute path execve runs.                              (this commit)
+  - V8 preflight: stat() for existence and regular-file, access(R_OK) for
+    readability, all before a single pipe is created.                (this commit)
+
+OPEN:
+  - (none for CGI) — but NOT yet field-proven against php-cgi, which is not
+    installed on this machine. REDIRECT_STATUS=200 and the absolute
+    SCRIPT_FILENAME are set for it and unverified against the real binary;
+    python3 and /bin/sh both work. Verify on a machine that has php-cgi
+    before claiming interpreter-agnostic CGI.
 
 ===============================================================================
  Source of truth: the official 42 "Webserv" subject PDF. If the evaluation

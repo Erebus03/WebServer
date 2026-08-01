@@ -5,6 +5,7 @@
 #include "../includes/ResponseBuilder.hpp"
 #include "../includes/CgiResponse.hpp"
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -699,8 +700,29 @@ void Server::_processRequest(Client* client) {
                     _startErrorResponse(client, 403, FRAMING_INTACT);
                     return;
                 }
-                if (!FileUtils::file_exists(script_path)) {
+                // V8 preflight. Runs here, before _startCgi creates a single
+                // pipe, so a rejected request costs no fds and no fork.
+                struct stat st;
+                if (stat(script_path.c_str(), &st) != 0) {
                     _startErrorResponse(client, 404, FRAMING_INTACT);
+                    return;
+                }
+                if (!S_ISREG(st.st_mode)) {
+                    // Closes the directory-named-`.sh` hole: without this a
+                    // directory matching a cgi_extension would be handed to
+                    // execve, which fails in the child and surfaces as a
+                    // baffling 502 instead of an honest 403.
+                    _startErrorResponse(client, 403, FRAMING_INTACT);
+                    return;
+                }
+                // R_OK, not X_OK: an interpreter is always named by
+                // cgi_extension and IT opens the file, so the script needs to
+                // be readable, not executable. Demanding X_OK here would 403
+                // every .py sitting at the usual mode 644 while being perfectly
+                // runnable. (A direct-exec configuration, where the handler IS
+                // the script, would need X_OK — we have no such config form.)
+                if (access(script_path.c_str(), R_OK) != 0) {
+                    _startErrorResponse(client, 403, FRAMING_INTACT);
                     return;
                 }
                 // _startCgi queues its own error response on failure.
@@ -1196,6 +1218,19 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
         }
         if (reserve_fd >= 0) close(reserve_fd);
         close(fds[1]);
+
+        // V7: run the script from its own directory, so relative paths inside
+        // it resolve the way its author meant. Derived from script_path, the
+        // SAME absolute path execve is about to run, so the two cannot
+        // disagree. On failure _exit(1): the parent sees the pipe close with no
+        // header block and answers 502, which is the existing path for a child
+        // that dies before producing output.
+        {
+            const size_t slash = script_path.find_last_of('/');
+            if (slash != std::string::npos && slash > 0) {
+                if (chdir(script_path.substr(0, slash).c_str()) != 0) _exit(1);
+            }
+        }
 
         char* argv[3];
         argv[0] = const_cast<char*>(interpreter.c_str());
