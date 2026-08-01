@@ -1724,7 +1724,110 @@ is dropped by the 60s *idle* clock with no 504 and an orphaned child; the child
 inherits the server's sockets; and there is no `chdir()` into the script's
 directory. `SUBJECT_RULES.txt` §5 carries the full list.
 
-### 12.14 Still open elsewhere
+### 12.14 CGI part two: stdin, environment, and four things worth being asked
+
+#### The close IS the EOF
+
+`_handleCgiStdinWrite` writes one chunk of `request.body` per `POLLOUT`, then —
+the moment `cgi_body_sent` reaches `body.size()` — **closes the write end**.
+
+That close is the entire mechanism. A pipe read returns EOF only once *every*
+write end is shut, so while we hold ours open, a script doing `cat` sits waiting
+for a body that is already fully delivered. It would hang until our own 30 s CGI
+timeout killed it — and would present as *"the timeout is buggy"* when the truth
+is *"we never let go of the pipe"*. A bodiless request closes the write end
+immediately at fork for the same reason, and then never asks for `POLLOUT` on it.
+
+The sentence to have ready: **"a pipe read end returns EOF only when every write
+end is closed — the parent still holding the write end is the parent keeping its
+own EOF hostage."**
+
+Proof it is a real loop and not one lucky `write()`: an 8 MB body echoes
+byte-identical in 0.11 s. The pipe buffer is 64 KB, so that is ~128 write cycles
+driven entirely by `POLLOUT`.
+
+A `write()` returning `< 0` is **not** an abort. A script may legally ignore its
+body and close stdin early; with `SIGPIPE` ignored (`Server.cpp:102`) that
+arrives as `-1` rather than a signal. We stop writing and keep reading stdout —
+the child may already have produced a perfectly good answer.
+
+#### Why `X_Evil:` never becomes an environment variable
+
+The `HTTP_*` transform is: uppercase, `-` → `_`, prefix `HTTP_`. Which means
+`X-Evil` and `X_Evil` both transform to `HTTP_X_EVIL`. A client that sends the
+underscore form could therefore **shadow or spoof** the header a script trusts.
+
+So any header whose name contains `_` is dropped. nginx does this by default for
+exactly this reason. Small decision, real security rationale, and an evaluator
+who asks "what stops header smuggling here?" gets a specific answer.
+
+Three other exclusions, each for its own reason:
+
+- `Content-Type` / `Content-Length` — already dedicated variables; duplicating
+  them as `HTTP_*` is spec-noncompliant.
+- **`Transfer-Encoding`** — the load-bearing one. We un-chunk the body *before*
+  piping it, so forwarding `HTTP_TRANSFER_ENCODING=chunked` would tell a script
+  its stdin is chunked when it no longer is. A conforming script would try to
+  de-chunk already-decoded bytes and corrupt its own input. **The header
+  described the wire; the wire the script sees is our pipe.**
+- `Connection`, `Keep-Alive`, `TE`, `Upgrade` — hop-by-hop, describing a
+  connection the script is not on.
+
+#### `PATH_INFO` required fixing what counts as a CGI request
+
+`/cgi-bin/x.py/extra/path` is one URL carrying two things: a script and an
+argument. The original check took the URI's **last dot** — which in that string
+sits *before* the final slash, so the request did not register as CGI **at all**.
+Not "PATH_INFO was empty": the script never ran.
+
+The URI is now walked segment by segment and split at the first segment carrying
+a configured extension. Everything up to it is `SCRIPT_NAME`, the remainder is
+`PATH_INFO`. And only the script part is resolved on disk — resolving the whole
+URI would look for a file literally at `/cgi-bin/x.py/extra/path` and 404 every
+request that carries extra path.
+
+Measured: `/cgi-bin/env.sh/a/b?q=1` → `SCRIPT_NAME=/cgi-bin/env.sh`,
+`PATH_INFO=/a/b`, `QUERY_STRING=q=1`.
+
+#### The bug only an env dump could find
+
+`REMOTE_ADDR` was being set from `client->remote_address`, which is stored as
+`"ip:port"` for logging. So every script received `REMOTE_ADDR=127.0.0.1:38806`.
+
+Nothing crashes. Nothing 500s. A script comparing `REMOTE_ADDR` against an
+allow-list, or handing it to a resolver, simply fails — quietly, on every single
+request, forever. Split; the port moved to its own `REMOTE_PORT`.
+
+The lesson generalises: **a value being produced and a value being *correct* are
+separate claims**, and only dumping the actual output tests the second one. Same
+shape as 12.12, where a config value was parsed perfectly and then never read.
+
+#### The fd-reuse race is unreachable by construction
+
+Fair question: a client dies mid-iteration, its pipe fds are closed, and the same
+`poll()` pass still holds pending events for them. Could a stale entry touch a
+*different* client that recycled the fd number?
+
+No, for two reasons that compose:
+
+1. **The purged map entry.** `_removeClient` → `_closeCgi` erases both pipe fds
+   from `cgi_fd_to_client_fd` *before* the `delete`. A stale event then misses
+   that map, falls through to the client branch, and misses `clients` too (a pipe
+   fd number is not a client fd) → returns. Stale pipe events are no-ops.
+2. **Array order.** `_rebuildPollFds` appends listening sockets **first**
+   (`:247`), then clients (`:256`), then pipes (`:282`). Every `accept()` for a
+   pass therefore happens *before* any client or pipe event is handled, so an fd
+   number freed mid-pass cannot be handed out again until the next iteration — by
+   which time the rebuild has erased the stale entry entirely.
+
+Verified empirically too: 60 rounds of RST-mid-body with jittered timing left the
+server alive at 5 fds, 0 zombies, 0 children.
+
+That is the third *"unreachable by construction"* argument in this file, and
+they are worth more than the tests that accompany them — a test says "it did not
+happen this time," a construction argument says "it cannot."
+
+### 12.15 Still open elsewhere
 - **`PostHandler` is a stub** — returns 501 and `(void)`s both parameters, so
   uploads do not work. It is the last handler with no real body.
 - **`MimeTypes` exists but is wired to nothing** (updated 2026-08-01). B merged
