@@ -1,6 +1,6 @@
 ===============================================================================
  WEBSERV — SUBJECT RULES & ALLOWED FUNCTIONS  (quick reference)
- Last updated: 2026-07-24
+ Last updated: 2026-08-01
  Purpose: single source of truth for what we may/may not use, and the hard
           architectural rules the evaluator checks. Keep this current.
 ===============================================================================
@@ -58,6 +58,17 @@ NOTE on fcntl: in this project it may be used in EXACTLY one way:
         fcntl(fd, F_SETFL, O_NONBLOCK);
     Any other flag / any other use of fcntl is forbidden.
 
+    KNOWN DISCREPANCY (recorded 2026-08-01, not resolved): the subject PDF
+    lists the allowed flags as "F_SETFL, O_NONBLOCK and FD_CLOEXEC", which
+    would permit close-on-exec. That listing is self-inconsistent — FD_CLOEXEC
+    is set with F_SETFD, not F_SETFL — so an evaluator could reasonably read it
+    either way, and we do not rely on the permissive reading.
+
+    Consequence for CGI: the fd-inheritance problem (a forked child inheriting
+    every listen and client socket) is solved by having the CHILD close them
+    explicitly after fork, which needs no ruling from anyone. Do not introduce
+    FD_CLOEXEC to shortcut this without settling the question first.
+
 Standard C++98 library (iostream, string, vector, map, sstream, fstream,
 algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
 "external library".
@@ -110,10 +121,24 @@ algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
 301 Moved Permanently, 302 Found,
 400 Bad Request, 403 Forbidden, 404 Not Found, 405 Method Not Allowed,
 408 Request Timeout, 413 Content Too Large / Payload Too Large,
-500 Internal Server Error, 501 Not Implemented.
+431 Request Header Fields Too Large,
+500 Internal Server Error, 501 Not Implemented,
+502 Bad Gateway, 504 Gateway Timeout, 505 HTTP Version Not Supported.
+
+  502 — the CGI script produced nothing usable: it exited without emitting a
+        header block, or its pipe failed. Emitted by _handleCgiPipeRead().
+  504 — NOT YET IMPLEMENTED (see section 5). Intended answer when a CGI script
+        exceeds its timeout and is killed. This is what an evaluator tests with
+        a script containing sleep(9999): 504 and a server still serving, NOT a
+        hang. Today such a script is dropped by the 60s IDLE timer with no
+        response and its child is orphaned — wrong timer, wrong answer.
+  505 — request line named a version we do not speak. The parser seeds
+        request.status with it; _advanceRequest forwards that code rather
+        than a blanket 400.
+  431 — header section exceeded MAX_HEADER_BYTES before a blank line.
 
 -------------------------------------------------------------------------------
- 5. CURRENT-CODE COMPLIANCE (audit 2026-07-24, branch Anouar)
+ 5. CURRENT-CODE COMPLIANCE (audit 2026-08-01, branch Anouar)
 -------------------------------------------------------------------------------
 RESOLVED (fixed 2026-07-24):
   - inet_pton  -> replaced by static parseIPv4() (dotted-quad -> host order,
@@ -136,6 +161,39 @@ COMPLIANT (good):
   - setsockopt SO_REUSEADDR                 (Server.cpp:111)
   - partial writes tracked via bytes_sent  (Server.cpp:308-323)
   - signal / waitpid available for shutdown + CGI reaping
+
+CGI AUDIT (added 2026-08-01, after dd0b519 + cb302fd)
+COMPLIANT:
+  - one poll() covers listen + client + CGI pipe fds; pipe registered in
+    _rebuildPollFds(), dispatched in _handlePollEvents()
+  - parent's pipe read end non-blocking via the exact allowed fcntl form
+  - no errno inspected after the pipe read; >0 / 0 / <0 only
+  - child ends in execve or _exit(1) — never exit(), never a return
+  - waitpid(WNOHANG) only; no blocking wait anywhere in the loop
+  - parent closes its copy of the child's write end immediately after fork,
+    so EOF on the read end is reachable at all
+  - POLLHUP is not treated as terminal: the read runs first and only a
+    return of 0 ends the response (avoids truncating fast scripts)
+  - fork() appears exactly once in the codebase, in _startCgi()
+  - interpreter comes from LocationConfig::cgi_ext; nothing hardcoded
+  - framing chosen by request version: 1.1 -> chunked (self-delimiting, may
+    keep-alive), 1.0 -> close-delimited and keep_alive forced false
+
+OPEN (must be fixed before this section can claim CGI compliance):
+  - no CONTENT to the script: envp is empty. No REQUEST_METHOD, QUERY_STRING,
+    CONTENT_LENGTH, SCRIPT_FILENAME, PATH_INFO, HTTP_*, and no
+    REDIRECT_STATUS=200 — php-cgi refuses to run without the last one.
+  - no stdin pipe at all: POST bodies never reach the script.
+  - no CGI timeout / 504 (see section 4). A client in WAITING_FOR_CGI is
+    currently judged by the 60s idle clock, which section 9 of the CGI brief
+    calls out as the wrong timer.
+  - _closeCgi() clears cgi_pid even when waitpid(WNOHANG) reported the child
+    still running, so that pid is never reaped -> zombie under a race.
+  - client death mid-script closes the pipe but never kill()s the child.
+  - the child inherits every listen and client socket and does not close them.
+  - no chdir() into the script's directory, so relative paths break.
+  - preflight uses file_exists() only: no stat() regular-file check and no
+    access() permission check, so a non-executable script yields 502 not 403.
 
 ===============================================================================
  Source of truth: the official 42 "Webserv" subject PDF. If the evaluation

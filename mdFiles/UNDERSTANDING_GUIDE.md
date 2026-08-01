@@ -1594,11 +1594,72 @@ parser, where the parser was correct. The general lesson: a value being *parsed
 correctly* and a value being *used* are separate claims, and testing only the
 first proves nothing about the second.
 
-### 12.13 Still open elsewhere
+### 12.13 CGI: streaming, chunked, and the HTTP/1.0 collision — 2026-08-01
 
-- **`src/CgiHandler.cpp` is a 0-byte file.** CGI is a subject requirement and
-  is entirely unwritten; `_handleCgiPipeRead()` is an empty stub and the CGI
-  pipe fds are never added to the poll set (`Server.cpp`, two `TODO`s).
+CGI exists as of `dd0b519`, and `cb302fd` fixed how it frames responses. The
+shape: a matched location declaring `cgi_extension` forks the interpreter with
+its stdout on a pipe, and that pipe joins the **same** `poll()` loop as every
+socket. Nothing blocks and nothing waits.
+
+**Streaming, not buffering.** Only the header block is accumulated — it must be
+complete before anything can be framed, and B's `CgiResponse::parseHead()`
+reports when it is. Every body byte after that is queued the moment it is read.
+Proven with a script printing one line every 2s: the first line reaches the
+client at **t=0.00s**, not at t=4.00s when the script exits. Backpressure drops
+the pipe out of the poll set while the client is >256 KB behind, so a fast
+script and a slow peer cannot quietly turn this back into buffering.
+
+**Why chunked.** The body length is unknowable until the script exits, and
+waiting for it is the buffering being avoided. Chunked carries a size per piece,
+so the connection survives the response instead of being closed to mark its end.
+Verified: two CGI responses over one connection.
+
+#### The collision worth being able to explain
+
+Chunked is **HTTP/1.1 only** — 1.0 has no `Transfer-Encoding`. The first version
+emitted it unconditionally, so a 1.0 client received hex chunk sizes and
+rendered them as body text. So 1.0 falls back to a close-delimited body.
+
+That fallback then collides with keep-alive, which this server genuinely
+supports — including the case in §5.5 where an HTTP/1.0 request carrying an
+explicit `Connection: keep-alive` is honoured. Such a client asks for reuse, and
+a close-delimited body's only terminator **is** the close. Honouring the request
+would mean promising to reuse a connection while the response can only end by
+ending it.
+
+**The rule: framing beats preference.** A peer cannot consent to a body it has
+no way to find the end of, so a close-delimited response forces `keep_alive`
+false regardless of what was asked. Chunked responses are *not* blanket-closed —
+being self-delimiting is the entire reason chunked was chosen.
+
+Both halves live in one place, where the CGI headers are framed. `keep_alive`
+is still computed from the request at the top of `_processRequest`; that is the
+request half, and this is the response half of the same rule.
+
+#### The third bug, which the fix uncovered
+
+Recycle-or-close lived inside `_handleClientWrite`, which runs on `POLLOUT` —
+and `POLLOUT` is only requested while unsent bytes remain. A close-delimited
+response queues **no terminating chunk**, so at pipe EOF its buffer is typically
+already drained: no further write event ever arrived, the connection sat open
+until a timer reaped it, and the peer waited for the close that was its
+end-of-body marker. Measured 8.01s before, 0.00s after. Now `_finishResponse()`,
+called from both the write path and the CGI EOF path.
+
+Pipelining stays correct without a special case: leftover `input_buf` bytes are
+re-parsed only on the keep-alive branch, which a close-delimited response has
+already forced false — so a 1.0 client pipelining behind one loses its second
+request, as it must, having been told the connection ends.
+
+**Still missing** (recorded honestly rather than implied complete): the child's
+environment is empty, so no `REQUEST_METHOD`/`QUERY_STRING`/`CONTENT_LENGTH` and
+no `REDIRECT_STATUS` (php-cgi will not run without it); there is no stdin pipe,
+so POST bodies never reach a script; there is no CGI timeout, so `sleep(9999)`
+is dropped by the 60s *idle* clock with no 504 and an orphaned child; the child
+inherits the server's sockets; and there is no `chdir()` into the script's
+directory. `SUBJECT_RULES.txt` §5 carries the full list.
+
+### 12.14 Still open elsewhere
 - **`PostHandler` is a stub** — returns 501 and `(void)`s both parameters, so
   uploads do not work. It is the last handler with no real body.
 - **No MIME table.** `Content-Type` is hardcoded to `text/html` in five places
