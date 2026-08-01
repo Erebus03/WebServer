@@ -1041,7 +1041,16 @@ void Server::_closeCgi(Client* client) {
         close(client->cgi_pipe_fd);
         client->cgi_pipe_fd = -1;
     }
-    if (client->cgi_pid != -1) {
+    if (client->cgi_pid > 0) {
+        // Guarded with > 0, not != -1, and this is not pedantry: every pid-taking
+        // call here is one typo away from catastrophe. kill(-1, SIGKILL) signals
+        // EVERY process the user may signal — it would kill this server, and the
+        // shell that launched it. waitpid(-1) reaps an arbitrary child. A sentinel
+        // of -1 is exactly the value that turns both into wildcards, so no pid
+        // from a Client may ever reach them unchecked. Any kill() added later
+        // (killing a hung script on timeout, or on client death) MUST sit inside
+        // a guard of this shape.
+        //
         // WNOHANG: the child has normally already exited (its pipe hit EOF), and
         // blocking here would hand a hung script the ability to stop the entire
         // event loop — the one thing the subject forbids outright.
@@ -1205,8 +1214,14 @@ void Server::_handleCgiPipeRead(int cgi_fd) {
     // queues no terminating chunk. Without this the connection would stay open
     // until a timer reaped it, and the peer, whose only end-of-body signal IS
     // the close, would wait exactly that long.
+    //
+    // MUST BE THE LAST STATEMENT. _finishResponse() may delete this Client via
+    // _removeClient(), so `client` is a dangling pointer once it returns. The
+    // fd is read into the argument before the call, which is why passing
+    // client->fd is safe; nothing may be added below this line.
     if (client->bytes_sent >= client->output_buf.size())
         _finishResponse(client->fd);
+    return;
 }
 
 void Server::_handleError(int fd) {

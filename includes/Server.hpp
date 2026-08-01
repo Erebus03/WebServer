@@ -139,6 +139,15 @@ private:
     // Recycle or close once the response is complete AND drained. Called from
     // the write path and from the CGI EOF path, which can complete a response
     // whose buffer is already empty and would otherwise never see POLLOUT again.
+    //
+    // PRECONDITION: client->response_complete is true AND bytes_sent >=
+    // output_buf.size(). Calling it on a drained-but-unfinished response cuts a
+    // streaming CGI off mid-script — "drained" and "finished" are different
+    // facts and only response_complete carries the second one.
+    //
+    // POSTCONDITION: MAY DELETE THE CLIENT (the close branch calls
+    // _removeClient). Every caller must treat its Client* as dangling on
+    // return, and must not touch it or the fd afterwards.
     void _finishResponse(int client_fd);
 
     // Client lifecycle
