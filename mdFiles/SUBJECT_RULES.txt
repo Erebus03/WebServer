@@ -218,12 +218,14 @@ CLOSED (with the commit that closed it):
   - V8 preflight: stat() for existence and regular-file, access(R_OK) for
     readability, all before a single pipe is created.                (this commit)
 
+  - php-cgi field-proof: REDIRECT_STATUS=200 and the absolute SCRIPT_FILENAME
+    verified against the real binary (PHP 8.1.2, cgi-fcgi). Hello-world 200,
+    $_GET parsed from QUERY_STRING, $_POST parsed from the V4 stdin pipe
+    (21-byte and 100 KB bodies), a script-set `Status: 404` becoming the HTTP
+    status, PATH_INFO tolerated, keep-alive reused, 0 zombies.  (this commit)
+
 OPEN:
-  - (none for CGI) — but NOT yet field-proven against php-cgi, which is not
-    installed on this machine. REDIRECT_STATUS=200 and the absolute
-    SCRIPT_FILENAME are set for it and unverified against the real binary;
-    python3 and /bin/sh both work. Verify on a machine that has php-cgi
-    before claiming interpreter-agnostic CGI.
+  - (none for CGI)
 
 ===============================================================================
  Source of truth: the official 42 "Webserv" subject PDF. If the evaluation
