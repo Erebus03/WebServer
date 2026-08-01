@@ -11,5 +11,5 @@ mdFiles/UNDERSTANDING_GUIDE.md
 .idea/
 Makefile
 tests/
-
+claude_chat
 .mcp.json
