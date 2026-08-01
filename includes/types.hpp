@@ -60,4 +60,12 @@ struct HttpResponse {
     std::string                        body;
 };
 
+// one piece of a multipart/form-data body (a form field or an uploaded file).
+struct MultipartPart {
+    std::string name;          // the form field name
+    std::string filename;      // upload's filename (RAW, unsanitized); empty if a plain field
+    std::string content_type;  // the part's own Content-Type, empty if none
+    std::string data;          // the part's raw bytes
+};
+
 #endif
