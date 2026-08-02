@@ -23,6 +23,7 @@ SRCS = \
 	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
+	src/UrlCodec.cpp \
 	tests/test_router.cpp \
 	tests/test_FileUtils.cpp \
 	tests/test_GetHandler.cpp \
@@ -31,6 +32,7 @@ SRCS = \
 	tests/test_HttpStatus.cpp \
 	tests/test_DeleteHandler.cpp \
 	tests/test_http_parser.cpp \
+	tests/test_PostHandler.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
@@ -54,6 +56,7 @@ INCLUDES = \
 	includes/CgiHandler.hpp \
 	includes/DirectoryLister.hpp \
 	includes/FileUtils.hpp \
+	includes/UrlCodec.hpp \
 
 all: $(NAME)
 
