@@ -9,7 +9,6 @@
 #include <vector>
 #include <sstream>
 
-
 HttpResponse Dispatcher::produce_response(const HttpRequest& request, const ServerConfig& server)
 {
     const LocationConfig* location = Router::match(request.uri, server);
@@ -55,9 +54,9 @@ HttpResponse Dispatcher::produce_response(const HttpRequest& request, const Serv
     }
     if (request.method == "GET")
         return GetHandler::handle(request, *location);
-    else if (request.method == "DELETE")
+    if (request.method == "DELETE")
         return DeleteHandler::handle(request, *location);
-    else if (request.method == "POST")
+    if (request.method == "POST")
         return PostHandler::handle(request, *location);
 
     return HttpStatus::make_response(501);
@@ -71,7 +70,7 @@ void Dispatcher::attach_error_body(HttpResponse& response, const ServerConfig& s
     if (!response.body.empty())
         return;
 
-    std::map<int, std::string>::const_iterator pages = server.error_pages.find(response.status_code);
+    const std::map<int, std::string>::const_iterator pages = server.error_pages.find(response.status_code);
     if (pages != server.error_pages.end())
     {
 
