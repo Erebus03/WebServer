@@ -31,12 +31,38 @@ public:
     int          fd;
     int          listen_fd;       // socket we were accepted on; picks the vhost candidates
     int          cgi_pipe_fd;     // CGI stdout pipe read end; -1 if none
+    // CGI stdin pipe WRITE end; -1 if none or already drained. Closing this is
+    // how the child learns the body is over: a pipe read returns EOF only when
+    // every write end is shut, so holding it open makes a script that reads its
+    // body to EOF hang until our own timeout kills it.
+    int          cgi_stdin_fd;
+    size_t       cgi_body_sent;   // bytes of request.body handed to the child
     pid_t        cgi_pid;         // CGI child pid for waitpid(); -1 if none
+    // When the script was forked; 0 = none running. Its own clock, separate
+    // from every request/idle timer: a client waiting on a script is neither
+    // idle nor late, but it must still be bounded or a script that never exits
+    // holds the connection forever.
+    time_t       cgi_start_time;
     std::string  remote_address;
     State        state;
 
-    // I/O buffers
-    std::vector<char>  input_buf;
+    // I/O buffers. The types differ on purpose — do not "unify" them.
+    //
+    // input_buf is std::string because HttpParser::parse() takes a
+    // `const std::string&`. As std::vector<char> it had to be copied whole into
+    // a temporary string on EVERY recv, which made reading a body quadratic:
+    // measured 4.0x cost per doubling of body size, with the copy accounting for
+    // 99% of it (2 MB body: 0.405s copying vs 0.0031s parsing). Nothing takes
+    // its address — recv() reads into a stack buffer and we append() — so the
+    // C++98 rule that only vector guarantees contiguous storage does not bite.
+    // append(ptr, n) is length-based and binary-safe, embedded NULs included.
+    //
+    // output_buf stays std::vector<char> because send() DOES index into it:
+    // &output_buf[bytes_sent]. There the contiguity guarantee is load-bearing.
+    // It also costs nothing to keep — output_buf is assign()ed once per response
+    // and then drained through the bytes_sent cursor, never re-copied, so it is
+    // linear where input_buf was not.
+    std::string        input_buf;
     std::vector<char>  output_buf;
     size_t             bytes_sent;
 
@@ -51,6 +77,38 @@ public:
     // Reuse this connection once the current response has drained? Decided when
     // the response is framed, from the request's version and Connection header.
     bool    keep_alive;
+
+    // --- response completion ---
+    // Is every byte of this response now in output_buf? For an ordinary response
+    // that is true the moment it is framed. For a STREAMING CGI it stays false
+    // until the script's pipe hits EOF, because output_buf running empty only
+    // means "the script has not printed the next piece yet".
+    //
+    // The write path must consult this and NOT the buffer level: treating a
+    // drained buffer as a finished response would recycle or close the
+    // connection mid-script, truncating every CGI response at its first pause.
+    bool    response_complete;
+
+    // --- CGI streaming state (all unused when cgi_pipe_fd == -1) ---
+    // Script output that has not yet formed a complete header block. Parsed by
+    // CgiResponse::parseHead() on each read; once that succeeds this is dropped
+    // and everything after body_offset streams straight through. Capped by
+    // MAX_HEADER_BYTES so a script that never emits a blank line cannot grow it
+    // without bound.
+    std::string cgi_head_buf;
+    // Have we written this response's status line and headers into output_buf?
+    // Until then nothing of the body may be emitted — the framing headers must
+    // precede the first chunk.
+    bool        cgi_headers_sent;
+    // Is this CGI body framed with chunked encoding, or by closing?
+    //
+    // Chunked is HTTP/1.1 ONLY — 1.0 has no Transfer-Encoding, so a 1.0 client
+    // would render the hex sizes as body text. For those the body is delimited
+    // by the close instead, which forces keep_alive off no matter what the
+    // request asked for: the close IS the terminator, so reusing the connection
+    // would leave the body unterminated. Decided once, when the headers are
+    // framed, and read by both the body-append and EOF paths.
+    bool        cgi_chunked;
 
     // --- config + parsed data ---
     ServerConfig*  server_cfg;  // server block that accepted this client; never owns

@@ -39,6 +39,17 @@ private:
     Server(const Server& other);
     Server& operator=(const Server& other);
 
+    // IMMUTABLE after initialize() returns. Live Client objects hold interior
+    // pointers into this vector (Client::server_cfg == &config[i], set in
+    // _acceptNewClient and _resolveServerConfig), and Config is a std::vector,
+    // so ANY push_back/insert/erase/clear once clients exist may reallocate the
+    // buffer and leave every server_cfg dangling. That is a use-after-free with
+    // no crash at the point of the mistake: the server keeps running and reads
+    // freed memory as if it were a ServerConfig, under load, intermittently.
+    //
+    // If per-request or reloadable config is ever wanted, do NOT mutate this
+    // vector — store indices instead of pointers, or hold the blocks by pointer
+    // so the elements themselves never move.
     Config config;
     bool running;
 
@@ -80,7 +91,6 @@ private:
     void _acceptNewClient(int listen_fd);
     void _handleClientRead(int client_fd);
     void _handleClientWrite(int client_fd);
-    void _handleCgiPipeRead(int cgi_fd);
     void _handleError(int fd);
     
     // Read-side request pipeline
@@ -96,8 +106,85 @@ private:
     void _advanceRequest(Client* client);
     // Hand-off seam: runs exactly once per complete request.
     void _processRequest(Client* client);
+
+    // Whether this request's byte stream is still trustworthy at the moment the
+    // error is raised. FRAMING_LOST means unread bytes of the current request
+    // may still be in the socket or in input_buf, so we cannot tell where the
+    // next request begins and the connection must not be reused. Only the
+    // caller knows this: it is a property of WHERE the error was raised, not of
+    // the status number.
+    enum FramingState { FRAMING_INTACT, FRAMING_LOST };
+
     // Frames a status-only response into output_buf and flips to SENDING.
-    void _startErrorResponse(Client* client, int status_code);
+    void _startErrorResponse(Client* client, int status_code, FramingState framing);
+
+    // --- CGI (streaming) ---
+    // Is this request handled by a script? Returns the interpreter to exec when
+    // the matched location declares a cgi_extension for the URI's suffix.
+    // Empty string means "not CGI, hand it to Dispatcher as usual".
+    // Splits the URI at the first path segment carrying a configured CGI
+    // extension: everything up to and including it is SCRIPT_NAME, the rest is
+    // PATH_INFO. Returns the interpreter, or "" when no segment matches (not a
+    // CGI request). Walking segments rather than taking the last dot is what
+    // makes /cgi-bin/x.py/extra work at all.
+    std::string _cgiSplitPath(const std::string& uri, const LocationConfig& loc,
+                              std::string& script_name, std::string& path_info) const;
+    // CGI/1.1 environment for the child. Built before fork.
+    std::vector<std::string> _cgiEnv(const Client* client,
+                                     const std::string& script_filename,
+                                     const std::string& script_name,
+                                     const std::string& path_info) const;
+    // fork()s the script with its stdout on a pipe and parks the client in
+    // WAITING_FOR_CGI. False means the script could not be started and an error
+    // response is already queued.
+    bool _startCgi(Client* client, const std::string& interpreter,
+                   const std::string& script_path,
+                   const std::string& script_name,
+                   const std::string& path_info);
+    // Drains whatever the script has printed so far. Parses the header block on
+    // the way through, then streams the body out as chunks.
+    void _handleCgiPipeRead(int cgi_fd);
+    // Closes the read pipe and drops it from the reverse map. Does NOT touch the
+    // child — EOF on the pipe and the child's exit are separate events, and the
+    // exit status is the only thing that distinguishes a finished script from a
+    // crashed one.
+    void _closeCgiPipe(Client* client);
+    // Feeds request.body to the script. Dispatched on POLLOUT for the stdin
+    // write end; closes that end the moment the body drains, because that close
+    // IS the EOF the child is waiting for.
+    void _handleCgiStdinWrite(Client* client);
+    // Closes the stdin write end and purges its map entry. Idempotent.
+    void _closeCgiStdin(Client* client);
+    // Non-blocking reap. True means the child was collected and `status` is
+    // valid; false means it is still running and cgi_pid is deliberately kept so
+    // a later sweep can try again — clearing it here is how zombies are made.
+    bool _reapCgi(Client* client, int& status);
+    // Ends a CGI response that already sent its headers. `ok` false means the
+    // script died mid-body: the terminating chunk is withheld and the connection
+    // forced closed, so the peer sees a truncated transfer instead of being told
+    // a half-response was complete.
+    void _finalizeCgi(Client* client, bool ok);
+    // SIGKILL the child and reap it. For a timeout, or a client that died while
+    // its script ran. The wait is blocking on purpose — SIGKILL cannot be caught,
+    // so it is bounded by scheduler latency, not by the script.
+    void _killCgi(Client* client);
+    // Full teardown: pipe + child. Used by client destruction, where nothing is
+    // left to report to.
+    void _closeCgi(Client* client);
+
+    // Recycle or close once the response is complete AND drained. Called from
+    // the write path and from the CGI EOF path, which can complete a response
+    // whose buffer is already empty and would otherwise never see POLLOUT again.
+    //
+    // PRECONDITION: client->response_complete is true AND bytes_sent >=
+    // output_buf.size(). Calling it on a drained-but-unfinished response cuts a
+    // streaming CGI off mid-script — "drained" and "finished" are different
+    // facts and only response_complete carries the second one.
+    //
+    // POSTCONDITION: MAY DELETE THE CLIENT (the close branch calls
+    // _removeClient). Every caller must treat its Client* as dangling on
+    // return, and must not touch it or the fd afterwards.
+    void _finishResponse(int client_fd);
 
     // Client lifecycle
     void _removeClient(int client_fd);

@@ -162,8 +162,10 @@ Walk this chain in your head until it's reflex — it's the #1 interview questio
    means "come back with more bytes" and we return — **this is the gate**, and
    it is why a request split across ten segments still produces exactly one
    response. Once headers are in, `Host` selects the virtual host (§5.4.1).
-7. **Route → handle** *(`_processRequest`; answers 501 until the Dispatcher
-   exists)* — the response bytes are appended to `client->output_buf`.
+7. **Route → handle** — `_processRequest` calls `Dispatcher::dispatch`
+   (Router picks the location, a handler produces an `HttpResponse`), then
+   `ResponseBuilder::build` serialises it and the bytes are appended to
+   `client->output_buf`.
 8. **`poll()` reports `POLLOUT`** (we only ask for it when output is pending)
    and **`send()`** pushes as much as the kernel will take; `bytes_sent`
    remembers our position; repeat until drained.
@@ -637,9 +639,10 @@ The 4 KB stack buffer is just a shuttle between kernel space and
 `input_buf` — its size only affects how many loop iterations a large upload
 takes, not correctness.
 
-*(Past the gate, `_processRequest()` is the hand-off seam. It currently answers
-**501 Not Implemented** — an honest placeholder rather than a fake 200 — until
-`Dispatcher` has an interface to call.)*
+*(Past the gate, `_processRequest()` is the hand-off seam: it calls
+`Dispatcher::dispatch` for the `HttpResponse` and `ResponseBuilder::build` for
+the wire bytes, and knows nothing about routing or HTTP syntax itself — see
+§12.8 for why it deliberately does not consult `statusForcesClose()`.)*
 
 ### 5.4.1 Choosing the virtual host — `_resolveServerConfig(client)`
 
@@ -1051,22 +1054,43 @@ maintained alongside the enum, which is what §5.4.1 relies on to settle the
 virtual host the moment headers land — before the body accumulates, so the
 right server block's `client_max_body_size` is the one being enforced.
 
-Still open on this seam: `PARSE_ERROR` reports no status code (§12.3), and
-chunked transfer decoding is unimplemented.
+Both items that were open on this seam are now closed: `PARSE_ERROR` carries a
+status code (§12.3) and chunked transfer decoding landed.
 
-**`Router` (Member C, in progress):** `match(uri, server)` — finds the
-location block with the **longest matching prefix** (`/uploads/photos` beats
-`/uploads` beats `/`), with a guard that `/upload` does NOT match location
-`/up` (a prefix must end at a `/` boundary unless it's the whole segment).
-Longest-prefix is nginx's rule: most-specific configuration wins.
-Coming: method checks (405), file path resolution, GET/POST/DELETE/CGI
-handlers.
+**`ResponseBuilder` (Member B):** `build(response, keep_alive)` — the mirror of
+the parser, turning a filled `HttpResponse` into wire bytes. It **always** owns
+`Content-Length` (computed from the body), `Date`, `Server` and `Connection`,
+and skips any handler-supplied copies of those, so a handler cannot desync the
+framing. `Content-Type` is the exception: the handler's value wins if it set
+one. Status text falls back to C's `HttpStatus` table when the handler left it
+empty, keeping one source of truth for reason phrases.
+
+**`Router` (Member C):** `match(uri, server)` — finds the location block with
+the **longest matching prefix** (`/uploads/photos` beats `/uploads` beats `/`),
+with a guard that `/upload` does NOT match location `/up` (a prefix must end at
+a `/` boundary unless it's the whole segment). Longest-prefix is nginx's rule:
+most-specific configuration wins.
+
+**`Dispatcher` (Member C):** `dispatch(request, server)` = `produce_response()`
+then `attach_error_body()`. It takes a `ServerConfig` rather than a
+`LocationConfig` — unlike the handlers — because it calls `Router::match`
+itself and because error decoration reads `ServerConfig::error_pages`. Order of
+checks: no location → 404; `redirect_url` set → 3xx (or 500 if the configured
+code is not a redirect code); method not in `allowed_methods` → 405 with an
+`Allow` header listing them; then GET/DELETE/POST to a handler; anything else
+→ 501.
 
 **The integration seam** (why merging should be mechanical, not painful):
 B consumes `client->input_buf`, produces a `Request`. C consumes the
-`Request` + `Config`, produces a `Response`. The serializer turns it into
+`Request` + `Config`, produces a `Response`. `ResponseBuilder` turns it into
 bytes in `client->output_buf`. Server (A) never learns what HTTP is; B and C
 never learn what a socket is.
+
+The seam is **joined** as of 2026-07-30 — `_processRequest()` calls
+`Dispatcher::dispatch` then `ResponseBuilder::build` (§12.8). Until that day
+all of B's and C's code was fully written but reachable from nothing, which is
+the failure mode this three-way split invites: each column can be complete and
+tested on its own while the product does nothing.
 
 ---
 
@@ -1140,7 +1164,7 @@ Practice answering these out loud, from memory, then check against the section.
 **Design & honesty** *(the differentiators)*
 23. How would you scale this to 100k connections? *("swap poll for epoll behind the same seam; then sharded event loops per core — the nginx model")*
 24. What would you do differently in modern C++? *(unique_ptr in the client map, std::atomic for the signal flag, string_view in the parser, std::expected instead of throw-a-string)*
-25. What's the weakest part of your current code? *(honest options: plain bool vs sig_atomic_t; connection-close after every response — no keep-alive yet; timeout constant not yet configurable; a failed listen doesn't abort startup)*
+25. What's the weakest part of your current code? *(read the current answer from `SUBJECT_RULES.txt` §5 — that file is the ledger and this line has gone stale twice. As of 2026-08-01: **`PostHandler` is a 501 stub, so file uploads do not work at all** — a mandatory-part line, and the biggest one; `MimeTypes` was merged but is **called from nowhere**, so every response is still `text/html`; CGI is complete but **unproven against php-cgi**, which is not installed here, so `REDIRECT_STATUS` and the absolute `SCRIPT_FILENAME` are set-but-untested against the pickiest interpreter; tests must be compiled by hand because there is no Makefile test target; plain bool vs sig_atomic_t; timeout constants not configurable; a failed listen doesn't abort startup)*
 
 Question 25 matters most. Interviewers trust people who know their own
 code's limits far more than people who claim it's perfect.
@@ -1208,16 +1232,28 @@ members and friends at link time. C++98 has no `= delete`, so this pair is the
 idiom. Neither class was ever copied, so this costs nothing and converts an
 assumption into something the compiler enforces.
 
-### 12.3 `PARSE_ERROR` carries no status code
+### 12.3 `PARSE_ERROR` carries no status code — FIXED 2026-07-30
 
-Member B's `parse()` contract (§8) landed with three of the four things the
-read handler asked for: the `consumed` out-param, whole-buffer feeding, and a
-still-maintained `request.state`. The fourth is open — `PARSE_ERROR` is
-documented as "send 400 and close", so `_handleClientRead` hardcodes 400.
+Was: `PARSE_ERROR` was documented as "send 400 and close", so `_advanceRequest`
+hardcoded 400 — merging statuses that are genuinely different.
 
-That merges statuses that are genuinely different: an unknown method is 501,
-a bad HTTP version is 505, oversized headers are 431. Needs an int status on
-the request, set by the parser when it rejects.
+Fixed in two halves, and the second one lagged the first by several commits.
+B added `int status` to `HttpRequest` (`types.hpp`) and set it in the parser:
+`parse()` seeds it to 400 before touching anything, so every rejection has a
+usable code and the field can never be read uninitialised; `checkHttpVersion()`
+overwrites it with 505 for a version we do not speak.
+
+The server half stayed broken meanwhile — `_advanceRequest` still passed a
+literal 400 and threw the parser's code away, so **505 was unreachable even
+though the parser computed it correctly**. Worth remembering as a pattern: a
+field being populated is not the same as a field being consumed, and the tests
+that covered the parser could not see the gap. It surfaced only by sending
+`GET / HTTP/9.9` to the running server.
+
+Now `_startErrorResponse(client, client->request.status)`. 505 was also added
+to `reasonPhrase()` (it was falling through to the generic "Error") and to
+`statusForcesClose()` — rejection happens at the request line, so the rest of
+that stream was never parsed and the connection cannot be framed again.
 
 ### 12.4 Commented-out code in `Server.cpp` — FIXED 2026-07-27
 
@@ -1259,18 +1295,571 @@ progress yet "looked idle" and was killed after IDLE_TIMEOUT_SEC. Now sending
 bytes counts as activity. The stall clock still catches peers that stop
 reading entirely — the two clocks measure different failures.
 
-### 12.8 Still open elsewhere
+### 12.8 `_processRequest()` was a 501 placeholder — FIXED 2026-07-30
 
-- **Chunked transfer decoding** is unimplemented in `HttpParser` (Member B).
-- **`_processRequest()`** is still the honest 501 placeholder — it answers
-  `501 Not Implemented` rather than faking a 200, and stays that way until
-  `Dispatcher` has an interface to call. Not a bug; do not "fix" it by
-  hardcoding a response.
-- **`.gitignore` has 4 dead rules** (`tests/*`, `tests/`, `Makefile`,
-  `mdFiles/UNDERSTANDING_GUIDE.md`, `.idea/`) — those paths are already
-  tracked, and `.gitignore` only affects untracked files, so the rules do
-  nothing. Left as-is deliberately; `.git/info/exclude` is the right tool if
-  per-clone ignoring is ever wanted.
+Was: the integration seam answered every well-formed request with a hardcoded
+`501 Not Implemented`, waiting for `Dispatcher` to exist. It did exist —
+`Dispatcher`, `Router`, the three handlers, `HttpStatus` and `ResponseBuilder`
+had all landed, fully implemented, and had **zero callers**. The whole response
+pipeline was dead code reachable from nothing, and the stale comment
+("Dispatcher.hpp is still empty") is what kept it looking intentional.
+
+Now `_processRequest` sequences and nothing more:
+
+```
+Dispatcher::dispatch(request, *server_cfg)   // what to answer
+  -> ResponseBuilder::build(response, keep_alive)   // how it looks on the wire
+  -> output_buf + beginSending()
+```
+
+One deliberate asymmetry with `_startErrorResponse`: **`statusForcesClose()` is
+not consulted here.** That helper exists for replies sent when framing is
+unknown — after a malformed request, a timeout, or a body cut off by the cap,
+there is unread garbage queued and the next request would be framed out of it.
+A dispatched response is the opposite case: the parser reported COMPLETE and
+`_advanceRequest()` erased exactly `consumed` bytes, so what remains in
+`input_buf` is a clean request boundary. A 404 or a 405 is a normal answer to a
+well-formed request and must not cost the client its connection.
+
+A null `server_cfg` falls back to a 500 through the legacy path, which needs no
+config to render. That branch means the fd→server map was empty — a config or
+bind bug, never anything the client sent.
+
+**Verified** against `tests/local-test.conf`, not just reasoned: 200 on index
+and on a nested file, 404, 200 directory listing, 405 carrying `Allow: GET`,
+501 from the POST stub, 400 malformed, 505 bad version, 403 on both raw and
+percent-encoded traversal, keep-alive reuse (`num_connects=0` on request 2),
+and two pipelined requests written in a single `write()` answered with two
+responses on one connection.
+
+### 12.9 Read limits ran before the parser — FIXED 2026-07-31
+
+Was: `_enforceReadLimits()` was called from `_handleClientRead()`, before
+`parse()` saw the new bytes. Both of its checks consume parser output, so both
+were reading one recv into the past:
+
+| Check | Reads | Why it was stale |
+|---|---|---|
+| 431 | `request.state` | left by the *previous* recv's parse |
+| 413 | `server_cfg->client_max_body_size` | `server_cfg` is only correct after `Host` is parsed and `_resolveServerConfig()` runs |
+
+The dependency ran backwards through time: the 413 check *consumed*
+`server_cfg`, and `_resolveServerConfig()` *produced* it — one function later.
+
+**The 431 half was live.** On the recv that finally completes the header
+section, the stale state still said `READING_HEADERS`, so the body bytes in
+that same recv were counted against `MAX_HEADER_BYTES`. A request with ~8 KB of
+headers — fat cookies, a long `Referer` — plus any body got a spurious 431 and
+lost its connection. Reproduced against the pre-fix binary: an 8045-byte header
+section plus a 200-byte body (total 8247) answered 431; the same request now
+reaches the handler. Genuinely oversized headers still get 431, and an
+oversized body still gets 413.
+
+**The 413 half could not fire, and *why* is the interesting part.** The trigger
+is `received > MAX_HEADER_BYTES + cap`, and one `recv()` adds at most
+`READ_CHUNK` bytes. Since `READ_CHUNK` (4096) `< MAX_HEADER_BYTES` (8192),
+`input_buf` cannot reach the trigger during the single recv where the config is
+stale. The bug was held shut by an accidental ratio between two constants that
+nothing relates and no comment mentions:
+
+```
+false 413 becomes reachable when:
+    READ_CHUNK > MAX_HEADER_BYTES + default_server_cap
+```
+
+Someone profiling a 100 MB upload, seeing 25 000 loop iterations and raising
+`READ_CHUNK` to 65536 to cut syscalls — a change with no visible connection to
+virtual hosting — would have armed it, and would never have found it. **That is
+the character worth naming: not a live failure, a live tripwire**, the kind that
+detonates during someone else's unrelated commit weeks later.
+
+Fix is one moved call: `_enforceReadLimits()` now runs inside
+`_advanceRequest()`, after `parse()` and after `_resolveServerConfig()`. Both
+symptoms go away, and the code stops depending on a coincidence nobody was
+defending.
+
+No parser change was needed. `parse()` re-parses the whole buffer from byte 0
+each call and invokes `readBody()` on the *same* call that finds the blank line,
+so `state` becomes `READING_BODY` or `COMPLETE` immediately — there is no
+one-recv lag for the reorder to miss. (Worth confirming before trusting a
+reorder like this: had the parser instead reported "headers done" one call
+later, the 431 symptom would have survived and the parser would have had to
+report the header-section length explicitly.)
+
+The honest framing for the peer eval: *"the check is ordered wrong, it happens
+to be masked by `MAX_HEADER_BYTES` being larger than `READ_CHUNK`, and I moved
+it rather than rely on that coincidence."* Knowing a bug is currently
+unreachable and fixing it anyway is a stronger answer than not having it.
+
+**Still approximate, deliberately:** the 413 check compares
+`input_buf.size()` against `MAX_HEADER_BYTES + cap`, using total buffered bytes
+as a proxy for body size. That grants a body up to `cap + 8192` before
+rejecting, and it counts pipelined bytes of the *next* request toward the
+current one's total. Exact enforcement wants the body length the parser already
+knows (`Content-Length`, or bytes decoded so far when chunked). Not urgent, but
+it is the reason the cap is soft rather than exact.
+
+### 12.10 Framing inferred from the status code — FIXED 2026-07-31
+
+Was: `_startErrorResponse()` decided reuse through `statusForcesClose()`, a
+hardcoded list — 400, 408, 413, 431, 505. But whether a connection survives is a
+property of **where the error was raised** (is the request fully framed? are
+there unread bytes left?), not of the status number.
+
+The list was correct at every call site. By hand. The failure mode was the next
+one: someone adds a pre-parse rejection — a 414 for an over-long request line,
+a 501 for an unknown method caught before the body is read — and forgets the
+list. The status defaults to "reusable", the connection stays open desynced, and
+every subsequent request on it is framed out of the previous one's leftovers.
+Which only shows up under pipelining *plus* malformed input, i.e. never in a
+simple test.
+
+Now `_startErrorResponse(client, status, framing)` takes a required
+`FramingState`, so each caller states what it knows:
+
+| Call site | Framing | Why |
+|---|---|---|
+| 431 | `FRAMING_LOST` | header section never closed |
+| 413 | `FRAMING_LOST` | we return before erasing `consumed`, peer still sending |
+| 400 / 505 (parser) | `FRAMING_LOST` | rejected mid-stream |
+| 408 (timeout) | `FRAMING_LOST` | gave up while the request was in flight |
+| 500 (`_processRequest`) | `FRAMING_INTACT` | post-parse; our config bug, not theirs |
+
+`statusForcesClose()` deleted. No behavioural change — the point is that the
+invariant is now stated by each caller instead of guessed centrally.
+
+### 12.11 Quadratic re-parse: bodies over ~2.5 MB time out — FIXED 2026-07-31
+
+**Scope, stated carefully:** this is not "uploads are broken" — `PostHandler` is
+still a 501 stub, so nothing uploads anything yet. The cost is in the **read
+path**, which runs before any handler is consulted: the 408 fires while the body
+is still being accumulated, so the request never reaches COMPLETE and
+`Dispatcher` is never called. It applies to a large body on *any* method.
+
+That makes it a **pre-positioned blocker for POST**, and a nasty one. Whoever
+implements `PostHandler` will hit a 408 on their first real upload test and will
+reasonably start debugging their own handler — which never runs. Worth fixing
+before that work starts, not after.
+
+`_advanceRequest()` copies the whole accumulated `input_buf` into a fresh
+`std::string` on every recv:
+
+```cpp
+const std::string bytes(client->input_buf.begin(), client->input_buf.end());
+client->parser.parse(bytes, client->request, consumed);
+```
+
+With `READ_CHUNK` = 4096, a 10 MB upload is ~2560 recvs over an average 5 MB
+buffer — about 13 GB of copying to receive 10 MB. Measured, doubling the body
+each row:
+
+| body | wall | server CPU ticks | CPU/KB | vs previous |
+|---|---|---|---|---|
+| 125 KB | 0.11 s | 7 | 0.056 | — |
+| 250 KB | 0.23 s | 20 | 0.080 | 2.85× |
+| 500 KB | 0.48 s | 48 | 0.096 | 2.40× |
+| 1 MB | 1.91 s | 190 | 0.190 | 3.95× |
+| 2 MB | 8.79 s | 778 | 0.389 | 4.09× |
+
+The ratio converges on **4.0 per doubling** — textbook quadratic. Extrapolated,
+4 MB needs ~35 s, which exceeds `REQUEST_TIMEOUT_SEC` (30). Confirmed: a 4 MB
+and a 10 MB POST both die with **408**, at 29.5 s and 30.1 s.
+
+The rows at 2 MB and below returned 501 — the stub's answer — which is what
+makes the numbers trustworthy: the body was fully read, framed, and dispatched
+in each of those cases. Only the timing is being measured, not the handler.
+
+Downloads are unaffected. The write path sends out of `output_buf` through a
+`bytes_sent` cursor and never re-copies, so it is linear in the response size.
+
+**Where the cost actually is** — this matters, because the obvious diagnosis is
+wrong. Splitting the two halves of the loop (`scratchpad/micro.cpp`):
+
+| body | vector→string copy | `parse()` |
+|---|---|---|
+| 250 KB | 0.0081 s | 0.00036 s |
+| 500 KB | 0.0386 s | 0.00099 s |
+| 1 MB | 0.1254 s | 0.00160 s |
+| 2 MB | 0.4051 s | 0.00314 s |
+
+**The copy is 99.2 % of the cost. `parse()` is 0.8 %, and it is linear.** The
+parser is already cheap on re-entry: for a `Content-Length` body it re-reads
+only the header block (a fixed cost) and then does `bytes.size() - body_start <
+expected` and returns. It never rescans the body.
+
+So the fix was **not** a `parse_offset` and **not** a parser-contract change. It
+was one field type: `Client::input_buf` from `std::vector<char>` to
+`std::string`, letting it be passed to `parse()` directly instead of copied.
+`HttpParser::parse` already takes `const std::string&` — its signature did not
+move at all.
+
+**Applied in `3bda491`.** The declaration in `Client.hpp`, plus three lines in
+`Server.cpp`: `insert`→`append(ptr, n)`, `erase(begin, begin+n)`→`erase(0, n)`,
+and dropping the copy. The "jointly-owned struct" caution turned out not to
+bite: `input_buf` is referenced in six lines of `Server.cpp` and nowhere else,
+and **no teammate file references `Client` at all** — B's parser takes
+`const std::string&` and `HttpRequest&`, C's handlers take `HttpRequest` and
+`ServerConfig`. Neither knows the type exists.
+
+After, same ladder. Two measurement notes, both of which bit on the first
+attempt and are worth knowing before quoting any of these numbers:
+
+- **`Expect: 100-continue` suppressed.** curl adds that header for bodies over
+  1 MB and then waits up to 1 s for a `100` we never send, adding a flat second
+  to every large row. That is curl's wait, not server cost.
+- **Warmed, median of 7 runs.** The post-fix times are small enough that a
+  single cold sample is meaningless: the first run of a loop absorbs curl
+  startup, page-cache misses on the body file, and the server's first-accept
+  path. An earlier single-sample table reported 1 MB *slower* than 2 MB for
+  exactly that reason. At tens of milliseconds on WSL2 the noise floor is
+  comparable to the signal — repeat and take the median.
+
+| body | before | after (median of 7) | vs prev |
+|---|---|---|---|
+| 1 MB | 1.91 s | 0.009 s | — |
+| 2 MB | 8.79 s | 0.014 s | 1.56× |
+| 4 MB | **408** @ 29.5 s | 0.019 s | 1.36× |
+| 10 MB | **408** @ 30.1 s | 0.039 s | 2.05× (2.5× data) |
+| 20 MB | — | 0.069 s | 1.77× |
+| 40 MB | — | 0.156 s | 2.26× |
+
+Doubling the body now doubles the time — linear, against 4.0× per doubling
+before. 40× the data costs 17× the time; the sublinearity at the low end is
+fixed per-request overhead, not a measurement problem. The 408 trap in front of
+`PostHandler` is gone. Regression: the full `112ad83` matrix (200 ×4, 404, 403
+on both traversal encodings, 405, 501, keep-alive ×2, pipelined ×2) unchanged,
+build clean under `-Wall -Wextra -Werror -std=c++98`.
+
+**The asymmetry is deliberate and commented.** `output_buf` stays
+`std::vector<char>` because `send()` indexes into it (`&output_buf[bytes_sent]`),
+where the C++98 guarantee that only `vector` is contiguous is load-bearing.
+`input_buf` has no such constraint — `recv()` reads into a stack `char[4096]`
+and we `append(ptr, n)`, which is length-counted and therefore binary-safe with
+embedded NULs. Both declarations say why, so nobody "unifies" them later.
+
+**Worth being able to say out loud:** neither original choice was a mistake.
+`vector<char>` signals raw bytes and was the standards-correct pick for a buffer
+in C++98; `parse(const std::string&)` is far nicer for `find("\r\n")` and
+`substr`. Two sound local decisions that composed into a full-buffer copy at the
+seam between them — and neither person could see it from inside their own file.
+
+### 12.12 A location's `client_max_body_size` was never enforced — FIXED 2026-07-31
+
+Reported by a teammate as a **parser** bug: *"`client_max_body_size` doesn't
+inherit into a location if the directive comes after the location block —
+location gets 1M instead of the configured 10M."*
+
+The ordering half does not reproduce. Inheritance is resolved in a **second
+pass** once the server block closes (`Config.cpp:367-379`), specifically so
+source order cannot matter; `tests/test_config.cpp` now asserts the
+directive-after-location, interleaved, and explicit-`0` cases.
+
+But the symptom was real, one layer down. `_enforceReadLimits` read
+`server_cfg->client_max_body_size` and nothing else, so
+`loc.client_max_body_size` was read **nowhere outside `Config.cpp`**. The parser
+tokenised it, stored it, inherited it and applied overrides correctly — and then
+nothing ever looked at it. A location could neither raise nor lower the limit.
+
+Three configs pin this, kept in `config/` with the reproduction in their
+comments:
+
+| case | setup | 2 MB POST before | after |
+|---|---|---|---|
+| a | server 1M, **location 10M** | **413** | **501** |
+| b | location first, server 10M after | 501 | 501 |
+| c | control: server 1M, no override | 413 | 413 |
+
+**Case C is the one that makes the argument.** It is case A with the location
+override deleted, and before the fix it behaved *identically* — which is what
+proves A's 10M was doing nothing, rather than A's 413 coming from somewhere
+unrelated.
+
+The fix resolves the cap through `Router::match()`, the same matcher
+`Dispatcher` uses. A different matcher would let a request be admitted under one
+location's cap and then served by another. Two fallbacks to the server value,
+both deliberate: `request.uri` is empty until the request line is parsed (the
+431 check owns that window), and no-location-match still needs *a* bound because
+`Dispatcher`'s 404 only happens at COMPLETE — without it an unmatched path could
+stream bytes indefinitely.
+
+Also verified that the cap still *bounds*: 12 MB to a 10M location is 413, a 1M
+location under a 10M server rejects 2 MB, and an unmatched path takes 404 at
+100 KB but 413 at 2 MB.
+
+**Worth having ready:** the misdiagnosis was reasonable. `config/example.conf`'s
+8080 vhost is server-level 1M, so anyone overriding it on a location there sees
+exactly 1M enforced — which looks like inheritance failing, and that file does
+happen to put the directive near the locations. Two coincidences pointing at the
+parser, where the parser was correct. The general lesson: a value being *parsed
+correctly* and a value being *used* are separate claims, and testing only the
+first proves nothing about the second.
+
+### 12.13 CGI: streaming, chunked, and the HTTP/1.0 collision — 2026-08-01
+
+CGI exists as of `dd0b519`, and `cb302fd` fixed how it frames responses. The
+shape: a matched location declaring `cgi_extension` forks the interpreter with
+its stdout on a pipe, and that pipe joins the **same** `poll()` loop as every
+socket. Nothing blocks and nothing waits.
+
+**Streaming, not buffering.** Only the header block is accumulated — it must be
+complete before anything can be framed, and B's `CgiResponse::parseHead()`
+reports when it is. Every body byte after that is queued the moment it is read.
+Proven with a script printing one line every 2s: the first line reaches the
+client at **t=0.00s**, not at t=4.00s when the script exits. Backpressure drops
+the pipe out of the poll set while the client is >256 KB behind, so a fast
+script and a slow peer cannot quietly turn this back into buffering.
+
+**Why chunked.** The body length is unknowable until the script exits, and
+waiting for it is the buffering being avoided. Chunked carries a size per piece,
+so the connection survives the response instead of being closed to mark its end.
+Verified: two CGI responses over one connection.
+
+#### The collision worth being able to explain
+
+Chunked is **HTTP/1.1 only** — 1.0 has no `Transfer-Encoding`. The first version
+emitted it unconditionally, so a 1.0 client received hex chunk sizes and
+rendered them as body text. So 1.0 falls back to a close-delimited body.
+
+That fallback then collides with keep-alive, which this server genuinely
+supports — including the case in §5.5 where an HTTP/1.0 request carrying an
+explicit `Connection: keep-alive` is honoured. Such a client asks for reuse, and
+a close-delimited body's only terminator **is** the close. Honouring the request
+would mean promising to reuse a connection while the response can only end by
+ending it.
+
+**The rule: framing beats preference.** A peer cannot consent to a body it has
+no way to find the end of, so a close-delimited response forces `keep_alive`
+false regardless of what was asked. Chunked responses are *not* blanket-closed —
+being self-delimiting is the entire reason chunked was chosen.
+
+Both halves live in one place, where the CGI headers are framed. `keep_alive`
+is still computed from the request at the top of `_processRequest`; that is the
+request half, and this is the response half of the same rule.
+
+#### The third bug, which the fix uncovered
+
+Recycle-or-close lived inside `_handleClientWrite`, which runs on `POLLOUT` —
+and `POLLOUT` is only requested while unsent bytes remain. A close-delimited
+response queues **no terminating chunk**, so at pipe EOF its buffer is typically
+already drained: no further write event ever arrived, the connection sat open
+until a timer reaped it, and the peer waited for the close that was its
+end-of-body marker. Measured 8.01s before, 0.00s after. Now `_finishResponse()`,
+called from both the write path and the CGI EOF path.
+
+Pipelining stays correct without a special case: leftover `input_buf` bytes are
+re-parsed only on the keep-alive branch, which a close-delimited response has
+already forced false — so a 1.0 client pipelining behind one loses its second
+request, as it must, having been told the connection ends.
+
+#### Telling a finished script from a crashed one
+
+A script that segfaults has its stdout closed by the kernel **exactly** as one
+that returns cleanly does. The parent reads an identical EOF. Reading the pipe
+can never distinguish them — the exit status is the only signal that exists.
+
+The first version threw it away (`waitpid`'s return discarded) and appended the
+terminating chunk unconditionally, so a half-response was announced as whole.
+Demonstrated on the pre-fix binary: a script printing half its body and raising
+SIGKILL produced `curl exit=0, HTTP 200`, with the wire ending
+`first-half\n\r\n0\r\n\r\n`. After the fix, the same request ends at
+`first-half\n\r\n` and curl reports **"transfer closed with outstanding read
+data remaining."**
+
+The rule: headers are already on the wire, so no status code can be retracted.
+The only honest signal left is to make the transfer *visibly incomplete* — the
+peer waits for a terminator and gets a closed connection instead. `keep_alive`
+is forced off too, since the next response on that connection would be read as
+a continuation of this chunk stream.
+
+**Close-delimited (HTTP/1.0) responses cannot carry this signal at all.** A
+clean close is what success looks like. That is a genuine limitation of the
+framing, not an oversight — worth saying plainly rather than implying the
+detection is universal.
+
+#### The deferred-verdict decision (worth being asked about)
+
+Closing stdout and exiting are separate events, so at EOF `waitpid(WNOHANG)`
+can legally return 0: the pipe is done, the child is still winding down, and
+the verdict is not in yet. Two options:
+
+- **Optimistically clean-end** — assume success, send the terminator, finish
+  now. Lowest latency, but it guesses the exact fact this whole path exists to
+  establish, and it guesses in the direction that hides crashes.
+- **Hold the response until the child is reaped** — what this server does. The
+  response is parked INCOMPLETE and a sweep in `_checkTimeouts()` finalizes it
+  once the status exists.
+
+Chosen: hold. The benefit is that the truncation signal is never wrong, and a
+signal that is right except under a race is not one you can defend.
+
+Be precise about the cost, though: the sweep only runs when `poll()` returns,
+and its timeout is **5000 ms**. On a busy server the wait is microseconds
+(any event wakes the loop); on a silent one it is up to 5 s. The normal case
+never waits at all — a script that simply exits has its stdout closed BY the
+exit, so `waitpid` succeeds immediately at EOF. Only a script that closes stdout
+and lingers reaches the deferred path, and that one is bounded above by
+`CGI_TIMEOUT_SEC` regardless.
+
+The consequence to notice: those clients must be skipped by the idle and stall
+timeout branches. A client waiting on us to reap its child is **mid-response,
+not late**, and letting the 60s idle clock reap it would reintroduce exactly
+the wrong-timer bug described for CGI timeouts below.
+
+#### Why a 1.0 request gets an `HTTP/1.1` status line
+
+Deliberate, not an oversight. RFC 7230 §2.6: a server SHOULD send the highest
+version it conforms to within the same major version, regardless of what the
+request used — and nginx does exactly this, answering `HTTP/1.1` to 1.0
+requests while avoiding 1.1-only *features*. That is precisely the shape here:
+1.1 status line, no chunked encoding, close-delimited body. Mirroring the
+request's version in only the CGI path would also make the server less
+consistent, since `ResponseBuilder` and `_startErrorResponse` both hardcode
+1.1.
+
+**What was still missing when this section was first written** — the child's
+environment, the stdin pipe, the CGI timeout, the inherited sockets and the
+`chdir` — all landed afterwards in `485e110`, `16b1b9d`, `2c1ef3c` and
+`9d7944a`, and are written up in 12.14. The CGI ledger in `SUBJECT_RULES.txt`
+§5 is empty as of 2026-08-01, with one caveat standing in its place: none of it
+is proven against **php-cgi**, which is not installed on this machine, so
+`REDIRECT_STATUS` and the absolute `SCRIPT_FILENAME` are set-but-untested
+against the pickiest interpreter. `/bin/sh` and `python3` both work end to end.
+
+Read the current list from that file, never from here — this paragraph went
+stale three times, which is why the ledger rule exists.
+
+### 12.14 CGI part two: stdin, environment, and four things worth being asked
+
+#### The close IS the EOF
+
+`_handleCgiStdinWrite` writes one chunk of `request.body` per `POLLOUT`, then —
+the moment `cgi_body_sent` reaches `body.size()` — **closes the write end**.
+
+That close is the entire mechanism. A pipe read returns EOF only once *every*
+write end is shut, so while we hold ours open, a script doing `cat` sits waiting
+for a body that is already fully delivered. It would hang until our own 30 s CGI
+timeout killed it — and would present as *"the timeout is buggy"* when the truth
+is *"we never let go of the pipe"*. A bodiless request closes the write end
+immediately at fork for the same reason, and then never asks for `POLLOUT` on it.
+
+The sentence to have ready: **"a pipe read end returns EOF only when every write
+end is closed — the parent still holding the write end is the parent keeping its
+own EOF hostage."**
+
+Proof it is a real loop and not one lucky `write()`: an 8 MB body echoes
+byte-identical in 0.11 s. The pipe buffer is 64 KB, so that is ~128 write cycles
+driven entirely by `POLLOUT`.
+
+A `write()` returning `< 0` is **not** an abort. A script may legally ignore its
+body and close stdin early; with `SIGPIPE` ignored (`Server.cpp:102`) that
+arrives as `-1` rather than a signal. We stop writing and keep reading stdout —
+the child may already have produced a perfectly good answer.
+
+#### Why `X_Evil:` never becomes an environment variable
+
+The `HTTP_*` transform is: uppercase, `-` → `_`, prefix `HTTP_`. Which means
+`X-Evil` and `X_Evil` both transform to `HTTP_X_EVIL`. A client that sends the
+underscore form could therefore **shadow or spoof** the header a script trusts.
+
+So any header whose name contains `_` is dropped. nginx does this by default for
+exactly this reason. Small decision, real security rationale, and an evaluator
+who asks "what stops header smuggling here?" gets a specific answer.
+
+Three other exclusions, each for its own reason:
+
+- `Content-Type` / `Content-Length` — already dedicated variables; duplicating
+  them as `HTTP_*` is spec-noncompliant.
+- **`Transfer-Encoding`** — the load-bearing one. We un-chunk the body *before*
+  piping it, so forwarding `HTTP_TRANSFER_ENCODING=chunked` would tell a script
+  its stdin is chunked when it no longer is. A conforming script would try to
+  de-chunk already-decoded bytes and corrupt its own input. **The header
+  described the wire; the wire the script sees is our pipe.**
+- `Connection`, `Keep-Alive`, `TE`, `Upgrade` — hop-by-hop, describing a
+  connection the script is not on.
+
+#### `PATH_INFO` required fixing what counts as a CGI request
+
+`/cgi-bin/x.py/extra/path` is one URL carrying two things: a script and an
+argument. The original check took the URI's **last dot** — which in that string
+sits *before* the final slash, so the request did not register as CGI **at all**.
+Not "PATH_INFO was empty": the script never ran.
+
+The URI is now walked segment by segment and split at the first segment carrying
+a configured extension. Everything up to it is `SCRIPT_NAME`, the remainder is
+`PATH_INFO`. And only the script part is resolved on disk — resolving the whole
+URI would look for a file literally at `/cgi-bin/x.py/extra/path` and 404 every
+request that carries extra path.
+
+Measured: `/cgi-bin/env.sh/a/b?q=1` → `SCRIPT_NAME=/cgi-bin/env.sh`,
+`PATH_INFO=/a/b`, `QUERY_STRING=q=1`.
+
+#### The bug only an env dump could find
+
+`REMOTE_ADDR` was being set from `client->remote_address`, which is stored as
+`"ip:port"` for logging. So every script received `REMOTE_ADDR=127.0.0.1:38806`.
+
+Nothing crashes. Nothing 500s. A script comparing `REMOTE_ADDR` against an
+allow-list, or handing it to a resolver, simply fails — quietly, on every single
+request, forever. Split; the port moved to its own `REMOTE_PORT`.
+
+The lesson generalises: **a value being produced and a value being *correct* are
+separate claims**, and only dumping the actual output tests the second one. Same
+shape as 12.12, where a config value was parsed perfectly and then never read.
+
+#### The fd-reuse race is unreachable by construction
+
+Fair question: a client dies mid-iteration, its pipe fds are closed, and the same
+`poll()` pass still holds pending events for them. Could a stale entry touch a
+*different* client that recycled the fd number?
+
+No, for two reasons that compose:
+
+1. **The purged map entry.** `_removeClient` → `_closeCgi` erases both pipe fds
+   from `cgi_fd_to_client_fd` *before* the `delete`. A stale event then misses
+   that map, falls through to the client branch, and misses `clients` too (a pipe
+   fd number is not a client fd) → returns. Stale pipe events are no-ops.
+2. **Array order.** `_rebuildPollFds` appends listening sockets **first**
+   (`:247`), then clients (`:256`), then pipes (`:282`). Every `accept()` for a
+   pass therefore happens *before* any client or pipe event is handled, so an fd
+   number freed mid-pass cannot be handed out again until the next iteration — by
+   which time the rebuild has erased the stale entry entirely.
+
+Verified empirically too: 60 rounds of RST-mid-body with jittered timing left the
+server alive at 5 fds, 0 zombies, 0 children.
+
+That is the third *"unreachable by construction"* argument in this file, and
+they are worth more than the tests that accompany them — a test says "it did not
+happen this time," a construction argument says "it cannot."
+
+### 12.15 Still open elsewhere
+- **`PostHandler` is a stub** — returns 501 and `(void)`s both parameters, so
+  uploads do not work. It is the last handler with no real body.
+- **`MimeTypes` exists but is wired to nothing** (updated 2026-08-01). B merged
+  `src/MimeTypes.cpp` + `includes/MimeTypes.hpp` in `25d9818`, and `MimeTypes::`
+  is called from **zero** call sites outside its own definition. The effect is
+  unchanged from before it landed: `Content-Type` is still `text/html` for
+  everything, hardcoded at `Dispatcher.cpp:80`, `Dispatcher.cpp:92`,
+  `GetHandler.cpp:56`, and as `ResponseBuilder.cpp`'s fallback. This is the
+  worse kind of gap — the file exists, the Makefile builds it, and a glance at
+  the repo says the feature is done. Wiring it is a handful of lines and is
+  worth doing before anyone claims MIME support.
+- **The original note, still accurate on effect:** `Content-Type` is hardcoded
+  to `text/html` in five places
+  (`ResponseBuilder.cpp`, `Dispatcher.cpp` ×2, `GetHandler.cpp`,
+  `Server.cpp`), so a `.txt`, `.css` or `.png` is served as HTML.
+  `ResponseBuilder.cpp:42` already names the intended fix (`MimeTypes`).
+- **`HEAD` is unimplemented** — `Dispatcher::produce_response` falls through to
+  501, yet `config/default.conf` lists `HEAD` in `allowed_methods`, so the
+  config promises a method the server refuses.
+- **No test target in the Makefile.** `tests/test_config.cpp`,
+  `test_http_parser.cpp` and `test_integration.cpp` are never built; they have
+  to be compiled by hand, which means in practice they are not being run.
+- **`.gitignore` has 3 dead rules** (`Makefile`, `tests/`,
+  `mdFiles/UNDERSTANDING_GUIDE.md`) — those paths are already tracked, and
+  `.gitignore` only affects untracked files, so the rules do nothing.
+  `.idea/` used to be a fourth; it was resolved on 2026-07-30 with
+  `git rm -r --cached .idea/`, which is the fix the others need if they are
+  ever meant to take effect. Left as-is deliberately.
 
 ---
 

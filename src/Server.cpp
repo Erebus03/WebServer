@@ -1,5 +1,11 @@
 #include "../includes/Server.hpp"
 #include "../includes/FileUtils.hpp"
+#include "../includes/Dispatcher.hpp"
+#include "../includes/Router.hpp"
+#include "../includes/ResponseBuilder.hpp"
+#include "../includes/CgiResponse.hpp"
+#include <sys/wait.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -14,6 +20,13 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+// How far the client may fall behind before we stop reading the CGI pipe. Not a
+// cap on response size — it is the depth of the in-flight window, so a 1 GB
+// script output still only ever occupies this much of our memory at a time.
+// Lives here rather than with the other tuning constants because
+// _rebuildPollFds() needs it and sits above them.
+static const size_t CGI_BACKLOG_HIGH = 256 * 1024;
 
 
 // ── Allowed-function-safe IPv4 helpers ───────────────────────────────────────
@@ -266,8 +279,46 @@ void Server::_rebuildPollFds(std::vector<struct pollfd>& pollfds) {
         pfd.revents = 0;
         pollfds.push_back(pfd);
     }
-    
-    // TODO: Add CGI pipe FDs here when implemented
+
+    // CGI pipes. Each one is a normal poll()-managed fd in the SAME loop as the
+    // sockets (subject:100) — that is what keeps a slow script from blocking
+    // anything else while it thinks.
+    for (std::map<int, int>::iterator it = cgi_fd_to_client_fd.begin();
+         it != cgi_fd_to_client_fd.end(); ++it) {
+        std::map<int, Client*>::iterator cit = clients.find(it->second);
+        if (cit == clients.end()) continue;   // client already gone; EOF path cleans up
+
+        // BACKPRESSURE. Stop reading the script while the client is behind on
+        // what we have already produced. Without this a script that prints
+        // faster than the peer reads would have its entire output accumulate in
+        // output_buf — which is buffering by accident, exactly what streaming
+        // is supposed to prevent. Dropping POLLIN leaves the data in the pipe;
+        // the kernel's pipe buffer fills, and the script blocks on its own
+        // write() until we catch up. poll() is level-triggered, so the moment
+        // the backlog drains below the mark this asks for POLLIN again and no
+        // readiness is lost.
+        Client* c = cit->second;
+        struct pollfd pfd;
+        pfd.fd = it->first;
+        pfd.revents = 0;
+
+        if (it->first == c->cgi_stdin_fd) {
+            // Write end: POLLOUT ONLY while body bytes remain. Asking
+            // unconditionally would make poll() return instantly forever on a
+            // pipe we have nothing to write to — the same 100%-CPU spin the
+            // client sockets already guard against.
+            if (c->cgi_body_sent >= c->request.body.size()) continue;
+            pfd.events = POLLOUT;
+        } else {
+            // Read end. Backpressure: stop reading the script while the client
+            // is behind on what we already produced, or a fast script and a
+            // slow peer accumulate the whole output in output_buf.
+            const size_t pending = c->output_buf.size() - c->bytes_sent;
+            if (pending >= CGI_BACKLOG_HIGH) continue;
+            pfd.events = POLLIN;
+        }
+        pollfds.push_back(pfd);
+    }
 }
 
 void Server::_handlePollEvents(const std::vector<struct pollfd>& pollfds) {
@@ -281,6 +332,31 @@ void Server::_handlePollEvents(const std::vector<struct pollfd>& pollfds) {
             if (pollfds[i].revents & POLLIN) _acceptNewClient(fd);
             if (pollfds[i].revents & (POLLERR | POLLNVAL))
                 std::cerr << "[fatal] listen fd " << fd << " went bad" << std::endl;
+            continue;
+        }
+
+        // CGI pipe. Checked before the client branch because these fds are not
+        // in `clients` at all — POLLHUP is normal here (it is how a finished
+        // script announces itself) and must reach the read path, which drains
+        // the remaining bytes and only then treats the read of 0 as EOF.
+        std::map<int, int>::iterator cgi_link = cgi_fd_to_client_fd.find(fd);
+        if (cgi_link != cgi_fd_to_client_fd.end()) {
+            // The map says WHICH client owns this fd; the client says which of
+            // its two pipe ends it is. One source of truth for ownership and no
+            // direction tag to keep in sync — and it matters: routing a POLLOUT
+            // on the write end into the read path would read() a write-only fd,
+            // get -1, and take the script-failed branch. A self-inflicted 502
+            // on every POST, wearing the costume of a script bug.
+            std::map<int, Client*>::iterator owner = clients.find(cgi_link->second);
+            if (owner == clients.end()) { continue; }
+            Client* c = owner->second;
+
+            if (fd == c->cgi_stdin_fd) {
+                if (pollfds[i].revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL))
+                    _handleCgiStdinWrite(c);   // HUP/ERR handled as the -1 case
+            } else if (pollfds[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+                _handleCgiPipeRead(fd);
+            }
             continue;
         }
 
@@ -375,6 +451,10 @@ static const size_t MAX_HEADER_BYTES = 8192;
 static const time_t IDLE_TIMEOUT_SEC    = 60;
 static const time_t REQUEST_TIMEOUT_SEC = 30;
 static const time_t SEND_STALL_SEC      = 30;
+// A script gets this long from fork() to being fully done. Its OWN clock: a
+// client waiting on a script is neither idle nor late, so the other timers
+// deliberately skip it — which means without this one nothing bounds it at all.
+static const time_t CGI_TIMEOUT_SEC     = 30;
 
 static std::string reasonPhrase(int code) {
     switch (code) {
@@ -382,7 +462,9 @@ static std::string reasonPhrase(int code) {
         case 408: return "Request Timeout";
         case 413: return "Content Too Large";
         case 431: return "Request Header Fields Too Large";
+        case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
+        case 505: return "HTTP Version Not Supported";
         default:  return "Error";
     }
 }
@@ -392,23 +474,6 @@ static std::string toLowerCopy(const std::string& s) {
     for (size_t i = 0; i < out.size(); ++i)
         out[i] = static_cast<char>(tolower(static_cast<unsigned char>(out[i])));
     return out;
-}
-
-// Some failures make the byte stream itself untrustworthy: after a malformed
-// request we do not know where it ended, and after a timeout or a size cap
-// there is unread garbage still queued. Reusing such a connection would frame
-// the NEXT request out of leftovers. 501 is not in that class — it is a normal
-// answer to a well-formed request, so the connection may persist.
-static bool statusForcesClose(int code) {
-    switch (code) {
-        case 400:   // framing unknown
-        case 408:   // we gave up mid-request
-        case 413:   // body cut short by the cap
-        case 431:   // headers cut short by the cap
-            return true;
-        default:
-            return false;
-    }
 }
 
 // RFC 9112 §9.3. HTTP/1.1 is persistent unless told otherwise; HTTP/1.0 is the
@@ -423,13 +488,23 @@ static bool requestWantsKeepAlive(const HttpRequest& request) {
     if (value.find("close") != std::string::npos)
         return false;
     if (request.version == "HTTP/1.0")
-        return value.find("keep-alive") != std::string::npos;
+        return (value.find("keep-alive") != std::string::npos);
     return true;                                   // HTTP/1.1 default
 }
 
-void Server::_startErrorResponse(Client* client, int status_code) {
+// `framing` is required rather than inferred from status_code. Whether the
+// connection survives depends on whether we still know where this request
+// ended — which the caller knows and the status number does not. The old
+// version kept a hardcoded list (400/408/413/431/505) that happened to be
+// right at every call site; the failure mode was that a NEW pre-parse
+// rejection (a 414 for an over-long request line, say) would default to
+// "reusable", leaving a desynced connection open. That corrupts every
+// subsequent request on it, and only shows up under pipelining plus malformed
+// input — i.e. never in a simple test.
+void Server::_startErrorResponse(Client* client, int status_code,
+                                 FramingState framing) {
     const std::string reason = reasonPhrase(status_code);
-    client->keep_alive = !statusForcesClose(status_code) &&
+    client->keep_alive = (framing == FRAMING_INTACT) &&
                          requestWantsKeepAlive(client->request);
 
     std::string body;
@@ -479,18 +554,50 @@ bool Server::_enforceReadLimits(Client* client) {
     if (client->request.state != READING_BODY &&
         client->request.state != COMPLETE &&
         received > MAX_HEADER_BYTES) {
-        _startErrorResponse(client, 431);
+        // Header section never closed, so we have no idea where this
+        // request ends. Stream is unusable.
+        _startErrorResponse(client, 431, FRAMING_LOST);
         return false;
     }
 
-    // Body cap comes from config. server_cfg is bound at accept() time from the
-    // listening socket's server block; once Host-header selection lands this
-    // should be re-resolved before the body is read.
+    // Body cap comes from config. Callers must run _resolveServerConfig() first
+    // so this is the cap of the vhost the Host header actually named, not the
+    // default server's — see the ordering note in _advanceRequest().
     if (client->server_cfg) {
-        const size_t max_total =
-            MAX_HEADER_BYTES + client->server_cfg->client_max_body_size;
+        // A location may override the server's cap. Until now that override was
+        // parsed, inherited and then never read: this function only ever looked
+        // at the server value, so `client_max_body_size` inside a location block
+        // was dead config — a location asking for 10M under a 1M server still
+        // got 1M, silently. See config/bodysize-case-{a,b,c}.conf, which pin
+        // that behaviour (case C is case A minus the override and behaves
+        // identically, which is what proves the override did nothing).
+        //
+        // Resolved through the same Router::match() the Dispatcher uses, so the
+        // limit enforced here belongs to the location that will actually serve
+        // the request. Using a different matcher would let a request be admitted
+        // under one location's cap and then served by another.
+        size_t cap = client->server_cfg->client_max_body_size;
+        if (!client->request.uri.empty()) {
+            // uri is empty until the request line is parsed; the server cap
+            // covers that window, and it is not a real gap — the 431 check above
+            // owns everything before the header section closes.
+            const LocationConfig* loc =
+                Router::match(client->request.uri, *client->server_cfg);
+            if (loc)
+                cap = loc->client_max_body_size;
+            // No match falls back to the server cap deliberately. Dispatcher
+            // answers 404 for such a URI, but that happens only at COMPLETE, so
+            // the read path still needs a bound to stop an unmatched path from
+            // streaming bytes at us forever.
+        }
+
+        const size_t max_total = MAX_HEADER_BYTES + cap;
         if (received > max_total) {
-            _startErrorResponse(client, 413);
+            // We return before erasing `consumed`, and the client is very
+            // likely still sending body bytes we will never read. Even
+            // when the parser reached COMPLETE, the boundary is not acted
+            // on, so treat the stream as lost.
+            _startErrorResponse(client, 413, FRAMING_LOST);
             return false;
         }
     }
@@ -544,13 +651,140 @@ void Server::_resolveServerConfig(Client* client) {
     }
 }
 
+// Integration seam. Reached only for a request the parser called COMPLETE,
+// exactly once per request. Sequences the response pipeline and nothing else:
+// Dispatcher decides WHAT to answer (Router::match -> handler -> error body),
+// ResponseBuilder decides how it looks on the wire. Neither knows about
+// sockets, and this function knows about neither routing nor HTTP syntax.
 void Server::_processRequest(Client* client) {
-    // Integration seam. Reached only for a request the parser called COMPLETE,
-    // exactly once per request. Dispatcher.hpp is still empty, so until it has
-    // an interface this answers honestly rather than faking a 200.
-    // TODO: Router::match() -> Dispatcher -> HttpResponse -> serialise to output_buf.
-    _startErrorResponse(client, 501);
+    // _resolveServerConfig() runs at the end of the header section and always
+    // installs candidates[0] when the listening socket has any server block, so
+    // a null here means the fd->server map was empty — a config/bind bug, not
+    // anything the client did. 500 via the legacy path, which needs no config.
+    if (!client->server_cfg) {
+        // Post-parse: the request was framed correctly and this is our
+        // own config bug, so the connection is still perfectly usable.
+        _startErrorResponse(client, 500, FRAMING_INTACT);
+        return;
+    }
+
+    // Decided here rather than further down, because the CGI branch below
+    // returns before ever reaching that point — leaving keep_alive at its
+    // constructed false and closing the connection after every script. The
+    // value is a property of the REQUEST, so it is knowable this early; what
+    // the response does with it still differs per path (see the framing note
+    // above the non-CGI assignment).
+    client->keep_alive = requestWantsKeepAlive(client->request);
+
+    // CGI is decided BEFORE Dispatcher, because a script's output never becomes
+    // an HttpResponse: it streams from the pipe to the socket, so there is no
+    // body for Dispatcher to build or for ResponseBuilder to serialise. Routing
+    // still comes from the same Router::match() everything else uses — this
+    // only asks whether the matched location declared a handler for this URI's
+    // extension.
+    {
+        const LocationConfig* loc =
+            Router::match(client->request.uri, *client->server_cfg);
+        if (loc) {
+            std::string script_name, path_info;
+            const std::string interpreter =
+                _cgiSplitPath(client->request.uri, *loc, script_name, path_info);
+            if (!interpreter.empty()) {
+                std::string script_path;
+                // Resolve the SCRIPT part only. PATH_INFO is data for the
+                // script, not filesystem path — resolving the whole URI would
+                // look for a file at /cgi-bin/x.py/extra and 404 every request
+                // that carries extra path.
+                if (!FileUtils::is_path_safe(client->request.uri) ||
+                    !FileUtils::resolve_path(loc->root, script_name, script_path)) {
+                    _startErrorResponse(client, 403, FRAMING_INTACT);
+                    return;
+                }
+                // V8 preflight. Runs here, before _startCgi creates a single
+                // pipe, so a rejected request costs no fds and no fork.
+                struct stat st;
+                if (stat(script_path.c_str(), &st) != 0) {
+                    _startErrorResponse(client, 404, FRAMING_INTACT);
+                    return;
+                }
+                if (!S_ISREG(st.st_mode)) {
+                    // Closes the directory-named-`.sh` hole: without this a
+                    // directory matching a cgi_extension would be handed to
+                    // execve, which fails in the child and surfaces as a
+                    // baffling 502 instead of an honest 403.
+                    _startErrorResponse(client, 403, FRAMING_INTACT);
+                    return;
+                }
+                // R_OK, not X_OK: an interpreter is always named by
+                // cgi_extension and IT opens the file, so the script needs to
+                // be readable, not executable. Demanding X_OK here would 403
+                // every .py sitting at the usual mode 644 while being perfectly
+                // runnable. (A direct-exec configuration, where the handler IS
+                // the script, would need X_OK — we have no such config form.)
+                if (access(script_path.c_str(), R_OK) != 0) {
+                    _startErrorResponse(client, 403, FRAMING_INTACT);
+                    return;
+                }
+                // _startCgi queues its own error response on failure.
+                _startCgi(client, interpreter, script_path, script_name, path_info);
+                return;
+            }
+        }
+    }
+
+    const HttpResponse response =
+        Dispatcher::dispatch(client->request, *client->server_cfg);
+
+    // Unlike the _startErrorResponse path, this one does not go through
+    // FramingState at all — it is the FRAMING_INTACT case by construction, so
+    // there is nothing for a caller to declare. That enum exists for replies
+    // sent when framing is unknown (a malformed request, a timeout, a body cut
+    // off by the cap) — reusing the connection would then frame the next
+    // request out of garbage. None of that applies to a dispatched response:
+    // the parser reported COMPLETE and
+    // _advanceRequest() erased exactly `consumed` bytes, so whatever remains in
+    // input_buf is a clean request boundary. A 404 or 405 is a normal answer to
+    // a well-formed request and must not cost the client its connection.
+    // THE RULE: keep-alive requires a well-framed request AND a self-delimiting
+    // response. This line asks only the request, which is a real gap — being
+    // able to reuse a connection depends on the peer finding the end of the
+    // body without waiting for FIN, and that is a property of the response.
+    //
+    // It is sound today only because ResponseBuilder::build() emits
+    // Content-Length unconditionally (ResponseBuilder.cpp:39), computed from
+    // response.body.size(), so every response we can currently produce is
+    // self-delimiting. _startErrorResponse does the same by hand.
+    //
+    // WHEN CGI LANDS THIS MUST CHANGE. The subject allows a CGI to return no
+    // Content-Length, in which case EOF delimits the body and the response is
+    // framed by close; marking it keep-alive would make the client hang waiting
+    // for a terminator that never comes, or frame the next response out of the
+    // CGI's trailing bytes.
+    //
+    // Note for whoever does it: the fix is NOT to inspect
+    // response.headers["Content-Length"] here. build() deliberately skips the
+    // handler's copy of that key (ResponseBuilder.cpp:32) and substitutes its
+    // own, so the map is not what goes on the wire. HttpResponse currently has
+    // no way to express "body framed by EOF" at all — that concept has to exist
+    // before the check can mean anything, which is why it is not being faked
+    // now.
+    //
+    // keep_alive was already computed at the top of this function so the CGI
+    // path could see it; this is where the rule it has to satisfy is written
+    // down, because this is the path where the response framing is decided.
+
+    const std::string wire = ResponseBuilder::build(response, client->keep_alive);
+    client->output_buf.assign(wire.begin(), wire.end()); // why assign and not another alternative, if there are even
+    client->beginSending();
+
+    // Same bookkeeping as _startErrorResponse: the request is fully consumed,
+    // so stop its deadline clock, and give the response a full idle window to
+    // drain before the reaper could consider the connection quiet.
+    client->request_start = 0;
+    client->last_activity = std::time(NULL);
 }
+
+
 void Server::_handleClientRead(int client_fd) {
     std::map<int, Client*>::iterator it = clients.find(client_fd);
     if (it == clients.end()) return;
@@ -579,7 +813,9 @@ void Server::_handleClientRead(int client_fd) {
         return;
     }
 
-    client->input_buf.insert(client->input_buf.end(), buffer, buffer + n);
+    // append(ptr, n), not append(ptr): the length-counted overload. A body may
+    // contain NUL bytes and must not be truncated at the first one.
+    client->input_buf.append(buffer, static_cast<size_t>(n));
     client->last_activity = std::time(NULL); // keep the connection alive
 
     // Start the request clock on the first byte of a new request only. Not
@@ -588,8 +824,9 @@ void Server::_handleClientRead(int client_fd) {
     if (client->request_start == 0)
         client->request_start = client->last_activity;
 
-    if (!_enforceReadLimits(client)) return; // error already framed into output_buf
-
+    // Limits are NOT checked here. Both of them depend on facts only the parser
+    // can produce — which phase we are in, and which vhost's cap applies — so
+    // they live inside _advanceRequest(), after parse(). See the note there.
     _advanceRequest(client);
 }
 
@@ -604,12 +841,26 @@ void Server::_advanceRequest(Client* client) {
     // Feed the parser. It owns every framing decision; this function only
     // supplies bytes. The parser is restartable, so handing it the whole
     // accumulated buffer each time is idempotent.
-    const std::string bytes(client->input_buf.begin(), client->input_buf.end());
+    //
+    // input_buf is passed by reference, NOT copied. It used to be a
+    // vector<char> rebuilt into a std::string here on every recv — an O(n) copy
+    // per call over a buffer that grows by 4 KB each time, i.e. O(n^2) to read a
+    // body. Re-parsing from byte zero is NOT the expensive part and never was:
+    // for a Content-Length body the parser re-reads the header block (fixed
+    // cost) and then returns on `size() - body_start < expected` without
+    // rescanning the body. Measured at 2 MB, the copy was 0.405s and parse()
+    // 0.0031s. Matching input_buf's type to the parser's parameter deleted the
+    // copy outright; keep them the same type.
     size_t consumed = 0; // bytes this request used; valid once COMPLETE
-    client->parser.parse(bytes, client->request, consumed);
+    client->parser.parse(client->input_buf, client->request, consumed);
 
     if (client->request.state == ERROR) {
-        _startErrorResponse(client, 400);
+        // Use the code the parser chose, not a blanket 400. parse() seeds
+        // request.status to 400 before doing anything, so every rejection has a
+        // usable code and this can never read an uninitialised field; the
+        // request-line check overwrites it with 505 for a version we do not
+        // speak. Hardcoding 400 here is what made 505 unreachable.
+        _startErrorResponse(client, client->request.status, FRAMING_LOST);
         return;
     }
 
@@ -620,6 +871,38 @@ void Server::_advanceRequest(Client* client) {
     if (client->request.state == READING_BODY || client->request.state == COMPLETE)
         _resolveServerConfig(client);
 
+    // Limits go HERE, not in _handleClientRead, and the ordering is the whole
+    // point. Both checks consume parser output: the 431 check reads
+    // request.state to know whether the bytes so far are headers or body, and
+    // the 413 check reads server_cfg->client_max_body_size — a value that only
+    // exists once the Host header has been parsed and _resolveServerConfig has
+    // run, four lines up. Running them before parse() meant judging this recv
+    // against the PREVIOUS recv's state and against the default server's cap.
+    //
+    // Two concrete failures came out of that ordering:
+    //
+    //   431 — on the recv that finally completes the header section, the stale
+    //   state still said READING_HEADERS, so body bytes were counted against
+    //   MAX_HEADER_BYTES. A request with ~8 KB of headers (fat cookies, a long
+    //   Referer) plus any body got a spurious 431 and lost its connection.
+    //
+    //   413 — on the first recv of a connection, server_cfg is still whatever
+    //   accept() installed (candidates[0], the default server), so the default
+    //   vhost's cap was enforced against a request destined for a different
+    //   vhost entirely.
+    //
+    // The 413 case could not actually fire, and it is worth being precise about
+    // why: the trigger is received > MAX_HEADER_BYTES + cap, and one recv can
+    // add at most READ_CHUNK bytes. With READ_CHUNK (4096) < MAX_HEADER_BYTES
+    // (8192), input_buf cannot reach the trigger during the single recv where
+    // the config is stale. That is a bug held shut by an accidental ratio
+    // between two constants that nothing relates and nobody documented —
+    // raising READ_CHUNK to 65536 for fewer syscalls, a change with no apparent
+    // connection to virtual hosting, would have armed it. Ordering the checks
+    // correctly removes the dependency on that coincidence instead of
+    // preserving it.
+    if (!_enforceReadLimits(client)) return; // error already framed into output_buf
+
     // The gate. A partial request stops here and waits for the next POLLIN —
     // this is what makes a request split across TCP segments produce one
     // response instead of one per segment.
@@ -628,8 +911,7 @@ void Server::_advanceRequest(Client* client) {
     // Drop exactly this request's bytes; everything after them is the start of
     // the next pipelined request and must survive. The parsed request holds its
     // own copies, so the raw bytes are no longer needed.
-    client->input_buf.erase(client->input_buf.begin(),
-                            client->input_buf.begin() + consumed);
+    client->input_buf.erase(0, consumed);
 
     client->request_start = 0;               // request landed; stop its clock
     client->state = Client::PROCESSING;
@@ -665,29 +947,675 @@ void Server::_handleClientWrite(int client_fd) {
     }
 
     if (client->bytes_sent >= client->output_buf.size()) {
-        if (client->keep_alive) {
-            // Recycle instead of destroy. state goes back to READING, which is
-            // what makes _rebuildPollFds ask for POLLIN again — the event mask
-            // follows the state machine, so a connection can cycle
-            // READING -> SENDING -> READING indefinitely.
-            std::cout << "Response sent to client " << client_fd << ", keeping connection alive" << std::endl;
-            client->resetForNextRequest();
-            // A pipelined next request may already be sitting in input_buf —
-            // its bytes arrived while we were SENDING, so its POLLIN is long
-            // gone and recv() will never be our trigger. Parse it now.
-            if (!client->input_buf.empty()) {
-                client->request_start = std::time(NULL); // deadline clock restarts
-                _advanceRequest(client);
-            }
-        } else {
-            std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
-            _removeClient(client_fd);
+        // Drained is NOT the same as finished. While a CGI script is still
+        // running, an empty buffer only means it has not printed the next piece
+        // yet — recycling or closing here would truncate the response at its
+        // first pause. response_complete is the authority; it is set the moment
+        // the response is framed for ordinary replies, and only at pipe EOF for
+        // a streamed one.
+        if (!client->response_complete) {
+            // Compact: drop what has already been sent so a long stream does not
+            // grow output_buf without bound. Done here, where the buffer is
+            // exactly empty, so it costs nothing and never moves live bytes.
+            client->output_buf.clear();
+            client->bytes_sent = 0;
+            return;
         }
+
+        _finishResponse(client_fd);
     }
 }
+
+// Recycle or close, once the response is both complete and fully drained.
+//
+// Extracted because _handleClientWrite is NOT the only way to arrive here. It
+// runs on POLLOUT, and POLLOUT is only requested while unsent bytes remain — so
+// a response that completes with its buffer ALREADY empty never gets another
+// write event, and without this call from the CGI EOF path the connection would
+// sit open until a timer reaped it. A close-delimited CGI response hits that
+// exact case: it has no terminating chunk to queue, so the last byte is often
+// long gone by the time the script exits.
+void Server::_finishResponse(int client_fd) {
+    std::map<int, Client*>::iterator it = clients.find(client_fd);
+    if (it == clients.end()) return;
+    Client* client = it->second;
+
+    if (client->keep_alive) {
+        // Recycle instead of destroy. state goes back to READING, which is
+        // what makes _rebuildPollFds ask for POLLIN again — the event mask
+        // follows the state machine, so a connection can cycle
+        // READING -> SENDING -> READING indefinitely.
+        std::cout << "Response sent to client " << client_fd << ", keeping connection alive" << std::endl;
+        client->resetForNextRequest();
+        // A pipelined next request may already be sitting in input_buf —
+        // its bytes arrived while we were SENDING, so its POLLIN is long
+        // gone and recv() will never be our trigger. Parse it now.
+        //
+        // Only reachable on a keep-alive connection, which is what keeps the
+        // close-delimited case correct: such a response forces keep_alive off
+        // when its headers are framed, so we take the branch below and the
+        // leftover bytes die with the connection — as they must, since the peer
+        // was told the connection ends here.
+        if (!client->input_buf.empty()) {
+            client->request_start = std::time(NULL); // deadline clock restarts
+            _advanceRequest(client);
+        }
+    } else {
+        std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
+        _removeClient(client_fd);
+    }
+}
+// ---------------------------------------------------------------------------
+// CGI: run a script and stream its stdout to the client as it is produced.
+//
+// The whole point of streaming is that the script's output NEVER accumulates in
+// full anywhere. Only the header block is buffered (it must be complete before
+// anything can be framed); every body byte is wrapped in a chunk and appended
+// to output_buf the moment it is read.
+//
+// That is also why the response is chunked rather than length-delimited: the
+// length cannot be known until the script exits, and waiting for that is
+// exactly the buffering we are avoiding. Chunked carries the size per piece,
+// so the connection survives the response instead of being closed to mark
+// its end.
+// ---------------------------------------------------------------------------
+
+// Does the matched location declare a handler for this URI's extension?
+std::string Server::_cgiSplitPath(const std::string& uri, const LocationConfig& loc,
+                                  std::string& script_name, std::string& path_info) const {
+    script_name.clear();
+    path_info.clear();
+    if (loc.cgi_ext.empty()) return "";
+
+    // Walk segments left to right and stop at the FIRST one whose extension is
+    // configured. Taking the last dot instead would miss /cgi-bin/x.py/extra
+    // entirely — the last dot there sits before the final slash, so the request
+    // would not even register as CGI, and PATH_INFO could never exist.
+    size_t pos = 0;
+    while (pos < uri.size()) {
+        size_t slash = uri.find('/', pos + 1);
+        const std::string segment_end_at =
+            uri.substr(0, (slash == std::string::npos) ? uri.size() : slash);
+
+        const size_t dot = segment_end_at.find_last_of('.');
+        const size_t seg_start = segment_end_at.find_last_of('/');
+        if (dot != std::string::npos &&
+            (seg_start == std::string::npos || dot > seg_start)) {
+            std::map<std::string, std::string>::const_iterator it =
+                loc.cgi_ext.find(segment_end_at.substr(dot));
+            if (it != loc.cgi_ext.end()) {
+                script_name = segment_end_at;
+                path_info   = (slash == std::string::npos) ? "" : uri.substr(slash);
+                return it->second;
+            }
+        }
+        if (slash == std::string::npos) break;
+        pos = slash;
+    }
+    return "";
+}
+
+// CGI/1.1 environment. Subject: "the full request and arguments provided by the
+// client must be available to the CGI."
+std::vector<std::string> Server::_cgiEnv(const Client* client,
+                                         const std::string& script_filename,
+                                         const std::string& script_name,
+                                         const std::string& path_info) const {
+    const HttpRequest& rq = client->request;
+    std::vector<std::string> env;
+
+    env.push_back("GATEWAY_INTERFACE=CGI/1.1");
+    env.push_back("SERVER_SOFTWARE=webserv/1.0");
+    env.push_back("SERVER_PROTOCOL=" + rq.version);
+    env.push_back("REQUEST_METHOD=" + rq.method);
+    env.push_back("SCRIPT_FILENAME=" + script_filename);   // php-cgi reads THIS
+    env.push_back("SCRIPT_NAME=" + script_name);
+    env.push_back("PATH_INFO=" + path_info);               // may be empty, must exist
+    env.push_back("QUERY_STRING=" + rq.query_string);      // raw; decoding is the script's job
+    // remote_address is stored as "ip:port" for logging. REMOTE_ADDR is the
+    // ADDRESS only — leaving the port on it makes scripts that compare against
+    // an allow-list, or hand it to a resolver, silently fail on every request.
+    // The port has its own variable.
+    {
+        const std::string& peer = client->remote_address;
+        const size_t colon = peer.find_last_of(':');
+        if (colon == std::string::npos) {
+            env.push_back("REMOTE_ADDR=" + peer);
+        } else {
+            env.push_back("REMOTE_ADDR=" + peer.substr(0, colon));
+            env.push_back("REMOTE_PORT=" + peer.substr(colon + 1));
+        }
+    }
+    // php-cgi's force-cgi-redirect check refuses to run without this. Harmless
+    // to every other interpreter, so it is set unconditionally.
+    env.push_back("REDIRECT_STATUS=200");
+
+    // Omitted, not zeroed, when there is no body: RFC 3875 section 4.1.2 says
+    // CONTENT_LENGTH is set only when a message body is present. A POST with
+    // Content-Length: 0 lands here too — no body, no variable.
+    if (!rq.body.empty()) {
+        std::ostringstream len;
+        len << rq.body.size();   // DECODED size: the parser un-chunks before this
+        env.push_back("CONTENT_LENGTH=" + len.str());
+    }
+    std::map<std::string, std::string>::const_iterator ct = rq.headers.find("content-type");
+    if (ct != rq.headers.end())
+        env.push_back("CONTENT_TYPE=" + ct->second);
+
+    if (client->server_cfg) {
+        env.push_back("SERVER_NAME=" + (client->server_cfg->server_names.empty()
+                                        ? client->server_cfg->host
+                                        : client->server_cfg->server_names[0]));
+        std::ostringstream port;
+        port << client->server_cfg->port;
+        env.push_back("SERVER_PORT=" + port.str());
+    }
+
+    // HTTP_* : uppercase the name, '-' -> '_', prefix HTTP_.
+    for (std::map<std::string, std::string>::const_iterator it = rq.headers.begin();
+         it != rq.headers.end(); ++it) {
+        const std::string& name = it->first;   // parser stores these lowercased
+
+        // Already carried as dedicated variables; duplicating them as HTTP_* is
+        // spec-noncompliant and confuses picky scripts.
+        if (name == "content-type" || name == "content-length") continue;
+
+        // Hop-by-hop headers describe a connection the script is not on.
+        // Transfer-Encoding additionally describes framing we ALREADY REMOVED:
+        // the body was un-chunked before it reached the pipe, so telling the
+        // script "chunked" would make a conforming one try to de-chunk decoded
+        // bytes and corrupt its own input.
+        if (name == "transfer-encoding" || name == "connection" ||
+            name == "keep-alive" || name == "te" || name == "upgrade") continue;
+
+        // A header name containing '_' would transform into the same variable
+        // as its '-' twin, letting a client shadow or spoof one (X_Evil vs
+        // X-Evil). nginx drops underscore headers by default for this reason.
+        if (name.find('_') != std::string::npos) continue;
+
+        std::string var = "HTTP_";
+        for (size_t i = 0; i < name.size(); ++i) {
+            const char c = name[i];
+            var += (c == '-') ? '_' : static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        env.push_back(var + "=" + it->second);
+    }
+    return env;
+}
+
+bool Server::_startCgi(Client* client, const std::string& interpreter,
+                       const std::string& script_path,
+                       const std::string& script_name,
+                       const std::string& path_info) {
+    // Built BEFORE fork: allocating in the child after fork is asking for
+    // trouble, and this cannot fail in a way the child could report.
+    const std::vector<std::string> env_storage =
+        _cgiEnv(client, script_path, script_name, path_info);
+    int fds[2];                       // script stdout -> us
+    if (pipe(fds) < 0) {
+        _startErrorResponse(client, 500, FRAMING_INTACT);
+        return false;
+    }
+    int in_fds[2];                    // us -> script stdin
+    if (pipe(in_fds) < 0) {
+        // The first pair is already open; leaking it here would burn two fds
+        // per failed CGI until the process hits its limit.
+        close(fds[0]);
+        close(fds[1]);
+        _startErrorResponse(client, 500, FRAMING_INTACT);
+        return false;
+    }
+
+    const pid_t pid = fork();          // fork() is allowed ONLY here (subject:22)
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        close(in_fds[0]);
+        close(in_fds[1]);
+        _startErrorResponse(client, 500, FRAMING_INTACT);
+        return false;
+    }
+
+    if (pid == 0) {
+        // --- child ---
+        // Everything here must end in exec or _exit. Returning would give us a
+        // second copy of the server running its own event loop.
+        close(fds[0]);                       // not reading our own stdout pipe
+        close(in_fds[1]);                    // not writing our own stdin pipe
+        if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(1);
+        if (dup2(in_fds[0], STDIN_FILENO) < 0) _exit(1);
+        close(fds[1]);
+        close(in_fds[0]);
+
+        // Close every socket this fork inherited. NOT hygiene — load-bearing.
+        //
+        // fork() copies the whole descriptor table, so the script (and anything
+        // it spawns) holds a duplicate of the listening socket and of EVERY live
+        // client socket. A connection then stays open as long as any copy does,
+        // so the server closing its own descriptor closes nothing: measured, a
+        // timed-out script was killed correctly, the server closed the client
+        // fd, and curl still hung — because the script's orphaned `sleep`
+        // grandchild was holding fd 4 (listen) and fd 5 (client). The CGI
+        // timeout is unenforceable without this.
+        //
+        // Done by hand rather than with FD_CLOEXEC: the subject's fcntl rule
+        // permits exactly F_SETFL/O_NONBLOCK, and the PDF's mention of
+        // FD_CLOEXEC is self-inconsistent (that flag is F_SETFD). Closing
+        // explicitly needs no ruling from anyone. See SUBJECT_RULES.txt.
+        for (size_t i = 0; i < listening_sockets.size(); ++i)
+            close(listening_sockets[i]);
+        for (std::map<int, Client*>::iterator it = clients.begin();
+             it != clients.end(); ++it) {
+            close(it->first);                        // that client's socket
+            if (it->second->cgi_pipe_fd != -1)
+                close(it->second->cgi_pipe_fd);      // another script's pipe
+            // Other clients' stdin write ends. Holding one open means THAT
+            // script never sees EOF on its stdin and blocks forever waiting for
+            // a body we already finished sending — the same class of bug as the
+            // sockets above, one hop over.
+            if (it->second->cgi_stdin_fd != -1)
+                close(it->second->cgi_stdin_fd);
+        }
+        if (reserve_fd >= 0) close(reserve_fd);
+        close(fds[1]);
+
+        // V7: run the script from its own directory, so relative paths inside
+        // it resolve the way its author meant. Derived from script_path, the
+        // SAME absolute path execve is about to run, so the two cannot
+        // disagree. On failure _exit(1): the parent sees the pipe close with no
+        // header block and answers 502, which is the existing path for a child
+        // that dies before producing output.
+        {
+            const size_t slash = script_path.find_last_of('/');
+            if (slash != std::string::npos && slash > 0) {
+                if (chdir(script_path.substr(0, slash).c_str()) != 0) _exit(1);
+            }
+        }
+
+        char* argv[3];
+        argv[0] = const_cast<char*>(interpreter.c_str());
+        argv[1] = const_cast<char*>(script_path.c_str());
+        argv[2] = NULL;
+
+        // Pointers are taken only now that env_storage is fully built and will
+        // not grow again. Taking them during construction would leave every
+        // pointer dangling after the vector's next reallocation — the classic
+        // version of this bug.
+        std::vector<char*> envp;
+        for (size_t i = 0; i < env_storage.size(); ++i)
+            envp.push_back(const_cast<char*>(env_storage[i].c_str()));
+        envp.push_back(NULL);
+
+        execve(interpreter.c_str(), argv, &envp[0]);
+        _exit(1);                            // exec failed; parent sees EOF
+    }
+
+    // --- parent ---
+    close(fds[1]);                           // we only read the stdout pipe
+    close(in_fds[0]);                        // we only write the stdin pipe
+    _setNonBlocking(fds[0]);
+    _setNonBlocking(in_fds[1]);
+
+    client->cgi_pipe_fd      = fds[0];
+    client->cgi_pid          = pid;
+    client->cgi_start_time   = std::time(NULL);   // starts the CGI clock
+    client->cgi_head_buf.clear();
+    client->cgi_headers_sent = false;
+    client->cgi_body_sent    = 0;
+    cgi_fd_to_client_fd[fds[0]] = client->fd;
+
+    if (client->request.body.empty()) {
+        // No body: close the write end NOW so the child sees EOF immediately.
+        // A GET must not leave a dangling open pipe that its script would sit
+        // waiting on, and no POLLOUT is ever requested for it.
+        close(in_fds[1]);
+        client->cgi_stdin_fd = -1;
+    } else {
+        client->cgi_stdin_fd = in_fds[1];
+        cgi_fd_to_client_fd[in_fds[1]] = client->fd;
+    }
+
+    // Start sending now, with nothing to send yet. beginSending() marks the
+    // response complete because that is true for every other caller; for a
+    // script still running it is exactly false, and the write path depends on
+    // the distinction to avoid ending the response at the first empty buffer.
+    client->beginSending();
+    client->response_complete = false;
+    client->state             = Client::WAITING_FOR_CGI;
+    return true;
+}
+
+void Server::_closeCgiStdin(Client* client) {
+    if (client->cgi_stdin_fd != -1) {
+        cgi_fd_to_client_fd.erase(client->cgi_stdin_fd);
+        close(client->cgi_stdin_fd);
+        client->cgi_stdin_fd = -1;
+    }
+}
+
+void Server::_closeCgiPipe(Client* client) {
+    if (client->cgi_pipe_fd != -1) {
+        cgi_fd_to_client_fd.erase(client->cgi_pipe_fd);
+        close(client->cgi_pipe_fd);
+        client->cgi_pipe_fd = -1;
+    }
+}
+
+// True when the child was collected; `status` is then valid.
+//
+// A pid is cleared ONLY on a successful reap. The previous version discarded
+// waitpid's return and cleared unconditionally, which forgot any child that had
+// closed stdout but not yet exited — a permanent zombie, and trivially
+// reachable since the pipe's EOF and the process's exit are separate events.
+bool Server::_reapCgi(Client* client, int& status) {
+    status = 0;
+    if (client->cgi_pid <= 0) return false;
+
+    // WNOHANG: blocking here would hand a hung script the ability to stop the
+    // entire event loop — the one thing the subject forbids outright.
+    const pid_t r = waitpid(client->cgi_pid, &status, WNOHANG);
+    if (r == client->cgi_pid) {
+        client->cgi_pid = -1;
+        return true;
+    }
+    if (r < 0) {
+        // Already reaped or never ours. Nothing to collect, and keeping the pid
+        // would make the sweep retry forever.
+        client->cgi_pid = -1;
+        return false;
+    }
+    return false;                 // r == 0: still running, keep the pid
+}
+
+// Did the script finish cleanly, or die partway through its output?
+//
+// This is the ONLY signal that separates the two. A script that crashes has its
+// stdout closed by the kernel exactly like one that returns, so the parent sees
+// an identical EOF — reading the pipe can never tell them apart.
+// Judgment call, stated because it is arguable: a nonzero exit counts as
+// failure even when the script printed a COMPLETE body first. CGI never blessed
+// exit codes as protocol, and nginx would neither notice nor care — so this is
+// the stricter reading. Chosen because the alternative is to ignore the only
+// health signal the script gives us, and a response that is whole but whose
+// producer reported failure is not something to certify as fine.
+static bool cgiExitedCleanly(int status) {
+    if (WIFSIGNALED(status)) return false;          // segfault, SIGKILL, ...
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// SIGKILL the child and reap it. Used when we have decided the script is over:
+// a timeout, or a client that died while its script was still running.
+//
+// The waitpid here is BLOCKING, deliberately, and it is the one place in this
+// file where that is defensible: SIGKILL cannot be caught, blocked or ignored,
+// so the child is already dead or dying and the wait is bounded by scheduler
+// latency rather than by anything the script controls. The honest caveat: a
+// child wedged in uninterruptible sleep (D state — a hung NFS read, say) defers
+// even SIGKILL, so the bound assumes it is not stuck in the kernel. Accepted
+// knowingly: the alternative leaks a zombie with no owner left to reap it. The alternative — a
+// WNOHANG that may return 0 and leave the pid behind — is how the client-death
+// path leaks zombies, since after _removeClient there is no Client left to
+// carry the pid and no sweep that could retry.
+//
+// The kill is guarded on `> 0`, not `!= -1`: kill(-1, SIGKILL) signals EVERY
+// process this user may signal, which includes this server and the shell that
+// launched it. -1 is exactly the sentinel these fields hold when idle.
+// Scope note: this kills OUR child, not its descendants. A script that spawned
+// something of its own leaves that grandchild running; it is reparented to init
+// and is no longer ours to account for. So "0 children" after a kill means zero
+// children OF THIS SERVER — an evaluator watching `ps` may still see the
+// grandchild for a moment, correctly.
+void Server::_killCgi(Client* client) {
+    if (client->cgi_pid > 0) {
+        kill(client->cgi_pid, SIGKILL);
+        int status = 0;
+        waitpid(client->cgi_pid, &status, 0);
+        client->cgi_pid = -1;
+    }
+    client->cgi_start_time = 0;
+}
+
+// Full teardown: pipe + child, outcome discarded. For client destruction, where
+// there is nobody left to report to.
+void Server::_closeCgi(Client* client) {
+    // BOTH ends. Missing either leaves a registered fd pointing at a dead child,
+    // which _rebuildPollFds would keep polling forever.
+    _closeCgiPipe(client);
+    _closeCgiStdin(client);
+    _killCgi(client);
+}
+
+// Appends one chunked-encoding piece: <hex size> CRLF <data> CRLF.
+static void appendChunk(std::vector<char>& out, const char* data, size_t n) {
+    if (n == 0) return;                      // a 0-size chunk would mean "end"
+    std::ostringstream head;
+    head << std::hex << n << "\r\n";
+    const std::string h = head.str();
+    out.insert(out.end(), h.begin(), h.end());
+    out.insert(out.end(), data, data + n);
+    out.push_back('\r');
+    out.push_back('\n');
+}
+
+static void appendRaw(std::vector<char>& out, const std::string& s) {
+    out.insert(out.end(), s.begin(), s.end());
+}
+
+// Queues body bytes in whichever framing this response settled on. Every body
+// write goes through here so the chunked/close choice cannot be applied in one
+// place and forgotten in another.
+static void appendBody(Client* client, const char* data, size_t n) {
+    if (n == 0) return;
+    if (client->cgi_chunked)
+        appendChunk(client->output_buf, data, n);
+    else
+        client->output_buf.insert(client->output_buf.end(), data, data + n);
+}
+
+// The chunked terminator, and nothing at all for a close-delimited body — there
+// the close itself is the terminator.
+static void appendBodyEnd(Client* client) {
+    if (client->cgi_chunked)
+        appendRaw(client->output_buf, "0\r\n\r\n");
+}
+
+// Ends a CGI response whose headers already went out.
+//
+// `ok` false means the script died partway through its body. There is no way to
+// retract headers already on the wire, so the response cannot become an error
+// code — the only honest signal left is to make the transfer visibly incomplete:
+//
+//   chunked : withhold the terminating 0-chunk. The peer is waiting for it and
+//             instead gets a closed connection, which every HTTP client reports
+//             as a truncated transfer (curl: "transfer closed with outstanding
+//             read data remaining"). Sending it would assert the half-response
+//             was whole.
+//   close   : the body was already close-delimited, so a clean close is
+//             indistinguishable from success. Nothing better exists; this is a
+//             real limitation of close-delimited framing, not an oversight.
+//
+// Either way keep_alive is forced off. A connection carrying an unterminated
+// body cannot be reused: the next response would be read as a continuation of
+// this one's chunk stream.
+void Server::_finalizeCgi(Client* client, bool ok) {
+    if (ok) {
+        appendBodyEnd(client);
+    } else {
+        std::cerr << "CGI for client " << client->fd
+                  << " died mid-body; withholding the terminator" << std::endl;
+        client->keep_alive = false;
+    }
+
+    client->response_complete = true;
+    client->state = Client::SENDING;
+
+    // MUST BE LAST — _finishResponse() may delete the client. See its header.
+    if (client->bytes_sent >= client->output_buf.size())
+        _finishResponse(client->fd);
+}
+
+// Feed the script its body. One write per POLLOUT, same discipline as the
+// client socket: poll says ready, we write once, we never loop until EAGAIN.
+void Server::_handleCgiStdinWrite(Client* client) {
+    if (client->cgi_stdin_fd == -1) return;
+
+    const std::string& body = client->request.body;
+    const size_t remaining = body.size() - client->cgi_body_sent;
+    if (remaining == 0) { _closeCgiStdin(client); return; }
+
+    const ssize_t n = write(client->cgi_stdin_fd,
+                            body.data() + client->cgi_body_sent, remaining);
+
+    if (n < 0) {
+        // No errno inspection (subject:19). This is NOT an error to abort on:
+        // a script may legally ignore its body and close stdin early, and with
+        // SIGPIPE ignored (Server.cpp:102) that arrives here as -1 rather than
+        // killing us. Stop writing, keep reading stdout — the child may already
+        // have produced a perfectly good answer without reading a byte.
+        _closeCgiStdin(client);
+        return;
+    }
+
+    client->cgi_body_sent += static_cast<size_t>(n);
+
+    if (client->cgi_body_sent >= body.size()) {
+        // THE EOF. A pipe read returns 0 only once every write end is closed,
+        // so this close is the only thing that tells a script reading to EOF
+        // that the body is over. Forget it and every such script hangs until
+        // the CGI timeout kills it — which presents as "the timeout is buggy"
+        // and is actually "we never let go of the pipe".
+        _closeCgiStdin(client);
+    }
+}
+
 void Server::_handleCgiPipeRead(int cgi_fd) {
-    (void)cgi_fd;
-    // TODO: Handle CGI pipe reads
+    std::map<int, int>::iterator link = cgi_fd_to_client_fd.find(cgi_fd);
+    if (link == cgi_fd_to_client_fd.end()) return;
+    std::map<int, Client*>::iterator cit = clients.find(link->second);
+    if (cit == clients.end()) return;
+    Client* client = cit->second;
+
+    char buffer[READ_CHUNK];
+    const ssize_t n = read(cgi_fd, buffer, sizeof(buffer));
+
+    if (n < 0) {
+        // Same rule as every other read in this file: no errno inspection
+        // (subject:19). The read failed, so the body is definitionally
+        // incomplete — finalize as a failure, never with a terminator. The old
+        // version appended one here, which announced a truncated body as whole.
+        _closeCgi(client);
+        if (!client->cgi_headers_sent)
+            _startErrorResponse(client, 502, FRAMING_INTACT);
+        else
+            _finalizeCgi(client, false);
+        return;
+    }
+
+    if (n > 0) {
+        client->last_activity = std::time(NULL);
+
+        if (!client->cgi_headers_sent) {
+            client->cgi_head_buf.append(buffer, static_cast<size_t>(n));
+
+            CgiHeaders head;
+            if (!CgiResponse::parseHead(client->cgi_head_buf, head)) {
+                // Headers still incomplete. A script that never prints a blank
+                // line would otherwise grow this buffer forever, so cap it with
+                // the same limit the request side uses.
+                if (client->cgi_head_buf.size() > MAX_HEADER_BYTES) {
+                    _closeCgi(client);
+                    _startErrorResponse(client, 502, FRAMING_INTACT);
+                }
+                return;                       // read more on the next POLLIN
+            }
+
+            // Header block complete: frame the response ourselves. ResponseBuilder
+            // is not involved — it exists to serialise a fully-built HttpResponse,
+            // and a streamed body never becomes one.
+            std::ostringstream out;
+            out << "HTTP/1.1 " << head.status_code << " "
+                << (head.status_message.empty() ? "OK" : head.status_message) << "\r\n";
+            for (std::map<std::string, std::string>::const_iterator it =
+                     head.headers.begin(); it != head.headers.end(); ++it) {
+                // Drop any length or framing header the script supplied: it
+                // described the script's own output, not our chunked wire form,
+                // and two disagreeing framings is a desynced connection.
+                if (it->first == "Content-Length" || it->first == "Transfer-Encoding" ||
+                    it->first == "Connection")
+                    continue;
+                out << it->first << ": " << it->second << "\r\n";
+            }
+            // FRAMING. Chunked is an HTTP/1.1 feature: 1.0 defines no
+            // Transfer-Encoding, so a 1.0 client would take the hex sizes for
+            // body text. Those responses are delimited by the close instead.
+            //
+            // And a close-delimited body FORCES keep_alive off, overriding what
+            // the request asked for. That override matters here specifically:
+            // requestWantsKeepAlive() honours an HTTP/1.0 request that sent an
+            // explicit `Connection: keep-alive`, so without this a 1.0 client
+            // opting into reuse would get a body whose only terminator is the
+            // close we then refuse to perform — an unterminated response on a
+            // recycled connection. Framing beats preference; the peer cannot
+            // consent to a body it has no way to find the end of.
+            //
+            // This is the one place the decision is made. keep_alive was set at
+            // the top of _processRequest from the request alone; this is the
+            // response half of the same rule, applied before a single body byte
+            // is queued.
+            client->cgi_chunked = (client->request.version == "HTTP/1.1");
+            if (!client->cgi_chunked)
+                client->keep_alive = false;
+
+            if (client->cgi_chunked)
+                out << "Transfer-Encoding: chunked\r\n";
+            out << "Connection: " << (client->keep_alive ? "keep-alive" : "close") << "\r\n"
+                << "\r\n";
+            appendRaw(client->output_buf, out.str());
+            client->cgi_headers_sent = true;
+
+            // Whatever followed the blank line in this same read is already body.
+            if (head.body_offset < client->cgi_head_buf.size()) {
+                appendBody(client,
+                           client->cgi_head_buf.data() + head.body_offset,
+                           client->cgi_head_buf.size() - head.body_offset);
+            }
+            std::string().swap(client->cgi_head_buf);   // release it for good
+        } else {
+            appendBody(client, buffer, static_cast<size_t>(n));
+        }
+        return;
+    }
+
+    // n == 0: EOF. The script is done — this is the ONLY thing that ends the
+    // response, which is why the write path may not infer completion from an
+    // empty buffer.
+    _closeCgiPipe(client);        // the pipe is done; the CHILD may not be
+
+    if (!client->cgi_headers_sent) {
+        // Exited without ever emitting a header block (a failed execve lands
+        // here, since the child _exit()s and we just see the pipe close).
+        // Nothing is on the wire yet, so a real status code is still possible.
+        _closeCgi(client);
+        _startErrorResponse(client, 502, FRAMING_INTACT);
+        return;
+    }
+
+    // Headers are already out, so how this ends depends entirely on HOW the
+    // script finished — and EOF alone cannot say. A crash closes stdout exactly
+    // like a clean return does; only the exit status separates them.
+    int status = 0;
+    if (!_reapCgi(client, status)) {
+        // Not collectable yet: closing stdout and exiting are distinct events,
+        // so the child can outlive its own EOF by a moment. Leave the response
+        // INCOMPLETE and let the sweep in _checkTimeouts() finish it once the
+        // status exists. Deciding now would mean guessing the very thing this
+        // whole path is about.
+        return;
+    }
+
+    // MUST BE THE LAST STATEMENT — _finalizeCgi() may delete the client.
+    _finalizeCgi(client, cgiExitedCleanly(status));
+    return;
 }
 
 void Server::_handleError(int fd) {
@@ -699,6 +1627,11 @@ void Server::_removeClient(int client_fd) {
     std::map<int, Client*>::iterator it = clients.find(client_fd);
     if (it == clients.end()) return;
     Client* c = it->second;
+    // A client can die mid-script (peer hangs up, timeout, error). Without this
+    // the pipe fd stays open and in cgi_fd_to_client_fd pointing at a freed
+    // Client, and the child becomes a zombie — an fd leak and a process leak on
+    // the one path most likely to be exercised by a hostile peer.
+    _closeCgi(c);
     clients.erase(it);
     delete c;
     close(client_fd);
@@ -710,9 +1643,42 @@ void Server::_checkTimeouts() {
     std::vector<int> overdue;   // began a request, never finished it -> 408
     std::vector<int> stalled;   // stopped reading its response -> drop
     std::vector<int> idle;      // said nothing at all -> just drop
+    std::vector<int> awaiting;  // CGI hit EOF but its child was not reapable yet
+    std::vector<int> cgi_late;  // script blew its deadline -> kill it
+
+    const time_t now = std::time(NULL);
 
     for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
         Client* c = it->second;
+
+        // Any live CGI, past its deadline. Checked FIRST and for every CGI
+        // state — still streaming, or parked waiting on a reap — because this
+        // is the only clock that bounds either of them.
+        //
+        // The parked case is why this cannot wait for a later commit. Those
+        // clients are skipped by the idle and stall branches below (they are
+        // mid-response, not late), their pipe is closed so it is out of the
+        // poll set, and their buffer is drained so no POLLOUT is requested.
+        // Nothing else in the server watches them. A script that closes stdout
+        // and then never exits (`exec 1>&-; sleep 9999`) held its connection
+        // FOREVER, which is a hard subject violation — measured: still hung
+        // after 25s, child alive.
+        if (c->cgi_pid > 0 && c->cgi_start_time != 0 &&
+            (now - c->cgi_start_time) >= CGI_TIMEOUT_SEC) {
+            cgi_late.push_back(it->first);
+            continue;
+        }
+
+        // A CGI whose pipe closed while the child was still exiting. Its
+        // response is deliberately parked as incomplete until the exit status
+        // exists, because that status is the only thing separating a finished
+        // script from a crashed one. Retried on every sweep, and now bounded
+        // above by CGI_TIMEOUT_SEC.
+        if (c->cgi_pid > 0 && c->cgi_pipe_fd == -1 &&
+            c->cgi_headers_sent && !c->response_complete) {
+            awaiting.push_back(it->first);
+            continue;   // not idle, not stalled — it is waiting on us
+        }
         // Specific clocks before the general one: a client that is overdue or
         // stalled usually still looks "active" to the idle clock, which is the
         // whole reason each of these needs its own measurement.
@@ -724,6 +1690,35 @@ void Server::_checkTimeouts() {
             idle.push_back(it->first);
     }
 
+    // Killed first: these are the ones actively holding a connection hostage.
+    for (size_t i = 0; i < cgi_late.size(); ++i) {
+        std::map<int, Client*>::iterator it = clients.find(cgi_late[i]);
+        if (it == clients.end()) continue;
+        Client* c = it->second;
+        std::cerr << "CGI for client " << cgi_late[i] << " exceeded "
+                  << CGI_TIMEOUT_SEC << "s, killing it" << std::endl;
+        _closeCgiPipe(c);
+        _killCgi(c);            // SIGKILL + blocking reap; guarded on pid > 0
+
+        // Nothing is on the wire yet -> a real status code is still possible,
+        // and 504 is the one that says "the upstream did not answer in time".
+        // Once headers are out that option is gone, so the only honest ending
+        // left is the truncation signal.
+        if (!c->cgi_headers_sent)
+            _startErrorResponse(c, 504, FRAMING_INTACT);
+        else
+            _finalizeCgi(c, false);   // may delete the client
+    }
+
+    // Before the timeout branches: these clients are mid-response, not late.
+    for (size_t i = 0; i < awaiting.size(); ++i) {
+        std::map<int, Client*>::iterator it = clients.find(awaiting[i]);
+        if (it == clients.end()) continue;
+        int status = 0;
+        if (_reapCgi(it->second, status))
+            _finalizeCgi(it->second, cgiExitedCleanly(status));  // may delete it
+    }
+
     for (size_t i = 0; i < overdue.size(); ++i) {
         std::map<int, Client*>::iterator it = clients.find(overdue[i]);
         if (it == clients.end()) continue;
@@ -731,7 +1726,8 @@ void Server::_checkTimeouts() {
         // Say why rather than dropping silently: a bare RST is indistinguishable
         // from a server crash at the other end. The write handler flushes it and
         // closes on the next POLLOUT.
-        _startErrorResponse(it->second, 408);
+        // Gave up mid-request; the rest of it is still in flight.
+        _startErrorResponse(it->second, 408, FRAMING_LOST);
     }
 
     for (size_t i = 0; i < stalled.size(); ++i) {

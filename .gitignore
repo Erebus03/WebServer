@@ -9,5 +9,7 @@ webserv
 mdFiles/UNDERSTANDING_GUIDE.md
 # Local-only entry point (each teammate keeps their own to avoid merge conflicts)
 .idea/
-
+Makefile
+tests/
+claude_chat
 .mcp.json

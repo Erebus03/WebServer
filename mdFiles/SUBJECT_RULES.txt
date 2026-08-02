@@ -1,6 +1,6 @@
 ===============================================================================
  WEBSERV — SUBJECT RULES & ALLOWED FUNCTIONS  (quick reference)
- Last updated: 2026-07-24
+ Last updated: 2026-08-01
  Purpose: single source of truth for what we may/may not use, and the hard
           architectural rules the evaluator checks. Keep this current.
 ===============================================================================
@@ -58,6 +58,17 @@ NOTE on fcntl: in this project it may be used in EXACTLY one way:
         fcntl(fd, F_SETFL, O_NONBLOCK);
     Any other flag / any other use of fcntl is forbidden.
 
+    KNOWN DISCREPANCY (recorded 2026-08-01, not resolved): the subject PDF
+    lists the allowed flags as "F_SETFL, O_NONBLOCK and FD_CLOEXEC", which
+    would permit close-on-exec. That listing is self-inconsistent — FD_CLOEXEC
+    is set with F_SETFD, not F_SETFL — so an evaluator could reasonably read it
+    either way, and we do not rely on the permissive reading.
+
+    Consequence for CGI: the fd-inheritance problem (a forked child inheriting
+    every listen and client socket) is solved by having the CHILD close them
+    explicitly after fork, which needs no ruling from anyone. Do not introduce
+    FD_CLOEXEC to shortcut this without settling the question first.
+
 Standard C++98 library (iostream, string, vector, map, sstream, fstream,
 algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
 "external library".
@@ -110,10 +121,25 @@ algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
 301 Moved Permanently, 302 Found,
 400 Bad Request, 403 Forbidden, 404 Not Found, 405 Method Not Allowed,
 408 Request Timeout, 413 Content Too Large / Payload Too Large,
-500 Internal Server Error, 501 Not Implemented.
+431 Request Header Fields Too Large,
+500 Internal Server Error, 501 Not Implemented,
+502 Bad Gateway, 504 Gateway Timeout, 505 HTTP Version Not Supported.
+
+  502 — the CGI script produced nothing usable: it exited without emitting a
+        header block, or its pipe failed. Emitted by _handleCgiPipeRead().
+  504 — a CGI script exceeded CGI_TIMEOUT_SEC (30s) and was SIGKILLed before
+        emitting any header. Implemented in 485e110 and measured: a script
+        containing sleep(9999) returns 504 with the server still serving.
+        Once headers are already on the wire a status code can no longer be
+        sent, so a timeout there ends as a withheld terminator instead — the
+        truncation signal, not a code.
+  505 — request line named a version we do not speak. The parser seeds
+        request.status with it; _advanceRequest forwards that code rather
+        than a blanket 400.
+  431 — header section exceeded MAX_HEADER_BYTES before a blank line.
 
 -------------------------------------------------------------------------------
- 5. CURRENT-CODE COMPLIANCE (audit 2026-07-24, branch Anouar)
+ 5. CURRENT-CODE COMPLIANCE (audit 2026-08-01, branch Anouar)
 -------------------------------------------------------------------------------
 RESOLVED (fixed 2026-07-24):
   - inet_pton  -> replaced by static parseIPv4() (dotted-quad -> host order,
@@ -136,6 +162,70 @@ COMPLIANT (good):
   - setsockopt SO_REUSEADDR                 (Server.cpp:111)
   - partial writes tracked via bytes_sent  (Server.cpp:308-323)
   - signal / waitpid available for shutdown + CGI reaping
+
+CGI AUDIT (added 2026-08-01, after dd0b519 + cb302fd)
+COMPLIANT:
+  - one poll() covers listen + client + CGI pipe fds; pipe registered in
+    _rebuildPollFds(), dispatched in _handlePollEvents()
+  - parent's pipe read end non-blocking via the exact allowed fcntl form
+  - no errno inspected after the pipe read; >0 / 0 / <0 only
+  - child ends in execve or _exit(1) — never exit(), never a return
+  - waitpid(WNOHANG) on every path driven by the script's own pace. The ONE
+    deliberate exception is _killCgi(): after SIGKILL it waits blocking, which
+    is safe because SIGKILL cannot be caught or ignored, so the wait is bounded
+    by scheduler latency rather than by the script. WNOHANG there would leave
+    the pid behind on the client-death path, where no Client remains to carry
+    it and no sweep can retry -- a zombie with no owner. Known caveat: a child
+    in uninterruptible sleep (D state) defers even SIGKILL; accepted knowingly
+  - parent closes its copy of the child's write end immediately after fork,
+    so EOF on the read end is reachable at all
+  - POLLHUP is not treated as terminal: the read runs first and only a
+    return of 0 ends the response (avoids truncating fast scripts)
+  - fork() appears exactly once in the codebase, in _startCgi()
+  - interpreter comes from LocationConfig::cgi_ext; nothing hardcoded
+  - framing chosen by request version: 1.1 -> chunked (self-delimiting, may
+    keep-alive), 1.0 -> close-delimited and keep_alive forced false
+
+THIS LIST IS THE LEDGER. A commit that closes an item MUST move it below in the
+SAME commit, and any "what is left" statement anywhere — chat summary, guide,
+message to a teammate — must be READ FROM HERE, never recalled from memory. The
+narrative list has silently dropped open items twice; this file is the fix.
+
+CLOSED (with the commit that closed it):
+  - V1 zombie: cgi_pid was cleared even when waitpid reported the child still
+    running, so that child was never reaped.                        221c97e
+  - truncation signal: a crashed script produced a clean EOF and still got a
+    terminating chunk, announcing a half-response as whole.          221c97e
+  - V2 client death mid-script closed the pipe but never kill()ed.   485e110
+  - V3 no CGI timeout / 504. Worse, the parked-response state was exempt from
+    every timer, so a script that closed stdout without exiting held its
+    connection forever.                                              485e110
+  - V6 child inherited every listen and client socket. NOT hygiene: it made
+    the V3 timeout unenforceable, because an orphaned grandchild kept the
+    client fd open and the server's own close() closed nothing.      485e110
+  - V4 stdin pipe: POST bodies now reach the script, written one POLLOUT at a
+    time and closed on drain (that close IS the child's EOF). Includes the
+    dispatch fix: the reverse map was type-blind, so a POLLOUT on the write
+    end would have been routed to the read path, read() a write-only fd, get
+    -1 and take the script-failed branch — a self-inflicted 502 on every POST
+    wearing the costume of a script bug.                             16b1b9d
+  - V5 CGI/1.1 environment: the full table plus HTTP_* transform, and the
+    URI now splits at the first segment carrying a configured extension so
+    PATH_INFO exists at all.                                         2c1ef3c
+
+  - V7 chdir() into the script's own directory, in the child, derived from
+    the same absolute path execve runs.                              (this commit)
+  - V8 preflight: stat() for existence and regular-file, access(R_OK) for
+    readability, all before a single pipe is created.                (this commit)
+
+  - php-cgi field-proof: REDIRECT_STATUS=200 and the absolute SCRIPT_FILENAME
+    verified against the real binary (PHP 8.1.2, cgi-fcgi). Hello-world 200,
+    $_GET parsed from QUERY_STRING, $_POST parsed from the V4 stdin pipe
+    (21-byte and 100 KB bodies), a script-set `Status: 404` becoming the HTTP
+    status, PATH_INFO tolerated, keep-alive reused, 0 zombies.  (this commit)
+
+OPEN:
+  - (none for CGI)
 
 ===============================================================================
  Source of truth: the official 42 "Webserv" subject PDF. If the evaluation

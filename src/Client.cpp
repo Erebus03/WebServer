@@ -8,7 +8,10 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
     : fd(socket_fd),
       listen_fd(accepted_on),
       cgi_pipe_fd(-1),
+      cgi_stdin_fd(-1),
+      cgi_body_sent(0),
       cgi_pid(-1),
+      cgi_start_time(0),
       remote_address(remote_addr),
       state(READING),
       bytes_sent(0),
@@ -16,6 +19,9 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
       request_start(0),
       last_send_progress(0),
       keep_alive(false),
+      response_complete(false),
+      cgi_headers_sent(false),
+      cgi_chunked(false),
       server_cfg(NULL)
 {
     // HttpRequest is a plain struct with no constructor, so its scalars are
@@ -43,6 +49,11 @@ void Client::beginSending() {
     state = SENDING;
     bytes_sent = 0;
     last_send_progress = std::time(NULL);
+    // Every caller but the CGI one hands us a response that is already complete
+    // in output_buf, so draining it means done. The streaming CGI path calls
+    // this and then clears the flag, because its buffer is still being filled
+    // from the script's pipe.
+    response_complete = true;
 }
 
 void Client::resetForNextRequest() {
@@ -56,6 +67,19 @@ void Client::resetForNextRequest() {
     output_buf.clear();
     bytes_sent = 0;
     last_send_progress = 0;         // not sending any more
+
+    // Response-completion and CGI streaming state. cgi_pipe_fd/cgi_pid are NOT
+    // reset here: the server closes the pipe and reaps the child at EOF and
+    // sets them back to -1 itself, so clearing them here would lose the fd and
+    // leak both the descriptor and a zombie. This only clears what belongs to
+    // the finished response.
+    response_complete = false;
+    cgi_headers_sent = false;
+    cgi_chunked = false;
+    // cgi_start_time, cgi_pipe_fd and cgi_stdin_fd are cleared by the server
+    // as it closes/reaps them — same ownership split as the comment above.
+    cgi_body_sent = 0;
+    cgi_head_buf.clear();
 
     request = HttpRequest();        // drop every header/body of the old request
     request.state = READING_REQUEST_LINE;
