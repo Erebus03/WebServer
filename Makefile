@@ -24,6 +24,7 @@ SRCS = \
 	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
+	src/UrlCodec.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
@@ -48,6 +49,7 @@ INCLUDES = \
 	includes/CgiHandler.hpp \
 	includes/DirectoryLister.hpp \
 	includes/FileUtils.hpp \
+	includes/UrlCodec.hpp \
 
 all: $(NAME)
 
