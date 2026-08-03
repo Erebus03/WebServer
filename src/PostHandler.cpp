@@ -9,8 +9,29 @@
 
 static std::string header_value(const HttpRequest& request, const std::string& name)
 {
-    const std::map<std::string, std::string>::const_iterator it = request.headers.find(name);
-    return (it == request.headers.end()) ? "" : it->second;
+    for (std::map<std::string, std::string>::const_iterator it = request.headers.begin();
+         it != request.headers.end(); ++it)
+    {
+        if (it->first.size() != name.size())
+            continue;
+
+        bool same = true;
+        for (size_t i = 0; i < name.size(); ++i)
+        {
+            const unsigned char stored = static_cast<unsigned char>(it->first[i]);
+            const char folded = (stored >= 'A' && stored <= 'Z')
+                                ? static_cast<char>(stored - 'A' + 'a')
+                                : static_cast<char>(stored);
+            if (folded != name[i])
+            {
+                same = false;
+                break;
+            }
+        }
+        if (same)
+            return it->second;
+    }
+    return "";
 }
 
 bool PostHandler::is_valid_upload_filename(const std::string& name)
@@ -96,6 +117,12 @@ HttpResponse PostHandler::handle(const HttpRequest& request, const LocationConfi
 
         if (FileUtils::file_exists(diskPath))
             return HttpStatus::make_response(409);
+
+        for (size_t j = 0; j < diskPaths.size(); ++j)
+        {
+            if (diskPaths[j] == diskPath)
+                return HttpStatus::make_response(409);
+        }
 
         diskPaths.push_back(diskPath);
         fileParts.push_back(i);

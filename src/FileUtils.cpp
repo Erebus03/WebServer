@@ -32,6 +32,13 @@ bool FileUtils::is_path_safe(const std::string& uri)
     if  (uri.empty())
         return false;
 
+    for (size_t i = 0; i < uri.size(); ++i)
+    {
+        const unsigned char c = static_cast<unsigned char>(uri[i]);
+        if (c < 0x20 || c == 0x7F)
+            return false;
+    }
+
     std::stringstream pathStream(uri);
     std::string component;
 
