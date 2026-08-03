@@ -10,6 +10,12 @@ mdFiles/UNDERSTANDING_GUIDE.md
 # Local-only entry point (each teammate keeps their own to avoid merge conflicts)
 .idea/
 Makefile
-tests/
+# tests/ sources ARE tracked — `make test` is useless if the tests it runs only
+# exist on one machine. Only the built binaries are ignored (no extension, so
+# they have to be listed by name).
+tests/test_config
+tests/test_http_parser
+tests/test_integration
+tests/dump_config
 claude_chat
 .mcp.json

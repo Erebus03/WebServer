@@ -224,7 +224,28 @@ CLOSED (with the commit that closed it):
     (21-byte and 100 KB bodies), a script-set `Status: 404` becoming the HTTP
     status, PATH_INFO tolerated, keep-alive reused, 0 zombies.  (this commit)
 
+  - graceful shutdown: SIGINT/SIGTERM were unhandled, so the process died by
+    default action inside poll() and ~Server() never ran. Proven by valgrind:
+    78,792 bytes still reachable and 2 fds open at exit. Now a handler sets a
+    volatile sig_atomic_t the loop tests, and the destructor calls _closeCgi()
+    per client so no CGI child is orphaned. Re-measured: "All heap blocks were
+    freed -- no leaks are possible", 0 errors, 0 server-owned fds. (this commit)
+
+  - fd-leak + stress audit (evidence, not a fix): 50 concurrent clients for 10 s
+    mixing keep-alive, pipelining, slow-loris, RST mid-body, early close, 1 MB
+    POST and malformed request lines. ~500 connections, server never crashed,
+    fd count 5 before and 5 after, 0 zombies, 200 OK afterwards. Pipelined
+    request 2 verified delivered byte-for-byte.                    (this commit)
+
 OPEN:
+  - HEAD is advertised and unimplemented. config/default.conf:19,50 say
+    `allowed_methods GET HEAD` and Config.cpp:220 accepts HEAD and PUT as valid
+    tokens, but Dispatcher.cpp:56-64 routes only GET/DELETE/POST, so HEAD falls
+    through to 501. Two halves: the routing one-liner is Member C's Dispatcher;
+    the body-suppression half (send headers incl. the GET Content-Length, drop
+    the body) belongs at the single framing point, Server.cpp ResponseBuilder
+    call site. PUT is advertised nowhere, but the parser still accepts it.
+
   - (none for CGI)
 
 ===============================================================================
