@@ -13,6 +13,7 @@ SRCS = \
 	src/HttpStatus.cpp \
 	src/ResponseBuilder.cpp \
 	src/MimeTypes.cpp \
+	src/UrlCodec.cpp \
 	src/MultipartParser.cpp \
 	src/CgiResponse.cpp \
 	src/Client.cpp \
@@ -38,6 +39,7 @@ INCLUDES = \
 	includes/HttpStatus.hpp \
 	includes/ResponseBuilder.hpp \
 	includes/MimeTypes.hpp \
+	includes/UrlCodec.hpp \
 	includes/MultipartParser.hpp \
 	includes/CgiResponse.hpp \
 	includes/DeleteHandler.hpp \
