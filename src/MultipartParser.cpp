@@ -1,20 +1,33 @@
 #include "../includes/MultipartParser.hpp"
 #include <cctype>
 
-// boundary value out of "multipart/form-data; boundary=----XYZ"
+static std::string lower(std::string s)
+{
+    for (size_t i = 0; i < s.size(); ++i)
+        s[i] = static_cast<char>(tolower(static_cast<unsigned char>(s[i])));
+    return s;
+}
+
+// boundary value out of "multipart/form-data; boundary=----XYZ".
+// parameter name is case-insensitive (RFC 2045); the value's case is preserved.
 std::string MultipartParser::boundaryFrom(const std::string& contentType)
 {
-    size_t p = contentType.find("boundary=");
+    size_t p = lower(contentType).find("boundary=");   // find case-insensitively
     if (p == std::string::npos)
         return "";
-    p += 9;                                   // past "boundary="
-    std::string b = contentType.substr(p);
+    p += 9;                                            // past "boundary="
+    std::string b = contentType.substr(p);             // value from the ORIGINAL (case matters)
 
-    if (!b.empty() && b[0] == '"') {          // quoted: boundary="..."
+    size_t lead = b.find_first_not_of(" \t");          // trim leading whitespace
+    if (lead == std::string::npos)
+        return "";
+    b = b.substr(lead);
+
+    if (!b.empty() && b[0] == '"') {                   // quoted: boundary="..."
         size_t end = b.find('"', 1);
         return (end == std::string::npos) ? "" : b.substr(1, end - 1);
     }
-    size_t semi = b.find(';');                // unquoted: runs to ';' or end
+    size_t semi = b.find(';');                         // unquoted: runs to ';' or end
     if (semi != std::string::npos)
         b = b.substr(0, semi);
     while (!b.empty() && (b[b.size() - 1] == ' ' || b[b.size() - 1] == '\t' ||
@@ -41,24 +54,34 @@ static std::string field(const std::string& headers, const std::string& name)
     return "";
 }
 
-// the part's own "Content-Type:" line, if it has one
+// the part's own Content-Type value, if it has one.
+// scans line by line and matches the header NAME (case-insensitive), so a
+// filename like "Content-Type: x" inside another line can't be mistaken for it.
 static std::string partContentType(const std::string& headers)
 {
-    size_t p = headers.find("Content-Type:");
-    if (p == std::string::npos)
-        return "";
-    p += 13;                                  // past "Content-Type:"
-    size_t end = headers.find("\r\n", p);
-    if (end == std::string::npos)
-        end = headers.size();
-    std::string v = headers.substr(p, end - p);
-    size_t s = v.find_first_not_of(" \t");    // trim leading space
-    return (s == std::string::npos) ? "" : v.substr(s);
+    size_t pos = 0;
+    while (pos < headers.size()) {
+        size_t nl = headers.find("\r\n", pos);
+        std::string line = (nl == std::string::npos) ? headers.substr(pos)
+                                                     : headers.substr(pos, nl - pos);
+        size_t colon = line.find(':');
+        if (colon != std::string::npos && lower(line.substr(0, colon)) == "content-type") {
+            std::string v = line.substr(colon + 1);
+            size_t s = v.find_first_not_of(" \t");
+            return (s == std::string::npos) ? "" : v.substr(s);
+        }
+        if (nl == std::string::npos)
+            break;
+        pos = nl + 2;
+    }
+    return "";
 }
 
 bool MultipartParser::parse(const std::string& body, const std::string& boundary,
                             std::vector<MultipartPart>& parts)
 {
+    parts.clear();                                // replace, don't append (matches read_file)
+
     if (boundary.empty())
         return false;
 
