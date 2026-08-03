@@ -81,3 +81,13 @@ bool FileUtils::read_file(const std::string& path, std::string& out)
 
     return true;
 }
+
+bool FileUtils::write_file(const std::string& path, const std::string& data)
+{
+    std::ofstream file(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!file.is_open())
+        return false;
+    file.write(data.data(), data.size());
+    file.close();
+    return file.good();
+}

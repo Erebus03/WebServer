@@ -1,4 +1,5 @@
 #include "../includes/DirectoryLister.hpp"
+#include "../includes/UrlCodec.hpp"
 #include "../includes/FileUtils.hpp"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -21,32 +22,6 @@ std::string DirectoryLister::html_escape(const std::string& raw)
             result += "&quot;";
         else
             result += raw[i];
-    }
-
-    return result;
-}
-
-std::string DirectoryLister::url_encode(const std::string& raw)
-{
-    static const char HEX[] = "0123456789ABCDEF";
-    std::string result;
-
-    for (size_t i = 0; i < raw.size(); i++)
-    {
-        unsigned char c = static_cast<unsigned char>(raw[i]);
-
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') ||
-            c == '-' || c == '.' || c == '_' || c == '~')
-        {
-            result += static_cast<char>(c);
-        }
-        else
-        {
-            result += '%';
-            result += HEX[c >> 4];
-            result += HEX[c & 0x0F];
-        }
     }
 
     return result;
@@ -92,7 +67,7 @@ std::string DirectoryLister::render(const std::string& diskPath, const std::stri
             continue;
 
         std::string name = *it;
-        std::string encodedName = url_encode(*it);
+        std::string encodedName = UrlCodec::encode(*it);
         std::string sizeCol;
 
         if (S_ISDIR(st.st_mode))
