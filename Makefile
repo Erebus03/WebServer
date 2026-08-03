@@ -23,6 +23,7 @@ SRCS = \
 	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
+	src/UrlCodec.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
@@ -46,6 +47,7 @@ INCLUDES = \
 	includes/CgiHandler.hpp \
 	includes/DirectoryLister.hpp \
 	includes/FileUtils.hpp \
+	includes/UrlCodec.hpp \
 
 # Everything except the server's own entry point. Each test brings its own
 # main(), so linking src/main.o too would be a duplicate-symbol error. Linking

@@ -237,7 +237,34 @@ CLOSED (with the commit that closed it):
     fd count 5 before and 5 after, 0 zombies, 200 OK afterwards. Pipelined
     request 2 verified delivered byte-for-byte.                    (this commit)
 
+  - uploads work. PostHandler is no longer a 501 stub (C) and B fixed the
+    MultipartParser bugs C reported. Verified end-to-end against the merged
+    tree: multipart POST -> 201 Created, file on disk byte-identical. 1 MB of
+    /dev/urandom round-trips with a matching md5, a 21-byte payload with an
+    embedded NUL survives, and C's exact off-by-one repro (3 bytes in, 4 out)
+    now stores 3.                                                  (this commit)
+
+  - broken build on main, twice over, fixed while merging:          (this commit)
+      * src/main.cpp had its ENTIRE main() commented out and pushed (fd73305,
+        Aboumata, 2026-08-02) — origin/main produced no `main` symbol at all.
+      * src/UrlCodec.cpp was added without a Makefile entry, so PostHandler and
+        DirectoryLister had undefined references to UrlCodec::encode.
+    Both are now fixed on this branch. See the OPEN entry about main.cpp below:
+    the first one WILL happen again as things stand.
+
 OPEN:
+  - src/main.cpp is tracked but treated as local-only. .gitignore lists it under
+    "each teammate keeps their own to avoid merge conflicts", but git ignores
+    that rule for already-tracked files, so a teammate's local edit is committed
+    like any other. That is exactly how main() got commented out and pushed.
+    Same trap applies to the Makefile, also listed-but-tracked.
+    Fix is a team decision, so it is NOT being made unilaterally here. Either
+    untrack it (`git rm --cached src/main.cpp`) and accept that the repo no
+    longer builds from a clean clone, or drop it from .gitignore and agree that
+    everyone shares one entry point. It cannot stay as it is.
+    A guard that would have caught it regardless: `make test` on the merged tree
+    fails loudly, which is why it now exists.
+
   - HEAD: half done, blocked on Member C for the rest.
     A's half is CLOSED — the framing point suppresses the body while keeping the
     Content-Length the GET would have sent (Server.cpp, ResponseBuilder call
