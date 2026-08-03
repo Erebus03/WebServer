@@ -32,6 +32,10 @@ public:
     // Reads the whole file into out, byte-perfect (binary mode, '\0' safe).
     // Returns false if the file cannot be opened; out is unspecified on failure.
     static bool read_file(const std::string& path, std::string& out);
+
+    // Writes data to path, byte-perfect (binary mode), truncating any existing
+    // file. Returns false if the file cannot be opened for writing.
+    static bool write_file(const std::string& path, const std::string& data);
 };
 
 #endif

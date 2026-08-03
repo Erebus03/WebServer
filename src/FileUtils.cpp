@@ -32,6 +32,13 @@ bool FileUtils::is_path_safe(const std::string& uri)
     if  (uri.empty())
         return false;
 
+    for (size_t i = 0; i < uri.size(); ++i)
+    {
+        const unsigned char c = static_cast<unsigned char>(uri[i]);
+        if (c < 0x20 || c == 0x7F)
+            return false;
+    }
+
     std::stringstream pathStream(uri);
     std::string component;
 
@@ -80,4 +87,14 @@ bool FileUtils::read_file(const std::string& path, std::string& out)
     out = ss.str();
 
     return true;
+}
+
+bool FileUtils::write_file(const std::string& path, const std::string& data)
+{
+    std::ofstream file(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!file.is_open())
+        return false;
+    file.write(data.data(), data.size());
+    file.close();
+    return file.good();
 }
