@@ -238,13 +238,24 @@ CLOSED (with the commit that closed it):
     request 2 verified delivered byte-for-byte.                    (this commit)
 
 OPEN:
-  - HEAD is advertised and unimplemented. config/default.conf:19,50 say
-    `allowed_methods GET HEAD` and Config.cpp:220 accepts HEAD and PUT as valid
-    tokens, but Dispatcher.cpp:56-64 routes only GET/DELETE/POST, so HEAD falls
-    through to 501. Two halves: the routing one-liner is Member C's Dispatcher;
-    the body-suppression half (send headers incl. the GET Content-Length, drop
-    the body) belongs at the single framing point, Server.cpp ResponseBuilder
-    call site. PUT is advertised nowhere, but the parser still accepts it.
+  - HEAD: half done, blocked on Member C for the rest.
+    A's half is CLOSED — the framing point suppresses the body while keeping the
+    Content-Length the GET would have sent (Server.cpp, ResponseBuilder call
+    site). Verified live: `HEAD /` returns Content-Length: 101 with 0 body
+    bytes, GET unaffected.
+    C's half is OPEN — Dispatcher.cpp:56-64 routes only GET/DELETE/POST, so
+    HEAD still falls through to 501. One line: route HEAD to GetHandler, i.e.
+    `if (request.method == "GET" || request.method == "HEAD")`. The allow-list
+    check above it must keep seeing the real method, so this cannot be done by
+    rewriting HEAD->GET before dispatch — a location that permits GET but not
+    HEAD has to stay a 405.
+    FALLBACK if it does not land before the defense: drop HEAD from
+    config/default.conf:19,50 rather than ship a config that advertises a
+    method we answer 501 to. HEAD is not required by the subject.
+
+  - PUT is accepted by Config.cpp:220 as a valid allowed_methods token but is
+    advertised in no config and implemented nowhere. Same 501 trap as HEAD if
+    an evaluator writes it into their own config.
 
   - (none for CGI)
 

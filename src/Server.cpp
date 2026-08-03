@@ -821,7 +821,27 @@ void Server::_processRequest(Client* client) {
     // path could see it; this is where the rule it has to satisfy is written
     // down, because this is the path where the response framing is decided.
 
-    const std::string wire = ResponseBuilder::build(response, client->keep_alive);
+    std::string wire = ResponseBuilder::build(response, client->keep_alive);
+
+    // HEAD: identical headers to the GET, then not one byte of body. RFC 7231
+    // §4.3.2 is explicit that Content-Length must still be the length the GET
+    // *would* have sent, so this truncates the wire after the blank line and
+    // deliberately does NOT recompute the header — a HEAD answering 0 where GET
+    // says 1024 is the classic way to break every client that uses HEAD to size
+    // a download before fetching it.
+    //
+    // Suppression lives here, at the one place a response becomes bytes, rather
+    // than in each handler: a handler that forgot would leak a body, and there
+    // is no way to forget a step that only exists once. Routing HEAD to the GET
+    // handler is the other half and belongs to Dispatcher (Member C) — until
+    // that lands, HEAD is answered 501 and never reaches this line, so this is
+    // inert rather than wrong.
+    if (client->request.method == "HEAD") {
+        const std::string::size_type head_end = wire.find("\r\n\r\n");
+        if (head_end != std::string::npos)
+            wire.erase(head_end + 4);
+    }
+
     client->output_buf.assign(wire.begin(), wire.end()); // why assign and not another alternative, if there are even
     client->beginSending();
 
