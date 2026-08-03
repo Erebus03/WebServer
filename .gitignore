@@ -17,5 +17,9 @@ tests/test_config
 tests/test_http_parser
 tests/test_integration
 tests/dump_config
+# Scratch binaries built by hand at the repo root. rb_test (a 55 KB ELF) was
+# committed once already; this stops the next one.
+rb_test
+a.out
 claude_chat
 .mcp.json

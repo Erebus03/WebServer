@@ -13,6 +13,7 @@ SRCS = \
 	src/HttpStatus.cpp \
 	src/ResponseBuilder.cpp \
 	src/MimeTypes.cpp \
+	src/UrlCodec.cpp \
 	src/MultipartParser.cpp \
 	src/CgiResponse.cpp \
 	src/Client.cpp \
@@ -23,7 +24,6 @@ SRCS = \
 	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
-	src/UrlCodec.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
@@ -39,6 +39,7 @@ INCLUDES = \
 	includes/HttpStatus.hpp \
 	includes/ResponseBuilder.hpp \
 	includes/MimeTypes.hpp \
+	includes/UrlCodec.hpp \
 	includes/MultipartParser.hpp \
 	includes/CgiResponse.hpp \
 	includes/DeleteHandler.hpp \
@@ -47,7 +48,6 @@ INCLUDES = \
 	includes/CgiHandler.hpp \
 	includes/DirectoryLister.hpp \
 	includes/FileUtils.hpp \
-	includes/UrlCodec.hpp \
 
 # Everything except the server's own entry point. Each test brings its own
 # main(), so linking src/main.o too would be a duplicate-symbol error. Linking

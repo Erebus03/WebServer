@@ -253,6 +253,18 @@ CLOSED (with the commit that closed it):
     the first one WILL happen again as things stand.
 
 OPEN:
+  - HttpParser accepts whitespace before the colon. `Content-Length : 5` parses
+    as a valid Content-Length and the request answers 200. RFC 7230 §3.2.4 says
+    a server MUST reject it, and the reason is the same one behind the CL+TE
+    rejection the parser already does: if a proxy in front of us disagrees about
+    whether that line is a header, the gap is a request-smuggling primitive.
+    B's file (C reported it; B fixed the other three findings but not this one).
+    Verified still open against the merged tree on 2026-08-04.
+    The other three are CLOSED and confirmed by probe: conflicting duplicate
+    Content-Length -> 400, empty header name -> 400, CL+TE together -> 400,
+    and an IDENTICAL duplicate Content-Length is still accepted (correct — the
+    RFC only bars conflicting values).
+
   - src/main.cpp is tracked but treated as local-only. .gitignore lists it under
     "each teammate keeps their own to avoid merge conflicts", but git ignores
     that rule for already-tracked files, so a teammate's local edit is committed

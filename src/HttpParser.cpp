@@ -170,6 +170,9 @@ bool HttpParser::parseRequestLine(const std::string& line, HttpRequest& request)
 bool HttpParser::parseHeaders(const std::string& bytes, size_t start, size_t end,
                               HttpRequest& request) const
 {
+    bool seen_cl = false;              // track Content-Length WITHIN this block
+    std::string cl_value;              // (a local counter, not the map, so re-parsing
+                                       //  the same buffer across recvs never false-flags)
     size_t pos = start;
     while (pos < end) {
         size_t line_end = bytes.find("\r\n", pos);
@@ -180,8 +183,16 @@ bool HttpParser::parseHeaders(const std::string& bytes, size_t start, size_t end
         std::string name, value;
         if (!parseHeaderLine(line, name, value))
             return false;
-        request.headers[name] = value;
 
+        // two Content-Length headers with different values = smuggling -> reject
+        if (name == "content-length") {
+            if (seen_cl && value != cl_value)
+                return false;
+            seen_cl = true;
+            cl_value = value;
+        }
+
+        request.headers[name] = value;
         pos = line_end + 2;
     }
     return true;
@@ -194,7 +205,9 @@ bool HttpParser::parseHeaderLine(const std::string& line, std::string& name,
     size_t colon = line.find(':');
     if (colon == std::string::npos)
         return false;
-    name  = toLowerCopy(trim(line.substr(0, colon)));
+    name = toLowerCopy(trim(line.substr(0, colon)));
+    if (name.empty())                  // ": value" or an all-whitespace name -> reject
+        return false;
     value = trim(line.substr(colon + 1));
     return true;
 }
