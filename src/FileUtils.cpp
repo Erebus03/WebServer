@@ -32,6 +32,18 @@ bool FileUtils::is_path_safe(const std::string& uri)
     if  (uri.empty())
         return false;
 
+    // Control bytes are refused before anything else. The parser percent-decodes
+    // the URI exactly once, so a client sending %0d%0a hands us real CR and LF
+    // bytes -- and any handler that puts this string into a response header
+    // (Location on a 301 or a 201) would let those bytes terminate the header
+    // early and inject headers of their own. No legitimate path contains them.
+    for (size_t i = 0; i < uri.size(); ++i)
+    {
+        const unsigned char c = static_cast<unsigned char>(uri[i]);
+        if (c < 0x20 || c == 0x7F)
+            return false;
+    }
+
     std::stringstream pathStream(uri);
     std::string component;
 
