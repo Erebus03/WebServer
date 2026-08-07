@@ -10,9 +10,6 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
     if (!FileUtils::is_path_safe(request.uri))
         return HttpStatus::make_response(403);
 
-    // Disk path only. request.uri stays whole below: the 301 Location header
-    // and DirectoryLister's hrefs are client-facing URLs, and stripping either
-    // sends the browser to a path that does not exist on the wire.
     std::string diskPath;
     const std::string relative =
         FileUtils::strip_location_prefix(request.uri, location.path);
