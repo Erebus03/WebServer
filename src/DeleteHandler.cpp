@@ -11,7 +11,9 @@ HttpResponse DeleteHandler::handle(const HttpRequest& request, const LocationCon
         return HttpStatus::make_response(403);
 
     std::string diskPath;
-    if (!FileUtils::resolve_path(location.root, request.uri, diskPath))
+    const std::string relative =
+        FileUtils::strip_location_prefix(request.uri, location.path);
+    if (!FileUtils::resolve_path(location.root, relative, diskPath))
         return HttpStatus::make_response(500);
 
     if (!FileUtils::file_exists(diskPath))

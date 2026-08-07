@@ -52,6 +52,27 @@ bool FileUtils::is_path_safe(const std::string& uri)
     return true;
 }
 
+std::string FileUtils::strip_location_prefix(const std::string& uri,
+                                             const std::string& location_path)
+{
+    if (location_path.empty() || location_path == "/")
+        return uri;
+
+    size_t cut = location_path.size();
+    while (cut > 1 && location_path[cut - 1] == '/')
+        --cut;
+
+    if (uri.size() < cut)
+        return uri;
+
+    const std::string rest = uri.substr(cut);
+    if (rest.empty())
+        return "/";
+    if (rest[0] != '/')
+        return "/" + rest;
+    return rest;
+}
+
 bool FileUtils::file_exists(const std::string& path)
 {
     struct stat fileInfo = {};
