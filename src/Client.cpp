@@ -85,6 +85,10 @@ void Client::resetForNextRequest() {
     request.state = READING_REQUEST_LINE;
     request.is_complete = false;
 
+    parser.reset();                 // clear the chunked-decode offset so the next
+                                    // request doesn't resume from this one's (B's
+                                    // incremental readChunkedBody now keeps state)
+
     request_start = 0;              // no request in flight; idle clock owns this gap
     last_activity = std::time(NULL);
     state = READING;
