@@ -9,9 +9,11 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
 {
     if (!FileUtils::is_path_safe(request.uri))
         return HttpStatus::make_response(403);
-
+    
     std::string diskPath;
-    if (!FileUtils::resolve_path(location.root, request.uri, diskPath))
+    const std::string relative =
+        FileUtils::strip_location_prefix(request.uri, location.path);
+    if (!FileUtils::resolve_path(location.root, relative, diskPath))
         return HttpStatus::make_response(500);
 
     if (!FileUtils::file_exists(diskPath))
@@ -46,7 +48,7 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
         if (!foundIndex)
         {
             if (!location.dir_listing)
-                return HttpStatus::make_response(403);
+                return HttpStatus::make_response(404);
 
             std::string listing;
             if (!DirectoryLister::generate(diskPath, request.uri, listing))

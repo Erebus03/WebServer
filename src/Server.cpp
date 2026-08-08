@@ -29,6 +29,27 @@
 static const size_t CGI_BACKLOG_HIGH = 256 * 1024;
 
 
+// Set by the SIGINT/SIGTERM handler, read by run()'s loop condition.
+//
+// A file-scope flag rather than the `running` member because a signal handler
+// has no `this`: it is called by the kernel, not by us, so there is nothing to
+// hand it a Server pointer without a global anyway. sig_atomic_t is the only
+// type C++98 guarantees can be written by a handler and read by the main flow
+// without tearing, and `volatile` stops the compiler from hoisting the read out
+// of the loop — without it, an optimiser is entitled to test the flag once and
+// spin forever on the cached value.
+static volatile sig_atomic_t g_shutdown = 0;
+
+// The entire handler. Assigning a flag is one of the few things that is
+// async-signal-safe; anything else here — closing fds, freeing clients, writing
+// to std::cerr — risks re-entering a function the interrupted code was already
+// inside, which is undefined behaviour. The real cleanup happens back on the
+// main flow, where ~Server() can run normally.
+static void onShutdownSignal(int) {
+    g_shutdown = 1;
+}
+
+
 // ── Allowed-function-safe IPv4 helpers ───────────────────────────────────────
 // The webserv subject does not permit inet_pton/inet_ntop/inet_addr/inet_ntoa,
 // so we convert between dotted-quad strings and 32-bit addresses by hand.
@@ -74,11 +95,19 @@ Server::Server() : running(false), reserve_fd(-1) {
 }
 
 Server::~Server() {
-    // Clean up clients
+    // Clean up clients. _closeCgi() FIRST, and it is not optional tidiness: a
+    // client can be sitting in WAITING_FOR_CGI with a live child, and closing
+    // only the socket would leave that child running with our pipes open,
+    // reparented to init — a process the evaluator can still see after the
+    // server is gone. It closes both pipe ends, then SIGKILLs and waitpid()s
+    // the child, so nothing outlives us. Touches only cgi_fd_to_client_fd, so
+    // it is safe to call while iterating `clients`.
     for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
+        _closeCgi(it->second);
         close(it->first);
         delete it->second;
     }
+    clients.clear();
 
     // Close listening sockets
     for (size_t i = 0; i < listening_sockets.size(); ++i) {
@@ -101,6 +130,16 @@ int Server::initialize(const std::string& config_file) {
     // would inherit a fatal default it never asked for. The guarantee belongs
     // to the class that does the writing.
     std::signal(SIGPIPE, SIG_IGN);
+
+    // Ctrl-C and `kill` must unwind the event loop instead of killing the
+    // process where it stands. Their default action terminates us inside
+    // poll(), so ~Server() never runs: client fds are never closed, and — the
+    // part the OS will not do for us — any CGI child still executing is
+    // orphaned rather than killed and reaped. Handled here for the same reason
+    // as SIGPIPE above: main.cpp is untracked, so the guarantee has to belong to
+    // the class that owns the loop and the children.
+    std::signal(SIGINT, onShutdownSignal);
+    std::signal(SIGTERM, onShutdownSignal);
 
     // One fd held in reserve so that when the process hits its fd limit,
     // accept() can still be made to succeed once — see _acceptNewClient.
@@ -130,7 +169,7 @@ int Server::initialize(const std::string& config_file) {
 void Server::run() {
     std::cout << "Server started with " << listening_sockets.size() << " listening sockets" << std::endl;
     
-    while (running) {
+    while (running && !g_shutdown) {
         // Build pollfd array
         std::vector<struct pollfd> pollfds;
         _rebuildPollFds(pollfds);
@@ -150,6 +189,15 @@ void Server::run() {
         // Check for timeouts
         _checkTimeouts();
     }
+
+    // Reached only by a clean exit — a signal, or stop(). poll() is one of the
+    // syscalls the kernel never restarts across a handler (signal(7)), so the
+    // interrupted poll() above returns EINTR, `continue` re-tests the condition
+    // and we land here at once rather than after the 5 s timeout expires.
+    // Returning lets ~Server() close every client, kill every CGI child and
+    // release the listening sockets on the normal path.
+    std::cout << "Shutting down: closing " << clients.size()
+              << " client connection(s)" << std::endl;
 }
 
 void Server::stop() {
@@ -773,7 +821,27 @@ void Server::_processRequest(Client* client) {
     // path could see it; this is where the rule it has to satisfy is written
     // down, because this is the path where the response framing is decided.
 
-    const std::string wire = ResponseBuilder::build(response, client->keep_alive);
+    std::string wire = ResponseBuilder::build(response, client->keep_alive);
+
+    // HEAD: identical headers to the GET, then not one byte of body. RFC 7231
+    // §4.3.2 is explicit that Content-Length must still be the length the GET
+    // *would* have sent, so this truncates the wire after the blank line and
+    // deliberately does NOT recompute the header — a HEAD answering 0 where GET
+    // says 1024 is the classic way to break every client that uses HEAD to size
+    // a download before fetching it.
+    //
+    // Suppression lives here, at the one place a response becomes bytes, rather
+    // than in each handler: a handler that forgot would leak a body, and there
+    // is no way to forget a step that only exists once. Routing HEAD to the GET
+    // handler is the other half and belongs to Dispatcher (Member C) — until
+    // that lands, HEAD is answered 501 and never reaches this line, so this is
+    // inert rather than wrong.
+    if (client->request.method == "HEAD") {
+        const std::string::size_type head_end = wire.find("\r\n\r\n");
+        if (head_end != std::string::npos)
+            wire.erase(head_end + 4);
+    }
+
     client->output_buf.assign(wire.begin(), wire.end()); // why assign and not another alternative, if there are even
     client->beginSending();
 
