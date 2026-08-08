@@ -224,7 +224,78 @@ CLOSED (with the commit that closed it):
     (21-byte and 100 KB bodies), a script-set `Status: 404` becoming the HTTP
     status, PATH_INFO tolerated, keep-alive reused, 0 zombies.  (this commit)
 
+  - graceful shutdown: SIGINT/SIGTERM were unhandled, so the process died by
+    default action inside poll() and ~Server() never ran. Proven by valgrind:
+    78,792 bytes still reachable and 2 fds open at exit. Now a handler sets a
+    volatile sig_atomic_t the loop tests, and the destructor calls _closeCgi()
+    per client so no CGI child is orphaned. Re-measured: "All heap blocks were
+    freed -- no leaks are possible", 0 errors, 0 server-owned fds. (this commit)
+
+  - fd-leak + stress audit (evidence, not a fix): 50 concurrent clients for 10 s
+    mixing keep-alive, pipelining, slow-loris, RST mid-body, early close, 1 MB
+    POST and malformed request lines. ~500 connections, server never crashed,
+    fd count 5 before and 5 after, 0 zombies, 200 OK afterwards. Pipelined
+    request 2 verified delivered byte-for-byte.                    (this commit)
+
+  - uploads work. PostHandler is no longer a 501 stub (C) and B fixed the
+    MultipartParser bugs C reported. Verified end-to-end against the merged
+    tree: multipart POST -> 201 Created, file on disk byte-identical. 1 MB of
+    /dev/urandom round-trips with a matching md5, a 21-byte payload with an
+    embedded NUL survives, and C's exact off-by-one repro (3 bytes in, 4 out)
+    now stores 3.                                                  (this commit)
+
+  - broken build on main, twice over, fixed while merging:          (this commit)
+      * src/main.cpp had its ENTIRE main() commented out and pushed (fd73305,
+        Aboumata, 2026-08-02) — origin/main produced no `main` symbol at all.
+      * src/UrlCodec.cpp was added without a Makefile entry, so PostHandler and
+        DirectoryLister had undefined references to UrlCodec::encode.
+    Both are now fixed on this branch. See the OPEN entry about main.cpp below:
+    the first one WILL happen again as things stand.
+
 OPEN:
+  - HttpParser accepts whitespace before the colon. `Content-Length : 5` parses
+    as a valid Content-Length and the request answers 200. RFC 7230 §3.2.4 says
+    a server MUST reject it, and the reason is the same one behind the CL+TE
+    rejection the parser already does: if a proxy in front of us disagrees about
+    whether that line is a header, the gap is a request-smuggling primitive.
+    B's file (C reported it; B fixed the other three findings but not this one).
+    Verified still open against the merged tree on 2026-08-04.
+    The other three are CLOSED and confirmed by probe: conflicting duplicate
+    Content-Length -> 400, empty header name -> 400, CL+TE together -> 400,
+    and an IDENTICAL duplicate Content-Length is still accepted (correct — the
+    RFC only bars conflicting values).
+
+  - src/main.cpp is tracked but treated as local-only. .gitignore lists it under
+    "each teammate keeps their own to avoid merge conflicts", but git ignores
+    that rule for already-tracked files, so a teammate's local edit is committed
+    like any other. That is exactly how main() got commented out and pushed.
+    Same trap applies to the Makefile, also listed-but-tracked.
+    Fix is a team decision, so it is NOT being made unilaterally here. Either
+    untrack it (`git rm --cached src/main.cpp`) and accept that the repo no
+    longer builds from a clean clone, or drop it from .gitignore and agree that
+    everyone shares one entry point. It cannot stay as it is.
+    A guard that would have caught it regardless: `make test` on the merged tree
+    fails loudly, which is why it now exists.
+
+  - HEAD: half done, blocked on Member C for the rest.
+    A's half is CLOSED — the framing point suppresses the body while keeping the
+    Content-Length the GET would have sent (Server.cpp, ResponseBuilder call
+    site). Verified live: `HEAD /` returns Content-Length: 101 with 0 body
+    bytes, GET unaffected.
+    C's half is OPEN — Dispatcher.cpp:56-64 routes only GET/DELETE/POST, so
+    HEAD still falls through to 501. One line: route HEAD to GetHandler, i.e.
+    `if (request.method == "GET" || request.method == "HEAD")`. The allow-list
+    check above it must keep seeing the real method, so this cannot be done by
+    rewriting HEAD->GET before dispatch — a location that permits GET but not
+    HEAD has to stay a 405.
+    FALLBACK if it does not land before the defense: drop HEAD from
+    config/default.conf:19,50 rather than ship a config that advertises a
+    method we answer 501 to. HEAD is not required by the subject.
+
+  - PUT is accepted by Config.cpp:220 as a valid allowed_methods token but is
+    advertised in no config and implemented nowhere. Same 501 trap as HEAD if
+    an evaluator writes it into their own config.
+
   - (none for CGI)
 
 ===============================================================================

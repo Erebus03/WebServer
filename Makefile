@@ -49,6 +49,20 @@ INCLUDES = \
 	includes/DirectoryLister.hpp \
 	includes/FileUtils.hpp \
 
+# Everything except the server's own entry point. Each test brings its own
+# main(), so linking src/main.o too would be a duplicate-symbol error. Linking
+# the whole rest of the program rather than a hand-picked subset per test is
+# deliberate: a test that grows a new dependency keeps building instead of
+# failing with an undefined reference nobody wants to debug.
+LIB_OBJS = $(filter-out src/main.o,$(OBJS))
+
+TEST_SRCS = \
+	tests/test_config.cpp \
+	tests/test_http_parser.cpp \
+	tests/test_integration.cpp \
+
+TEST_BINS = $(TEST_SRCS:.cpp=)
+
 all: $(NAME)
 
 $(NAME): $(OBJS)
@@ -57,12 +71,31 @@ $(NAME): $(OBJS)
 %.o: %.cpp $(INCLUDES)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+# -Iincludes so a test may say "Config.hpp" as well as "../includes/Config.hpp".
+tests/%: tests/%.cpp $(LIB_OBJS) $(INCLUDES)
+	$(CXX) $(CXXFLAGS) -Iincludes $< $(LIB_OBJS) -o $@
+
+# Unit tests. Stops at the first failure so a red run cannot scroll past.
+test: $(TEST_BINS)
+	@for t in $(TEST_BINS); do \
+		echo "=== $$t"; ./$$t || exit 1; \
+	done
+	@echo "=== all unit tests passed"
+
+# Live-server tests: 50 concurrent clients, hostile mix. Needs the binary.
+stress: $(NAME)
+	@./tests/stress.sh
+
+# Same load under valgrind, checking for leaked memory and leaked descriptors.
+valgrind: $(NAME)
+	@./tests/stress.sh --valgrind
+
 clean:
 	rm -f $(OBJS)
 
 fclean: clean
-	rm -f $(NAME)
+	rm -f $(NAME) $(TEST_BINS) tests/dump_config
 
 re: fclean all
 
-.PHONY: all clean fclean re
+.PHONY: all clean fclean re test stress valgrind
