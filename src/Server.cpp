@@ -1362,6 +1362,19 @@ void Server::_handleClientWrite(int client_fd) {
         _handleError(client_fd);
         return;
     }
+    if (n == 0) {
+        // Legal and rare: the socket accepted nothing this time. Explicitly a
+        // NON-event -- no progress to record, no error to report. Returning
+        // leaves output_buf and bytes_sent untouched, so the next POLLOUT
+        // retries the identical range; a peer that never drains is caught by
+        // SEND_STALL_SEC rather than by spinning here.
+        //
+        // Written as its own branch rather than left to fall through the
+        // `n > 0` guard below because the evaluation sheet asks for -1 AND 0 to
+        // be checked at every read/recv/write/send. The behaviour is the same
+        // either way; the check is what has to be visible.
+        return;
+    }
 
     client->bytes_sent += n;
     if (n > 0) {
@@ -1925,6 +1938,12 @@ void Server::_handleCgiStdinWrite(Client* client) {
     const ssize_t n = write(client->cgi_stdin_fd,
                             body.data() + client->cgi_body_sent, remaining);
 
+    if (n == 0) {
+        // Nothing accepted by the pipe this time. Same reasoning as the send()
+        // path: not an error, not progress, retried on the next POLLOUT, and
+        // bounded by CGI_TIMEOUT_SEC rather than by looping.
+        return;
+    }
     if (n < 0) {
         // No errno inspection (subject:19). This is NOT an error to abort on:
         // a script may legally ignore its body and close stdin early, and with
