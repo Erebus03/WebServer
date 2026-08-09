@@ -29,6 +29,18 @@ HttpResponse HttpStatus::make_response(int statusCode)
     case 301:
         response.status_message = "Moved Permanently";
         break;
+    case 302:
+        response.status_message = "Found";
+        break;
+    case 303:
+        response.status_message = "See Other";
+        break;
+    case 307:
+        response.status_message = "Temporary Redirect";
+        break;
+    case 308:
+        response.status_message = "Permanent Redirect";
+        break;
     case 400:
         response.status_message = "Bad Request";
         break;
@@ -41,6 +53,9 @@ HttpResponse HttpStatus::make_response(int statusCode)
     case 405:
         response.status_message = "Method Not Allowed";
         break;
+    case 409:
+        response.status_message = "Conflict";
+        break;
     case 413:
         response.status_message = "Content Too Large";
         break;
@@ -48,7 +63,7 @@ HttpResponse HttpStatus::make_response(int statusCode)
         response.status_message = "Internal Server Error";
         break;
     case 501:
-        response.status_message = "Not implemented";
+        response.status_message = "Not Implemented";
         break;
     default:
         response.status_message = "Unknown Status";
