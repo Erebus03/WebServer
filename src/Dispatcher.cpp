@@ -58,14 +58,10 @@ HttpResponse Dispatcher::produce_response(const HttpRequest& request, const Serv
     if (request.method == "GET")
         return GetHandler::handle(request, *location);
     if (request.method == "HEAD")
-    {
-        HttpResponse response = GetHandler::handle(request, *location);
-        std::ostringstream length;
-        length << response.body.size();
-        response.headers["Content-Length"] = length.str();
-        response.body.clear();
-        return response;
-    }
+        // body left intact on purpose: ResponseBuilder computes Content-Length
+        // from it, and Server.cpp strips the body at the wire afterward. Clearing
+        // it here would make Content-Length read 0.
+        return GetHandler::handle(request, *location);
     if (request.method == "DELETE")
         return DeleteHandler::handle(request, *location);
     if (request.method == "POST")
@@ -77,13 +73,15 @@ HttpResponse Dispatcher::produce_response(const HttpRequest& request, const Serv
 void Dispatcher::attach_error_body(const HttpRequest& request, HttpResponse& response,
                                    const ServerConfig& server)
 {
+    // HEAD is not special-cased here on purpose: the error page is generated
+    // normally so Content-Length describes what a GET would have returned, and
+    // Server.cpp drops the body at the wire.
+    (void)request;
+
     if (response.status_code < 400)
         return;
 
     if (!response.body.empty())
-        return;
-
-    if (request.method == "HEAD")
         return;
 
     const std::map<int, std::string>::const_iterator pages = server.error_pages.find(response.status_code);
