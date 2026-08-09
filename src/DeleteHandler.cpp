@@ -9,7 +9,7 @@ HttpResponse DeleteHandler::handle(const HttpRequest& request, const LocationCon
 {
     if (!FileUtils::is_path_safe(request.uri))
         return HttpStatus::make_response(403);
-
+    
     std::string diskPath;
     const std::string relative =
         FileUtils::strip_location_prefix(request.uri, location.path);

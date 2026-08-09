@@ -7,13 +7,11 @@ class FileUtils {
 private:
     FileUtils();
 public:
-
     static bool resolve_path(const std::string& root, const std::string& uri, std::string& outPath);
 
     static bool is_path_safe(const std::string& uri);
 
-    static std::string strip_location_prefix(const std::string& uri,
-                                             const std::string& location_path);
+    static std::string strip_location_prefix(const std::string& uri, const std::string& location_path);
 
     static bool file_exists(const std::string& path);
     static bool is_directory(const std::string& path);
