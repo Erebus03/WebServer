@@ -54,6 +54,7 @@ static std::string read_raw(const std::string& path)
 static void teardown_fixtures()
 {
     std::remove(at("/up/taken.txt").c_str());
+    std::remove(at("/up/empty.txt").c_str());   // new: zero-length upload test
     std::remove(at("/up/a.txt").c_str());
     std::remove(at("/up/1.txt").c_str());
     std::remove(at("/up/2.txt").c_str());
@@ -280,16 +281,20 @@ static void test_upload_dir_pointing_at_a_file_is_server_error()
     std::cout << "[OK] an upload_dir that is a file is a server error" << std::endl;
 }
 
-static void test_empty_body_is_bad_request()
+static void test_empty_body_creates_an_empty_file()
 {
+    // RFC 9110 does not require a payload on POST, so "Content-Length: 0" is
+    // well-formed. Rejecting it with 400 would claim we could not parse a request
+    // we parsed fine. write_file already treats a zero-byte write as a success.
     setup_fixtures();
 
     HttpResponse response = PostHandler::handle(
-        make_request("/up/a.txt", "text/plain", ""),
+        make_request("/up/empty.txt", "text/plain", ""),
         make_location(UPLOAD));
 
-    assert(response.status_code == 400);
-    std::cout << "[OK] an empty body is a bad request" << std::endl;
+    assert(response.status_code == 201);
+    assert(read_raw(at("/up/empty.txt")).empty());
+    std::cout << "[OK] a zero-length body creates a zero-byte file" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -332,20 +337,26 @@ static void test_raw_body_is_byte_exact()
     std::cout << "[OK] a raw body is stored byte for byte" << std::endl;
 }
 
-static void test_raw_body_collision_is_refused()
+static void test_raw_body_collision_overwrites()
 {
-    // Overwriting would let a client replace a file it never uploaded.
+    // The raw path OVERWRITES, because the client named this exact target in the
+    // request line -- the same shape as PUT. 409 is for a state clash the client
+    // could resolve by acting differently, and "the file you asked to write
+    // already exists" is not one when the client chose the name deliberately.
+    // The multipart path still refuses; that asymmetry is tested below.
     setup_fixtures();
 
     HttpResponse response = PostHandler::handle(
         make_request("/up/taken.txt", "text/plain", "replacement"),
         make_location(UPLOAD));
 
-    assert(response.status_code == 409);
-    // The original must be untouched, not merely reported as a conflict.
-    assert(read_raw(at("/up/taken.txt")) == "i was here first");
-    assert(!has_header(response, "Location"));
-    std::cout << "[OK] a colliding raw upload is refused and the original survives"
+    // 200, not 201: nothing was created, an existing resource was replaced.
+    assert(response.status_code == 200);
+    assert(read_raw(at("/up/taken.txt")) == "replacement");
+    // Location is still sent, so a client that ignores the create/replace
+    // distinction can follow the header either way.
+    assert(has_header(response, "Location"));
+    std::cout << "[OK] a colliding raw upload replaces the target, reported as 200"
               << std::endl;
 }
 
@@ -607,11 +618,11 @@ int main()
     test_uploads_disabled_is_refused();
     test_missing_upload_dir_is_server_error();
     test_upload_dir_pointing_at_a_file_is_server_error();
-    test_empty_body_is_bad_request();
+    test_empty_body_creates_an_empty_file();
 
     test_raw_body_creates_the_file();
     test_raw_body_is_byte_exact();
-    test_raw_body_collision_is_refused();
+    test_raw_body_collision_overwrites();
     test_raw_body_with_no_filename_is_bad_request();
     test_location_is_url_encoded();
 
