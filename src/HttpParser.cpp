@@ -2,6 +2,17 @@
 #include "../includes/HttpVersion.hpp"
 #include <cctype>
 
+HttpParser::HttpParser() : chunk_scan_pos_(0), chunk_started_(false) {}
+
+// clear per-request decode state. the caller must call this between requests on
+// a kept-alive connection, otherwise the next chunked body resumes from the old
+// offset and decodes wrong. (paired with Client::resetForNextRequest.)
+void HttpParser::reset()
+{
+    chunk_scan_pos_ = 0;
+    chunk_started_ = false;
+}
+
 // trim spaces/tabs off both ends
 static std::string trim(const std::string& s)
 {
@@ -214,7 +225,7 @@ bool HttpParser::parseHeaderLine(const std::string& line, std::string& name,
 
 // pick body framing: chunked / Content-Length / none. on COMPLETE, consumed = request end.
 void HttpParser::readBody(const std::string& bytes, size_t body_start,
-                          HttpRequest& request, size_t& consumed) const
+                          HttpRequest& request, size_t& consumed)
 {
     std::map<std::string, std::string>::const_iterator te =
         request.headers.find("transfer-encoding");
@@ -259,20 +270,31 @@ void HttpParser::readBody(const std::string& bytes, size_t body_start,
 }
 
 // un-chunk: read hex size, copy that many bytes, repeat until size 0.
+// Incremental chunked decode. Resumes from where the last recv left off
+// (chunk_scan_pos_) and APPENDS new chunks to request.body, so a big upload is
+// decoded once end-to-end (O(n)) instead of re-decoded from byte zero every recv
+// (O(n^2)). chunk_scan_pos_ only advances past a chunk once that chunk is fully
+// present, so a chunk is never appended twice.
 void HttpParser::readChunkedBody(const std::string& bytes, size_t body_start,
-                                 HttpRequest& request, size_t& consumed) const
+                                 HttpRequest& request, size_t& consumed)
 {
-    std::string decoded;
-    size_t pos = body_start;
+    if (!chunk_started_) {                 // first call for this request's body
+        chunk_scan_pos_ = body_start;
+        chunk_started_ = true;
+    }
+    size_t pos = chunk_scan_pos_;
 
     while (true) {
+        size_t chunk_start = pos;          // start of THIS chunk's size line (resume point)
+
         size_t line_end = bytes.find("\r\n", pos);
         if (line_end == std::string::npos) {
+            chunk_scan_pos_ = chunk_start;         // size line not fully here -> wait
             request.state = READING_BODY;
             return;
         }
 
-        // size line, drop any ";extension"
+        // hex size, dropping any ";chunk-extension"
         std::string size_line = bytes.substr(pos, line_end - pos);
         size_t semi = size_line.find(';');
         if (semi != std::string::npos)
@@ -283,39 +305,41 @@ void HttpParser::readChunkedBody(const std::string& bytes, size_t body_start,
             request.state = ERROR;
             return;
         }
-        pos = line_end + 2;
+        size_t data_start = line_end + 2;
 
-        // size 0 = last chunk. skip trailers until the blank line, then done.
+        // last chunk (size 0): skip trailer lines to the blank line, then done
         if (chunk_size == 0) {
+            size_t p = data_start;
             while (true) {
-                size_t t = bytes.find("\r\n", pos);
+                size_t t = bytes.find("\r\n", p);
                 if (t == std::string::npos) {
+                    chunk_scan_pos_ = chunk_start;     // trailers not done -> wait
                     request.state = READING_BODY;
                     return;
                 }
-                if (t == pos) {
-                    request.body  = decoded;
+                if (t == p) {                          // blank line -> body ends
                     request.state = COMPLETE;
-                    consumed = pos + 2;
+                    consumed = p + 2;
                     return;
                 }
-                pos = t + 2;
+                p = t + 2;                             // skip a trailer header line
             }
         }
 
-        // need chunk_size bytes + trailing \r\n. written this way to avoid pos+size overflow.
-        size_t available = bytes.size() - pos;
+        // data chunk: need chunk_size data bytes + the trailing \r\n (overflow-safe)
+        size_t available = bytes.size() - data_start;
         if (chunk_size > available || available - chunk_size < 2) {
+            chunk_scan_pos_ = chunk_start;     // data not all here -> wait, do NOT append
             request.state = READING_BODY;
             return;
         }
-        decoded.append(bytes, pos, chunk_size);
-        pos += chunk_size;
-
-        if (bytes.compare(pos, 2, "\r\n") != 0) {
-            request.state = ERROR;
+        if (bytes.compare(data_start + chunk_size, 2, "\r\n") != 0) {
+            request.state = ERROR;             // chunk data not followed by CRLF
             return;
         }
-        pos += 2;
+
+        request.body.append(bytes, data_start, chunk_size);   // append this chunk ONCE
+        pos = data_start + chunk_size + 2;                    // past the data + its \r\n
+        chunk_scan_pos_ = pos;                                // committed: chunk fully done
     }
 }

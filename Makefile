@@ -21,19 +21,8 @@ SRCS = \
 	src/GetHandler.cpp \
 	src/PostHandler.cpp \
 	src/DeleteHandler.cpp \
-	src/CgiHandler.cpp \
 	src/DirectoryLister.cpp \
 	src/FileUtils.cpp \
-	src/UrlCodec.cpp \
-	tests/test_router.cpp \
-	tests/test_FileUtils.cpp \
-	tests/test_GetHandler.cpp \
-	tests/test_Dispatcher.cpp \
-	tests/test_DirectoryLister.cpp \
-	tests/test_HttpStatus.cpp \
-	tests/test_DeleteHandler.cpp \
-	tests/test_http_parser.cpp \
-	tests/test_PostHandler.cpp \
 
 OBJS = $(SRCS:.cpp=.o)
 
@@ -55,10 +44,8 @@ INCLUDES = \
 	includes/DeleteHandler.hpp \
 	includes/Server.hpp \
 	includes/PostHandler.hpp \
-	includes/CgiHandler.hpp \
 	includes/DirectoryLister.hpp \
 	includes/FileUtils.hpp \
-	includes/UrlCodec.hpp \
 
 # Everything except the server's own entry point. Each test brings its own
 # main(), so linking src/main.o too would be a duplicate-symbol error. Linking
@@ -67,9 +54,23 @@ INCLUDES = \
 # failing with an undefined reference nobody wants to debug.
 LIB_OBJS = $(filter-out src/main.o,$(OBJS))
 
+# Every unit test. These belong HERE and never in SRCS: each brings its own
+# main(), so listing one in SRCS links it into the server binary and turns
+# ./webserv into a test runner. That is exactly what used to happen — nine of
+# these were in SRCS — and it is why `tests/%` is a separate target below.
+# ONLY the files that define their own main(), because `tests/%` links one test
+# source against LIB_OBJS and nothing else. Verified with:
+#   for f in tests/test_*.cpp; do grep -qE '^\s*int\s+main\s*\(' $f && echo $f; done
+#
+# The other eight (test_router, test_http_parser, test_FileUtils, test_GetHandler,
+# test_Dispatcher, test_DirectoryLister, test_HttpStatus, test_DeleteHandler) have
+# NO main(). They cannot be built by this target and were never being run — they
+# used to sit in SRCS instead, which linked their test bodies into ./webserv as
+# dead weight. Listing one here fails the link with "undefined reference to main".
+# They need either a main() each or a shared runner; until then they are inert.
 TEST_SRCS = \
 	tests/test_config.cpp \
-	tests/test_http_parser.cpp \
+	tests/test_PostHandler.cpp \
 	tests/test_integration.cpp \
 
 TEST_BINS = $(TEST_SRCS:.cpp=)

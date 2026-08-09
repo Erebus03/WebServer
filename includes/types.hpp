@@ -7,6 +7,11 @@
 
 struct LocationConfig {
     std::string                        path;
+    // PRE-FOLDED by ConfigParser. For a `root` directive the location path is
+    // already appended here; for `alias` it is not. Every consumer must call
+    // FileUtils::strip_location_prefix(uri, path) before joining, or the location
+    // path is counted twice. Consumers: GetHandler.cpp, DeleteHandler.cpp,
+    // Server.cpp (CGI script path).
     std::string                        root;
     std::vector<std::string>           index_files;
     std::vector<std::string>           methods;

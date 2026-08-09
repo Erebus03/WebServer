@@ -194,7 +194,11 @@ void test_location_directives() {
     CHECK(!c.empty());
     if (c.empty() || c[0].locations.size() < 3) { CHECK(false); return; }
     const LocationConfig& s = c[0].locations[0];
-    CHECK_EQ(s.root, std::string("/data/static"));
+    // root is PRE-FOLDED with the location path (nginx `root` semantics), so the
+    // stored value is declared-root + location-path. This is the real nginx
+    // behaviour: location /static { root /data/static; } serves
+    // GET /static/x from /data/static/static/x.
+    CHECK_EQ(s.root, std::string("/data/static/static"));
     CHECK(!s.index_files.empty());
     if (!s.index_files.empty()) CHECK_EQ(s.index_files[0], std::string("home.html"));
     CHECK(s.dir_listing == true);
@@ -207,9 +211,11 @@ void test_location_directives() {
     CHECK_EQ(r.redirect_code, 301);
     CHECK_EQ(r.redirect_url, std::string("/new"));
 
-    // inheritance: /inherits sets no root -> inherits /var/www
+    // inheritance: /inherits sets no root -> inherits /var/www, then the fold
+    // appends the location path because an inherited server root is always
+    // `root` semantics (only an explicit `alias` skips the fold).
     const LocationConfig& inh = c[0].locations[2];
-    CHECK_EQ(inh.root, std::string("/var/www"));
+    CHECK_EQ(inh.root, std::string("/var/www/inherits"));
 }
 
 void test_body_size_inheritance() {

@@ -15,6 +15,7 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
       remote_address(remote_addr),
       state(READING),
       bytes_sent(0),
+      header_bytes(0),
       last_activity(std::time(NULL)),
       request_start(0),
       last_send_progress(0),
@@ -33,11 +34,6 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
 
 bool Client::isTimedOut(time_t timeout_seconds) const {
     return (std::time(NULL) - last_activity) >= timeout_seconds;
-}
-
-bool Client::isRequestOverdue(time_t deadline_seconds) const {
-    if (request_start == 0) return false;   // nothing in flight to be late
-    return (std::time(NULL) - request_start) >= deadline_seconds;
 }
 
 bool Client::isSendStalled(time_t stall_seconds) const {
@@ -68,6 +64,13 @@ void Client::resetForNextRequest() {
     bytes_sent = 0;
     last_send_progress = 0;         // not sending any more
 
+    // Must be cleared even though input_buf is not: the finished request's
+    // bytes were erased from the front, so any surviving pipelined bytes have
+    // shifted down to offset 0 and this offset now points into the middle of
+    // the NEXT request. Leaving it set would measure that request's body from
+    // the wrong origin.
+    header_bytes = 0;
+
     // Response-completion and CGI streaming state. cgi_pipe_fd/cgi_pid are NOT
     // reset here: the server closes the pipe and reaps the child at EOF and
     // sets them back to -1 itself, so clearing them here would lose the fd and
@@ -84,6 +87,18 @@ void Client::resetForNextRequest() {
     request = HttpRequest();        // drop every header/body of the old request
     request.state = READING_REQUEST_LINE;
     request.is_complete = false;
+
+    // The parser is NOT stateless any more. Since the incremental chunked decode
+    // landed it carries chunk_scan_pos_/chunk_started_ across recvs WITHIN one
+    // request, so it has to be told where one request ends — this object is
+    // per-connection (Client.hpp) and survives every request on it.
+    //
+    // Without this line a keep-alive connection whose first request was chunked
+    // resumes request 2 from request 1's offset. It does not crash; it silently
+    // decodes a wrong body, which is worse. Ordered after `request = HttpRequest()`
+    // deliberately: that is what drops the old body the offset indexed into, so
+    // the two pieces of the same state are cleared together and cannot drift.
+    parser.reset();
 
     request_start = 0;              // no request in flight; idle clock owns this gap
     last_activity = std::time(NULL);

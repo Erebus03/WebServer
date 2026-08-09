@@ -23,3 +23,15 @@ rb_test
 a.out
 claude_chat
 .mcp.json
+study/
+report_chat
+
+# school-provided binaries and runtime output
+/tester
+/cgi_tester
+/uploads/
+# built unit-test binaries (Makefile TEST_BINS)
+tests/test_config
+tests/test_PostHandler
+tests/test_integration
+tests/dump_config

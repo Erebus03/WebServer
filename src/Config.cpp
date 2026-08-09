@@ -155,8 +155,25 @@ std::vector<std::string> readArgs(const std::vector<Token>& toks, size_t& pos,
     return args; // unreachable
 }
 
+// root + location path, one slash between them, no trailing one.
+std::string joinRootPath(const std::string& root, const std::string& path) {
+    if (path.empty() || path == "/")
+        return root;
+    std::string r = root;
+    while (r.size() > 1 && r[r.size() - 1] == '/')
+        r.erase(r.size() - 1);
+    std::string p = path;
+    if (p[0] != '/')
+        p = "/" + p;
+    while (p.size() > 1 && p[p.size() - 1] == '/')
+        p.erase(p.size() - 1);
+    return r + p;
+}
+
 void applyServerDirective(ServerConfig& s, const std::string& d,
                           const std::vector<std::string>& a, int line, bool& bodySet) {
+    if (d == "alias")
+        fail("'alias' is only valid inside a location block; use 'root' here", line);
     if (d == "listen") {
         if (a.size() != 1)
             fail("'listen' expects exactly one argument", line);
@@ -209,7 +226,8 @@ void applyServerDirective(ServerConfig& s, const std::string& d,
 }
 
 void applyLocationDirective(LocationConfig& l, const std::string& d,
-                            const std::vector<std::string>& a, int line, bool& bodySet) {
+                            const std::vector<std::string>& a, int line, bool& bodySet,
+                            bool& isAlias) {
     if (d == "allowed_methods") {
         if (a.empty())
             fail("'allowed_methods' expects at least one method", line);
@@ -257,10 +275,22 @@ void applyLocationDirective(LocationConfig& l, const std::string& d,
             fail("'redirect' expects [code] <url>", line);
         }
 
+    // root and alias differ exactly as in nginx:
+    //   root  /var/www + GET /pages/a.html -> /var/www/pages/a.html
+    //   alias /var/www + GET /pages/a.html -> /var/www/a.html
+    // Consumers always strip the location prefix, so `root` is implemented by
+    // folding the location path into the stored root -- see parseServer.
     } else if (d == "root") {
         if (a.size() != 1)
             fail("'root' expects exactly one path", line);
         l.root = a[0];
+        isAlias = false;
+
+    } else if (d == "alias") {
+        if (a.size() != 1)
+            fail("'alias' expects exactly one path", line);
+        l.root = a[0];
+        isAlias = true;
 
     } else if (d == "index") {
         if (a.empty())
@@ -288,7 +318,7 @@ void applyLocationDirective(LocationConfig& l, const std::string& d,
 // this point the server block is still half-built. parseServer resolves it in
 // a second pass. `bodySet` reports whether this block set its own body size.
 LocationConfig parseLocation(const std::vector<Token>& toks, size_t& pos,
-                             bool& bodySet) {
+                             bool& bodySet, bool& isAlias) {
     if (pos >= toks.size())
         fail("expected path after 'location'", lastLine(toks));
     const Token& pathTok = toks[pos];
@@ -301,6 +331,7 @@ LocationConfig parseLocation(const std::vector<Token>& toks, size_t& pos,
     expect(toks, pos, "{");
 
     bodySet = false;
+    isAlias = false;   // no root/alias -> inherits server root, which is root semantics
     while (true) {
         if (pos >= toks.size())
             fail("unclosed 'location' block (missing '}')", lastLine(toks));
@@ -315,7 +346,7 @@ LocationConfig parseLocation(const std::vector<Token>& toks, size_t& pos,
         int dline = t.line;
         ++pos;
         std::vector<std::string> args = readArgs(toks, pos, directive, dline);
-        applyLocationDirective(loc, directive, args, dline, bodySet);
+        applyLocationDirective(loc, directive, args, dline, bodySet, isAlias);
     }
 
     return loc;
@@ -331,6 +362,7 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
     // double as "unset". Track explicitness per location, parallel to
     // srv.locations, rather than adding a field to the shared LocationConfig.
     std::vector<bool> bodyExplicit;
+    std::vector<bool> aliasSemantics;   // parallel too: which used `alias`
 
     bool bodySet = false;
     while (true) {
@@ -342,8 +374,10 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
         if (t.text == "location") {
             ++pos;
             bool locBodySet = false;
-            srv.locations.push_back(parseLocation(toks, pos, locBodySet));
+            bool locIsAlias = false;
+            srv.locations.push_back(parseLocation(toks, pos, locBodySet, locIsAlias));
             bodyExplicit.push_back(locBodySet);
+            aliasSemantics.push_back(locIsAlias);
             continue;
         }
         if (t.text == "server")
@@ -376,6 +410,16 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
             loc.index_files = srv.index_files;
         if (!bodyExplicit[i])
             loc.client_max_body_size = srv.client_max_body_size;
+
+        // THE root/alias distinction, and the only place it exists. Consumers
+        // always strip the location prefix before joining; folding the path in
+        // here turns that same strip-then-join into nginx `root`. `alias` skips
+        // the fold. Nothing downstream learns which directive was used, so
+        // LocationConfig needs no new field.
+        // Done AFTER inheritance: a location with no root of its own inherits
+        // the server's, and a server root is always root semantics.
+        if (!aliasSemantics[i])
+            loc.root = joinRootPath(loc.root, loc.path);
     }
 
     return srv;

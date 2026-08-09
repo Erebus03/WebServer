@@ -66,9 +66,29 @@ public:
     std::vector<char>  output_buf;
     size_t             bytes_sent;
 
+    // Offset in input_buf where the CURRENT request's body starts, i.e. the
+    // length of its request line + headers + the terminating blank line.
+    // 0 means "not known yet" — a real header block is never shorter than the
+    // 4-byte terminator, so 0 is unambiguous as a sentinel.
+    //
+    // Cached rather than recomputed because the body-size check needs it on
+    // every recv, and HttpParser re-parses from byte zero each time. A
+    // find("\r\n\r\n") per recv over a growing buffer is O(n^2) in the body
+    // size — the same quadratic that was already deleted from input_buf (see
+    // the note above it). The header block cannot move once it has closed, so
+    // one scan per request is the true cost.
+    //
+    // Reset by resetForNextRequest(), because the bytes it indexes into are
+    // erased when the request completes and the next request starts at 0.
+    size_t             header_bytes;
+
     time_t  last_activity;
     // When the first byte of the CURRENT request arrived; 0 = none in flight.
-    // Deliberately not refreshed as more bytes come in — see isRequestOverdue().
+    // Deliberately not refreshed as more bytes come in — that is what makes the
+    // header deadline immune to a client dribbling just enough to keep
+    // isTimedOut() happy forever (slow-loris). Read by Server::_isReadOverdue(),
+    // which owns the read deadline because its body-phase ceiling needs the
+    // resolved config and this struct does not have it.
     time_t  request_start;
     // Last time send() actually moved bytes; 0 = not sending. Refreshed on
     // PROGRESS, not on attempts — see isSendStalled().
@@ -128,11 +148,6 @@ public:
     // Silent for too long. Refreshed by activity, so it only catches connections
     // that have genuinely gone quiet.
     bool isTimedOut(time_t timeout_seconds) const;
-
-    // Started a request and still hasn't finished it. Anchored to the request's
-    // FIRST byte, which is what makes it immune to a client that dribbles just
-    // enough to keep isTimedOut() happy forever (slow-loris).
-    bool isRequestOverdue(time_t deadline_seconds) const;
 
     // A response that has stopped draining. Measures time since the last byte
     // actually went out, NOT total response time — a big file to a genuinely

@@ -2,6 +2,7 @@
 #define SERVER_HPP
 
 #include <map>
+#include <set>
 #include <vector>
 #include <poll.h>
 #include "Config.hpp"
@@ -78,7 +79,30 @@ private:
     
     // CGI pipe tracking - CRITICAL for non-blocking CGI
     std::map<int, int> cgi_fd_to_client_fd;         // cgi_read_fd -> client_fd
-    
+
+    // Fds closed DURING the current _handlePollEvents pass.
+    //
+    // The pollfd snapshot is taken before poll(), so its revents describe the
+    // world as it was at the top of the tick. Closing an fd part-way through
+    // the pass does not invalidate the maps — every handler re-looks-up by fd
+    // and _removeClient purges both maps first — but it does free the NUMBER,
+    // and pipe() in _startCgi hands out the lowest free descriptors. A client
+    // destroyed early in the pass can therefore donate its cgi fd number to a
+    // different client's fresh pipe later in the SAME pass, at which point the
+    // map lookups in _handlePollEvents succeed against the new owner and we act
+    // on revents that described the dead descriptor.
+    //
+    // That is a read/write with no readiness report behind it, which the
+    // subject forbids outright, and it is reachable: the sections of the poll
+    // array are built listen -> clients -> cgi pipes (_rebuildPollFds), so a
+    // client socket is always processed before every CGI fd, including the ones
+    // its own death just freed.
+    //
+    // Remembering the numbers and skipping their stale entries costs one tick
+    // of latency at most — poll() is level-triggered, so the new owner is
+    // reported again immediately. Cleared at the top of every pass.
+    std::set<int> closed_this_tick;
+
     // Socket setup
     void _createListenSockets();
     int _createListeningSocket(const std::string& host, int port);
@@ -97,6 +121,11 @@ private:
     // Caps on how much we accumulate before the parser says COMPLETE. Returns
     // false when a limit was hit and an error response is already queued.
     bool _enforceReadLimits(Client* client);
+    // Read-side deadline. Phase-aware: a hard total deadline while the header
+    // block is still arriving, and once a body is streaming, an inactivity stall
+    // timer plus an absolute ceiling derived from client_max_body_size. Lives
+    // here rather than on Client because the ceiling needs the resolved config.
+    bool _isReadOverdue(const Client* client) const;
     // Picks the server block by Host among those sharing the client's endpoint.
     // Call once per request, after the parser reports COMPLETE.
     void _resolveServerConfig(Client* client);
