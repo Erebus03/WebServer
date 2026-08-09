@@ -54,7 +54,6 @@ bool FileUtils::is_path_safe(const std::string& uri)
 
 std::string FileUtils::strip_location_prefix(const std::string& uri, const std::string& location_path)
 {
-
     if (location_path.empty() || location_path == "/")
         return uri;
 

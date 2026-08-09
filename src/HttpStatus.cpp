@@ -53,6 +53,9 @@ HttpResponse HttpStatus::make_response(int statusCode)
     case 405:
         response.status_message = "Method Not Allowed";
         break;
+    case 409:
+        response.status_message = "Conflict";
+        break;
     case 413:
         response.status_message = "Content Too Large";
         break;
