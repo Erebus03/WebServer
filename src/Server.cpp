@@ -1176,9 +1176,14 @@ void Server::_processRequest(Client* client) {
     // Suppression lives here, at the one place a response becomes bytes, rather
     // than in each handler: a handler that forgot would leak a body, and there
     // is no way to forget a step that only exists once. Routing HEAD to the GET
-    // handler is the other half and belongs to Dispatcher (Member C) — until
-    // that lands, HEAD is answered 501 and never reaches this line, so this is
-    // inert rather than wrong.
+    // handler is the other half and belongs to Dispatcher (Member C); that has
+    // now landed, so this line is live rather than inert.
+    //
+    // It is also the ONLY correct place to do it. ResponseBuilder skips whatever
+    // Content-Length a handler set (ResponseBuilder.cpp:32-34) and recomputes it
+    // from body.size() (:39), so a handler that clears the body to make a HEAD
+    // gets Content-Length: 0 on the wire no matter what header it also set.
+    // Stripping AFTER serialization is what keeps the GET's length intact.
     if (client->request.method == "HEAD") {
         const std::string::size_type head_end = wire.find("\r\n\r\n");
         if (head_end != std::string::npos)
