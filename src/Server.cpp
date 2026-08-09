@@ -1072,14 +1072,33 @@ void Server::_processRequest(Client* client) {
                     _startErrorResponse(client, 403, FRAMING_INTACT);
                     return;
                 }
-                // V8 preflight. Runs here, before _startCgi creates a single
-                // pipe, so a rejected request costs no fds and no fork.
+                // Preflight. Runs here, before _startCgi creates a single pipe,
+                // so a rejected request costs no fds and no fork.
+                //
+                // A MISSING script is NOT rejected, and that is deliberate.
+                // `cgi_extension .bla <prog>` names a handler, not an
+                // interpreter opening a file: the subject says ".bla must answer
+                // to POST by calling the cgi_test executable", and MEASURED,
+                // cgi_tester returns `Status: 200 OK` with SCRIPT_FILENAME
+                // pointing at a file that does not exist -- it never opens it,
+                // it uppercases stdin. The handler owns the question of whether
+                // the URL names anything; it gets SCRIPT_FILENAME and PATH_INFO
+                // and can answer 404 itself.
+                //
+                // Rejecting here cost school-tester tests 15 and 16, which are
+                // POSTs to /directory/youpla.bla -- a .bla that does not exist.
+                //
+                // The cost of this choice, stated honestly: for an INTERPRETER
+                // config (.py -> python3) a missing script now forks python3,
+                // which fails, and surfaces as 502 instead of 404. That is a
+                // defensible reading -- the gateway did fail -- but it is worse
+                // than the 404 it replaces, and it is the trade being made.
                 struct stat st;
-                if (stat(script_path.c_str(), &st) != 0) {
-                    _startErrorResponse(client, 404, FRAMING_INTACT);
-                    return;
-                }
-                if (!S_ISREG(st.st_mode)) {
+                const bool script_exists = (stat(script_path.c_str(), &st) == 0);
+                // Both remaining checks apply ONLY to a script that exists. They
+                // are still worth keeping: each turns a confusing 502 from a
+                // failed execve into an honest refusal.
+                if (script_exists && !S_ISREG(st.st_mode)) {
                     // Closes the directory-named-`.sh` hole: without this a
                     // directory matching a cgi_extension would be handed to
                     // execve, which fails in the child and surfaces as a
@@ -1093,7 +1112,7 @@ void Server::_processRequest(Client* client) {
                 // every .py sitting at the usual mode 644 while being perfectly
                 // runnable. (A direct-exec configuration, where the handler IS
                 // the script, would need X_OK — we have no such config form.)
-                if (access(script_path.c_str(), R_OK) != 0) {
+                if (script_exists && access(script_path.c_str(), R_OK) != 0) {
                     _startErrorResponse(client, 403, FRAMING_INTACT);
                     return;
                 }
