@@ -20,6 +20,8 @@ HttpResponse Dispatcher::produce_response(const HttpRequest& request, const Serv
         const int code = location->redirect_code;
         if (code != 301 && code != 302 && code != 303 && code != 307 && code != 308)
             return HttpStatus::make_response(500);
+        if (!FileUtils::is_header_safe(location->redirect_url))
+            return HttpStatus::make_response(500);
         HttpResponse response = HttpStatus::make_response(location->redirect_code);
         response.headers["Location"] = location->redirect_url;
         return response;
@@ -54,6 +56,15 @@ HttpResponse Dispatcher::produce_response(const HttpRequest& request, const Serv
     }
     if (request.method == "GET")
         return GetHandler::handle(request, *location);
+    if (request.method == "HEAD")
+    {
+        HttpResponse response = GetHandler::handle(request, *location);
+        std::ostringstream length;
+        length << response.body.size();
+        response.headers["Content-Length"] = length.str();
+        response.body.clear();
+        return response;
+    }
     if (request.method == "DELETE")
         return DeleteHandler::handle(request, *location);
     if (request.method == "POST")
@@ -62,12 +73,15 @@ HttpResponse Dispatcher::produce_response(const HttpRequest& request, const Serv
     return HttpStatus::make_response(501);
 }
 
-void Dispatcher::attach_error_body(HttpResponse& response, const ServerConfig& server)
+void Dispatcher::attach_error_body(const HttpRequest& request, HttpResponse& response, const ServerConfig& server)
 {
     if (response.status_code < 400)
         return;
 
     if (!response.body.empty())
+        return;
+
+    if (request.method == "HEAD")
         return;
 
     const std::map<int, std::string>::const_iterator pages = server.error_pages.find(response.status_code);
@@ -91,9 +105,26 @@ void Dispatcher::attach_error_body(HttpResponse& response, const ServerConfig& s
     response.headers["Content-Type"] = "text/html; charset=UTF-8";
 }
 
+static bool headers_are_safe(const HttpResponse& response)
+{
+    for (std::map<std::string, std::string>::const_iterator it = response.headers.begin();
+         it != response.headers.end(); ++it)
+    {
+        if (!FileUtils::is_header_safe(it->first) || !FileUtils::is_header_safe(it->second))
+            return false;
+    }
+    return true;
+}
+
 HttpResponse Dispatcher::dispatch(const HttpRequest& request, const ServerConfig& server)
 {
     HttpResponse response = produce_response(request, server);
-    attach_error_body(response, server);
+
+    if (!headers_are_safe(response))
+    {
+        response = HttpStatus::make_response(500);
+    }
+
+    attach_error_body(request, response, server);
     return response;
 }
