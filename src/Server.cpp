@@ -1284,6 +1284,39 @@ void Server::_advanceRequest(Client* client) {
         return;
     }
 
+    // HTTP/1.1 without a Host header is invalid, and the rule is a MUST:
+    // RFC 9112 3.2 -- "A server MUST respond with a 400 (Bad Request) status
+    // code to any HTTP/1.1 request message that lacks a Host header field."
+    // MEASURED before this existed: `GET / HTTP/1.1` with no Host returned
+    // 200 OK. It matters beyond conformance -- Host is what selects the virtual
+    // host, so serving a request without one silently hands the client whatever
+    // the default server happens to be.
+    //
+    // Checked HERE, not in the parser: the parser is B's and this is a rule
+    // about which server should answer, which is my half of the seam. It runs
+    // before _resolveServerConfig for the same reason -- there is no vhost to
+    // resolve for a request that is not going to be answered.
+    //
+    // HTTP/1.0 is deliberately exempt; Host did not exist before 1.1, and
+    // _resolveServerConfig already treats its absence as "use the default
+    // server". Only 1.1 is required to carry it.
+    //
+    // KNOWN GAP, stated rather than hidden: RFC 9112 3.2 also requires 400 for
+    // a request carrying MORE THAN ONE Host field. We cannot see that here --
+    // headers arrive as a std::map, so duplicates have already collapsed to one
+    // entry. Catching it needs the parser, which is B's file.
+    if ((client->request.state == READING_BODY ||
+         client->request.state == COMPLETE) &&
+        client->request.version == "HTTP/1.1" &&
+        client->request.headers.find("host") == client->request.headers.end()) {
+        // FRAMING_INTACT only once the whole request is in: at READING_BODY the
+        // body is still arriving and we would leave unread bytes in the stream,
+        // which is the same desync the 413 gates avoid.
+        _startErrorResponse(client, 400,
+            client->request.state == COMPLETE ? FRAMING_INTACT : FRAMING_LOST);
+        return;
+    }
+
     // Headers are in as soon as the parser leaves the header section, so settle
     // the virtual host here rather than at COMPLETE — that way the body is
     // accumulated under the right server's client_max_body_size, not the
