@@ -526,6 +526,12 @@ static const size_t MAX_HEADER_BYTES = 8192;
 // what that kind of accidental coupling costs.
 static const size_t CHUNK_FRAMING_SLACK = 8192;
 
+// Below this, reclaiming input_buf's capacity costs more than it saves: the
+// allocation is cheap to keep and re-growing it for the next request on a
+// kept-alive connection is the common case. Above it, the buffer is a body-sized
+// block that would otherwise be held until the client disconnects.
+static const size_t INPUT_BUF_SHRINK_ABOVE = 64 * 1024;
+
 // ── Two clocks, and they measure different things ────────────────────────────
 // IDLE: "you have sent me nothing at all for this long." Refreshed by activity.
 // REQUEST: "you began a request this long ago and still have not finished it."
@@ -1416,6 +1422,24 @@ void Server::_advanceRequest(Client* client) {
     // own copies, so the raw bytes are no longer needed.
     client->input_buf.erase(0, consumed);
 
+    // erase() drops SIZE, never CAPACITY. After a 100 MB upload this buffer
+    // still owns 100 MB of allocation while holding nothing, and it keeps it
+    // for the life of the connection. MEASURED before this: one 100 MB POST
+    // left the server at ~2.3x the payload in RSS, and twenty concurrent ones
+    // were OOM-killed at 2.68 GB by the kernel -- school tester test 24.
+    //
+    // The copy-and-swap is the C++98 shrink-to-fit: the temporary allocates
+    // only size() bytes, the swap hands it our oversized block, and the
+    // temporary dies at the end of the statement taking that block with it.
+    // Any pipelined bytes are copied across, so the next request is untouched.
+    //
+    // Guarded so ordinary small requests never pay for it: only a buffer that
+    // is both large and now mostly empty is worth an allocation to reclaim.
+    if (client->input_buf.capacity() > INPUT_BUF_SHRINK_ABOVE &&
+        client->input_buf.size() < client->input_buf.capacity() / 4) {
+        std::string(client->input_buf).swap(client->input_buf);
+    }
+
     client->request_start = 0;               // request landed; stop its clock
     client->state = Client::PROCESSING;
     _processRequest(client);
@@ -2039,6 +2063,17 @@ void Server::_handleCgiStdinWrite(Client* client) {
         // the CGI timeout kills it — which presents as "the timeout is buggy"
         // and is actually "we never let go of the pipe".
         _closeCgiStdin(client);
+
+        // The script now has every byte, so our copy is dead weight -- and for
+        // a 100 MB upload it is 100 MB of dead weight held until the response
+        // finishes draining. Released here rather than at resetForNextRequest,
+        // which is far too late when twenty of these overlap.
+        //
+        // Safe at exactly this point: `body` is not touched again below, the
+        // only other reader is _rebuildPollFds' POLLOUT test, which is now
+        // 0 >= 0 and correctly asks for nothing, and the handlers that read
+        // request.body are the NON-CGI path and already ran or never will.
+        std::string().swap(client->request.body);
     }
 }
 
