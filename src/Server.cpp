@@ -614,6 +614,32 @@ static bool requestWantsKeepAlive(const HttpRequest& request) {
     return true;                                   // HTTP/1.1 default
 }
 
+// A response to HEAD carries the GET's headers and not one byte of body
+// (RFC 7231 4.3.2). Applied to the SERIALIZED wire, never to the body before
+// serialization: Content-Length must stay the length the GET would have sent,
+// and truncating text cannot change a header that is already in it. Clearing
+// the body first instead yields Content-Length: 0, which is the classic way to
+// break every client that uses HEAD to size a download.
+//
+// One helper, two call sites, because there are two places a response becomes
+// bytes and they do NOT share a path: _processRequest goes through
+// ResponseBuilder, while _startErrorResponse frames its own wire by hand. The
+// second was missed when the first was written, so every pre-parse rejection
+// -- 400, 408, 413, 431, 505 -- answered HEAD with a full body. MEASURED before
+// this existed: HEAD with a bad version returned 505 with 125 bytes of HTML,
+// HEAD with oversized headers returned 431 with 135. Those are exactly the
+// paths the school tester exercises.
+//
+// CGI is deliberately NOT covered here and is a separate decision -- it streams
+// the script's output chunked straight to the socket, touching neither wire.
+static void stripBodyForHead(const HttpRequest& request, std::string& wire) {
+    if (request.method != "HEAD")
+        return;
+    const std::string::size_type head_end = wire.find("\r\n\r\n");
+    if (head_end != std::string::npos)
+        wire.erase(head_end + 4);
+}
+
 // `framing` is required rather than inferred from status_code. Whether the
 // connection survives depends on whether we still know where this request
 // ended — which the caller knows and the status number does not. The old
@@ -656,7 +682,8 @@ void Server::_startErrorResponse(Client* client, int status_code,
          << "Connection: " << (client->keep_alive ? "keep-alive" : "close") << "\r\n"
          << "\r\n";
 
-    const std::string wire = head.str() + body;
+    std::string wire = head.str() + body;
+    stripBodyForHead(client->request, wire);
     client->output_buf.assign(wire.begin(), wire.end());
     client->beginSending();
 
@@ -1184,11 +1211,7 @@ void Server::_processRequest(Client* client) {
     // from body.size() (:39), so a handler that clears the body to make a HEAD
     // gets Content-Length: 0 on the wire no matter what header it also set.
     // Stripping AFTER serialization is what keeps the GET's length intact.
-    if (client->request.method == "HEAD") {
-        const std::string::size_type head_end = wire.find("\r\n\r\n");
-        if (head_end != std::string::npos)
-            wire.erase(head_end + 4);
-    }
+    stripBodyForHead(client->request, wire);
 
     client->output_buf.assign(wire.begin(), wire.end()); // why assign and not another alternative, if there are even
     client->beginSending();
@@ -1314,11 +1337,26 @@ void Server::_advanceRequest(Client* client) {
          client->request.state == COMPLETE) &&
         client->request.version == "HTTP/1.1" &&
         client->request.headers.find("host") == client->request.headers.end()) {
-        // FRAMING_INTACT only once the whole request is in: at READING_BODY the
-        // body is still arriving and we would leave unread bytes in the stream,
-        // which is the same desync the 413 gates avoid.
-        _startErrorResponse(client, 400,
-            client->request.state == COMPLETE ? FRAMING_INTACT : FRAMING_LOST);
+        if (client->request.state == COMPLETE) {
+            // The request is whole and well framed, so the connection can be
+            // reused -- but ONLY if its bytes are dropped first.
+            //
+            // This return skips the erase at the bottom of the function. Leaving
+            // the bytes there and keeping the connection alive makes
+            // resetForNextRequest recycle a buffer that still holds this exact
+            // request, which is parsed again, rejected again, forever. MEASURED
+            // when this erase was missing: one 22-byte request produced 39 MB of
+            // 400s in 4 seconds and did not stop. Every other FRAMING_INTACT
+            // error in the program is raised from _processRequest, which runs
+            // AFTER the erase -- this check is the only one upstream of it, which
+            // is exactly why it is the only one that had to do this itself.
+            client->input_buf.erase(0, consumed);
+            _startErrorResponse(client, 400, FRAMING_INTACT);
+        } else {
+            // Body still arriving: bytes we will never read remain in the
+            // stream, so the connection is desynced. Same call as the 413 gates.
+            _startErrorResponse(client, 400, FRAMING_LOST);
+        }
         return;
     }
 
