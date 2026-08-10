@@ -126,6 +126,8 @@ private:
     // timer plus an absolute ceiling derived from client_max_body_size. Lives
     // here rather than on Client because the ceiling needs the resolved config.
     bool _isReadOverdue(const Client* client) const;
+    // Bytes every live connection is currently holding for request bodies.
+    size_t _inflightBodyBytes() const;
     // Picks the server block by Host among those sharing the client's endpoint.
     // Call once per request, after the parser reports COMPLETE.
     void _resolveServerConfig(Client* client);

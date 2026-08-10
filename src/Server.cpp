@@ -14,6 +14,7 @@
 #include <cctype>
 #include <ctime>
 #include <cerrno>
+#include <fstream>
 #include <csignal>
 #include <stdint.h>
 #include <sstream>
@@ -532,6 +533,68 @@ static const size_t CHUNK_FRAMING_SLACK = 8192;
 // block that would otherwise be held until the client disconnects.
 static const size_t INPUT_BUF_SHRINK_ABOVE = 64 * 1024;
 
+// Past this much buffered body, a request counts as committed: the budget will
+// let it finish rather than throw the work away. Small enough that a burst of
+// newcomers is still shed promptly, large enough that ordinary uploads are never
+// caught mid-flight by someone else's traffic.
+static const size_t BUDGET_COMMIT_GRACE = 1024 * 1024;
+
+// ── The last line of defence: a server-wide budget on buffered body bytes ─────
+// We hold a request body in RAM while it arrives (1.10x the payload after
+// 81536f4). Twenty concurrent 100 MB uploads is 2 GB, and on a small machine the
+// kernel resolves that by killing us -- MEASURED, school tester test 24:
+//
+//     Out of memory: Killed process (webserv) anon-rss:2677788kB
+//
+// The subject is unambiguous that this is not acceptable: "Your server must
+// remain operational at all times." A refusal is a response; being OOM-killed is
+// not. So past the budget we answer 503 instead of accepting work we cannot
+// survive.
+//
+// Derived from the machine rather than hardcoded, for the same reason the read
+// deadline's ceiling is derived: a constant tuned on this laptop would be wrong
+// on every other one. At 40% of RAM the budget never binds on a 16 GB evaluation
+// machine (6.4 GB, far past what any test asks) and does bind on a 3.8 GB WSL box
+// (1.5 GB) exactly where we would otherwise die.
+//
+// It is a FLOOR under the crash, not a substitute for streaming: it converts
+// death into refusal, it does not make the request cheap.
+static size_t inflightBodyBudget() {
+    static size_t budget = 0;
+    if (budget != 0)
+        return budget;
+    budget = 512UL * 1024UL * 1024UL;          // fallback if /proc is unreadable
+    std::ifstream meminfo("/proc/meminfo");
+    if (meminfo) {
+        std::string key;
+        unsigned long kb = 0;
+        while (meminfo >> key) {
+            if (key == "MemTotal:") {
+                if (meminfo >> kb && kb > 0)
+                    budget = (static_cast<size_t>(kb) * 1024UL / 10UL) * 4UL;
+                break;
+            }
+            std::getline(meminfo, key);
+        }
+    }
+    return budget;
+}
+
+// Sum of what every connection is currently holding. Recomputed rather than
+// tracked incrementally on purpose: a running counter needs a release on every
+// exit path -- completion, 413, deadline, disconnect, CGI failure -- and one
+// missed release silently wedges the server closed. The loop is over live
+// clients only and runs once per recv; correctness is worth more than the cycles.
+size_t Server::_inflightBodyBytes() const {
+    size_t total = 0;
+    for (std::map<int, Client*>::const_iterator it = clients.begin();
+         it != clients.end(); ++it) {
+        total += it->second->input_buf.size();
+        total += it->second->request.body.size();
+    }
+    return total;
+}
+
 // ── Two clocks, and they measure different things ────────────────────────────
 // IDLE: "you have sent me nothing at all for this long." Refreshed by activity.
 // REQUEST: "you began a request this long ago and still have not finished it."
@@ -591,6 +654,7 @@ static std::string reasonPhrase(int code) {
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
         case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
         case 504: return "Gateway Timeout";
         case 505: return "HTTP Version Not Supported";
         default:  return "Error";
@@ -887,6 +951,53 @@ bool Server::_enforceReadLimits(Client* client) {
         // The three gates below are not redundant; each one is the only gate
         // reachable in its own case.
         if (client->request.state == READING_BODY) {
+            // Budget check before either size gate: those bound ONE request
+            // against its location's cap, which says nothing about twenty of
+            // them at once. This is the only check that looks at the server as a
+            // whole.
+            //
+            // Shed the NEWEST, never the nearly-finished. A flat "over budget ->
+            // refuse" turns out to refuse everyone: twenty uploads that started
+            // together cross the line together, and the next recv on each one
+            // rejects it -- MEASURED, 0 of 20 completed. Killing an upload that
+            // is 99 MB in wastes everything already spent on it and frees the
+            // memory a moment later anyway.
+            //
+            // So a request that has already buffered more than the grace amount
+            // is treated as committed and allowed to finish, while one still at
+            // the start is turned away. The admitted set drains, the budget
+            // recovers, and the refused clients get an honest 503 instead of the
+            // whole server being killed.
+            //
+            // FRAMING_LOST: the body is still arriving and we will never read the
+            // rest of it, so the connection cannot be reused.
+            // TWO levels, because the grace alone is not a bound. MEASURED with
+            // only the soft check: twenty uploads all passed the grace within
+            // their first few recvs, every one of them counted as committed, and
+            // the server ran to 2.14 GB against a 1.49 GB budget. A limit that
+            // politeness can walk through is not a limit -- it is worse than
+            // none, because it looks like protection.
+            const size_t inflight = _inflightBodyBytes();
+            const size_t budget   = inflightBodyBudget();
+            const size_t own_body =
+                (client->input_buf.size() > client->header_bytes)
+                    ? client->input_buf.size() - client->header_bytes : 0;
+
+            // SOFT: shed newcomers, let the committed finish. Killing an upload
+            // that is 99 MB in wastes everything spent on it and frees the memory
+            // a moment later anyway, so a request past the grace is allowed to
+            // land while one still at the start is turned away.
+            const bool soft_hit = (inflight > budget) &&
+                                  (own_body < BUDGET_COMMIT_GRACE);
+            // HARD: no exemptions. This is the one that actually bounds us, and
+            // it is the difference between refusing work and being OOM-killed.
+            const bool hard_hit = inflight > budget + budget / 4;
+
+            if (soft_hit || hard_hit) {
+                _startErrorResponse(client, 503, FRAMING_LOST);
+                return false;
+            }
+
             std::map<std::string, std::string>::const_iterator cl =
                 client->request.headers.find("content-length");
 
