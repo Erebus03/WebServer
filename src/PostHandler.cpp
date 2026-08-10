@@ -65,9 +65,6 @@ HttpResponse PostHandler::handle(const HttpRequest& request, const LocationConfi
     if (!FileUtils::file_exists(location.upload_dir) || !FileUtils::is_directory(location.upload_dir))
         return HttpStatus::make_response(500);
 
-    if (request.body.empty())
-        return HttpStatus::make_response(400);
-
     const std::string boundary =
         MultipartParser::boundaryFrom(header_value(request, "content-type"));
 
@@ -84,14 +81,14 @@ HttpResponse PostHandler::handle(const HttpRequest& request, const LocationConfi
         if (!FileUtils::resolve_path(location.upload_dir, filename, diskPath))
             return HttpStatus::make_response(500);
 
-        if (FileUtils::file_exists(diskPath))
-            return HttpStatus::make_response(409);
+        const bool replaced = FileUtils::file_exists(diskPath);
 
         if (!FileUtils::write_file(diskPath, request.body))
             return HttpStatus::make_response(500);
 
-        HttpResponse response = HttpStatus::make_response(201);
-        const std::string dir = request.uri.substr(0, slash + 1);
+        HttpResponse response = HttpStatus::make_response(replaced ? 200 : 201);
+        const std::string dir =
+            (slash == std::string::npos) ? "/" : request.uri.substr(0, slash + 1);
         response.headers["Location"] = dir + UrlCodec::encode(filename);
         return response;
     }

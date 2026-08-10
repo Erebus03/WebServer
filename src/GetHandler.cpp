@@ -23,6 +23,9 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
     {
         if (request.uri.empty() || request.uri[request.uri.length() - 1] != '/')
         {
+            if (!FileUtils::is_header_safe(request.query_string))
+                return HttpStatus::make_response(400);
+
             HttpResponse response = HttpStatus::make_response(301);
             std::string target = request.uri + "/";
             if (!request.query_string.empty())
@@ -47,7 +50,6 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
 
         if (!foundIndex)
         {
-
             if (!location.dir_listing)
                 return HttpStatus::make_response(404);
 
