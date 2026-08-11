@@ -126,6 +126,70 @@ def chunked(payload, size=16384):
         out+=f"{len(c):X}\r\n".encode()+c+b"\r\n"
     return out+b"0\r\n\r\n"
 
+def post_stream_chunked(port, path, total, block=65536, timeout=240):
+    """
+    Stream `total` bytes as chunked WITHOUT ever holding them in RAM.
+
+    One reused block, framed on the fly, so 20 of these cost ~1 MB of client
+    memory between them. Buffering the payload client-side is the trap that made
+    an earlier measurement blame the server for an OOM the harness caused
+    (study/T4 section 4) -- do not "simplify" this into building the body first.
+
+    Returns (status, note). Watches for readability WHILE sending, because a
+    server that refuses early closes mid-upload and a plain sendall() would lose
+    the reply to EPIPE.
+    """
+    import select
+    blk = b"z" * block
+    framed = ("%X\r\n" % block).encode() + blk + b"\r\n"
+    s = socket.socket(); s.settimeout(timeout)
+    try:
+        s.connect(("127.0.0.1", port))
+        s.sendall((f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                   "Transfer-Encoding: chunked\r\n"
+                   "Content-Type: application/octet-stream\r\n"
+                   "Connection: close\r\n\r\n").encode())
+        sent = 0
+        while sent < total:
+            if select.select([s], [], [], 0)[0]:
+                break                       # server answered early (refusal)
+            n = min(block, total - sent)
+            s.sendall(framed if n == block
+                      else ("%X\r\n" % n).encode() + blk[:n] + b"\r\n")
+            sent += n
+        else:
+            s.sendall(b"0\r\n\r\n")
+        out = b""
+        while True:
+            try: c = s.recv(65536)
+            except socket.timeout: return (0, "timeout")
+            if not c: break
+            out += c
+        return (status(out), "sent %d/%d B" % (sent, total))
+    except ConnectionResetError:
+        return ("connection reset (reply discarded)", "reset after %d B" % sent)
+    except BrokenPipeError:
+        return ("broken pipe (no reply)", "EPIPE after %d B" % sent)
+    except OSError as e:
+        return (0, "error %s" % e)
+    finally:
+        try: s.close()
+        except OSError: pass
+
+def mem_total_kb():
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"): return int(line.split()[1])
+    except OSError: pass
+    return 0
+
+def vm_hwm_kb(pid):
+    try:
+        for line in open("/proc/%d/status" % pid):
+            if line.startswith("VmHWM:"): return int(line.split()[1])
+    except OSError: pass
+    return 0
+
 # ── server lifecycle ─────────────────────────────────────────────────────────
 def free_port(start):
     p=start
@@ -180,6 +244,13 @@ sys.stdout.write("CL=%s\\n" % n)
 sys.stdout.write("BODYLEN=%d\\n" % len(body))
 """
 
+CGI_BAD  = "#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n"
+CGI_LOOP = "#!/usr/bin/env python3\nwhile True: pass\n"
+CGI_REL  = ("#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdout.write('Content-Type: text/plain\\r\\n\\r\\n')\n"
+            "sys.stdout.write(open('data.txt').read())\n")
+
 def build_tree(base):
     w=os.path.join(base,"www")
     for d in ("", "open", "noidx", "cgi", "all"): os.makedirs(os.path.join(w,d), exist_ok=True)
@@ -189,9 +260,40 @@ def build_tree(base):
     open(os.path.join(w,"open","file.txt"),"w").write("OPENFILE\n")
     open(os.path.join(w,"all","index.html"),"w").write("<html>ALL</html>\n")
     open(os.path.join(w,"noidx","hidden.txt"),"w").write("HIDDEN\n")
-    p=os.path.join(w,"cgi","hello.py")
-    open(p,"w").write(CGI_SCRIPT); os.chmod(p,0o755)
+    for name,src in (("hello.py",CGI_SCRIPT),("bad.py",CGI_BAD),
+                     ("loop.py",CGI_LOOP),("relpath.py",CGI_REL)):
+        f=os.path.join(w,"cgi",name); open(f,"w").write(src); os.chmod(f,0o755)
+    open(os.path.join(w,"cgi","data.txt"),"w").write("RELDATA")
+    open(os.path.join(base,"custom404.html"),"w").write("<html>CUSTOM404</html>\n")
     return w
+
+def vhost_conf(base, p1, p2, www):
+    """Second config: two ports, two hostnames on one port, a custom error page."""
+    return f"""server {{
+    listen 127.0.0.1:{p1};
+    server_name alpha.test;
+    root {www};
+    index index.html;
+    error_page 404 /custom404.html;
+    location / {{ allowed_methods GET; }}
+}}
+
+server {{
+    listen 127.0.0.1:{p1};
+    server_name beta.test;
+    root {os.path.join(www,'open')};
+    index file.txt;
+    location / {{ allowed_methods GET; directory_listing on; }}
+}}
+
+server {{
+    listen 127.0.0.1:{p2};
+    server_name gamma.test;
+    root {os.path.join(www,'all')};
+    index index.html;
+    location / {{ allowed_methods GET; }}
+}}
+"""
 
 def main_conf(base, port, www):
     py = shutil.which("python3") or "/usr/bin/python3"
@@ -226,6 +328,7 @@ def main_conf(base, port, www):
 
     location /cgi {{
         allowed_methods GET POST;
+        client_max_body_size 500M;
         cgi_extension .py {py};
     }}
 
@@ -430,6 +533,10 @@ def group_limits(r, port):
              headers={"Content-Length":"999999"},body=b"x"*10)
     r.check(status(resp)==413, "declared 1 MB against a 200 B cap",
             "an oversized declaration is refused before the bytes arrive", 413, status(resp), resp)
+    st,note = post_stream_chunked(port,"/upload/e.txt", 5*1024*1024)
+    r.check(st==413, "5 MB streamed against a 200 B cap",
+            "the 413 must ARRIVE; refusing by TCP reset is not a response",
+            413, f"{st} ({note})")
     resp=req(port,method="POST",path="/upload/d.txt",body=b"")
     r.check(status(resp) in (200,201), "POST with an empty body",
             "a zero-length POST is legal HTTP, not a 400", "200/201", status(resp), resp)
@@ -488,12 +595,192 @@ def group_load(r, port, srv):
             "the subject requires it stays operational at all times", "alive",
             "exited" if not srv.alive() else "alive")
 
+# ── group 9: memory under load — the school tester's test 24 ────────────────
+def group_heavy(r, port, srv, size_mb, workers):
+    """
+    The one the school tester dies on: many concurrent large POSTs to a CGI.
+
+    What is asserted is NOT "they all succeed". Refusing is a legitimate answer
+    when the machine cannot hold the work -- the subject's requirement is that the
+    server stays up and ANSWERS. So: every client must get an HTTP status line,
+    the process must survive, and peak RSS must stay under the in-flight budget
+    plus slack. A 503 passes. An OOM, a reset or a hang does not.
+    """
+    import threading
+    r.group(f"memory under load — {workers} x {size_mb} MB POST to a CGI (school test 24)")
+    mt = mem_total_kb()
+    budget_kb = (mt // 10) * 4                       # server's own 40%-of-RAM rule
+    hard_kb   = budget_kb + budget_kb // 4           # its hard ceiling
+    total_mb  = workers * size_mb
+    print(f"        {C.D}MemTotal {mt//1024} MB · offering {total_mb} MB · "
+          f"budget {budget_kb//1024} MB · hard {hard_kb//1024} MB{C.X}")
+
+    res=[]; lock=threading.Lock()
+    def one():
+        st,note = post_stream_chunked(port, "/cgi/hello.py", size_mb*1024*1024)
+        with lock: res.append((st,note))
+    ts=[threading.Thread(target=one) for _ in range(workers)]
+    t0=time.time()
+    for t in ts: t.start()
+    for t in ts: t.join()
+    dur=time.time()-t0
+
+    alive = srv.alive()
+    hwm   = vm_hwm_kb(srv.p.pid) if alive else 0
+    codes = [st for st,_ in res]
+    answered = sum(1 for c in codes if isinstance(c,int) and c>0)
+    ok2xx    = sum(1 for c in codes if isinstance(c,int) and 200<=c<300)
+    refused  = sum(1 for c in codes if isinstance(c,int) and c in (503,507,413))
+    broken   = [c for c in codes if not isinstance(c,int) or c<=0]
+
+    r.check(alive, "server survives the load",
+            "subject: must remain operational at all times -- an OOM kill is a zero",
+            "alive", "process gone (OOM/crash)")
+    r.check(answered==workers, f"all {workers} clients get an answer",
+            "a refusal is fine; silence, a reset or a hang is not",
+            f"{workers} status lines", f"{answered} ({len(broken)} broken: {sorted(set(map(str,broken)))[:3]})")
+    if alive and hard_kb:
+        r.check(hwm <= hard_kb + 65536, "peak RSS stays under the budget",
+                f"in-flight body budget is 40% of RAM + 25% slack",
+                f"<= {(hard_kb+65536)//1024} MB", f"{hwm//1024} MB")
+    print(f"        {C.D}{ok2xx} accepted · {refused} refused · "
+          f"peak {hwm//1024} MB · {dur:.1f}s{C.X}")
+
+# ── group: virtual hosts and multiple ports (correction sheet) ──────────────
+def group_vhost(r, p1, p2, base, www):
+    r.group("multiple servers — ports and hostnames (correction sheet)")
+    resp=req(p1,path="/",host="alpha.test")
+    r.check(status(resp)==200 and b"INDEX" in body_of(resp), "Host: alpha.test",
+            "same port, first server_name -> its own root", "200 + INDEX", status(resp), resp)
+    resp=req(p1,path="/",host="beta.test")
+    r.check(status(resp)==200 and b"OPENFILE" in body_of(resp), "Host: beta.test",
+            "same port, different server_name -> a different root", "200 + OPENFILE",
+            status(resp), resp)
+    resp=req(p1,path="/",host="nobody.test")
+    r.check(status(resp)==200 and b"INDEX" in body_of(resp), "Host: unknown",
+            "an unmatched Host falls back to the first server on that port",
+            "200 + INDEX (default)", status(resp), resp)
+    resp=req(p2,path="/",host="gamma.test")
+    r.check(status(resp)==200 and b"ALL" in body_of(resp), "second port",
+            "a second listen serves its own site", "200 + ALL", status(resp), resp)
+
+def group_errorpage(r, p1):
+    r.group("custom error pages (correction sheet)")
+    resp=req(p1,path="/definitely-missing",host="alpha.test")
+    b=body_of(resp)
+    r.check(status(resp)==404 and b"CUSTOM404" in b, "error_page 404 is served",
+            "the sheet asks specifically that a custom 404 be configurable",
+            "404 + CUSTOM404", f"{status(resp)} + {'default page' if b else 'empty'}", resp)
+
+def group_cgi_errors(r, port):
+    r.group("CGI error handling (correction sheet)")
+    resp=req(port,path="/cgi/relpath.py")
+    r.check(b"RELDATA" in body_of(resp), "script's relative paths resolve",
+            "the sheet: the CGI must run in its own directory", "RELDATA", status(resp), resp)
+    resp=req(port,path="/cgi/bad.py")
+    r.check(status(resp) in (500,502), "script exits without output",
+            "a broken script is a gateway error, not a crash or a hang", "500/502",
+            status(resp), resp)
+    resp=req(port,path="/cgi/nosuch.py")
+    r.check(status(resp) in (404,500,502), "script that does not exist",
+            "a missing script must be an error, never an exec of nothing", "404/502",
+            status(resp), resp)
+    t0=time.time()
+    resp=send_raw(port, f"GET /cgi/loop.py HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                  timeout=45)          # server kills at CGI_TIMEOUT_SEC = 30
+    dur=time.time()-t0
+    r.check(status(resp) in (500,502,504), "infinite-loop script",
+            f"killed at the CGI deadline and answered, not left hanging ({dur:.0f}s)",
+            "504", status(resp), resp)
+    resp=req(port,path="/")
+    r.check(status(resp)==200, "server still serves after all that",
+            "one bad script must not take the server with it", 200, status(resp), resp)
+
+def group_malformed(r, port):
+    r.group("malformed input — the subject says never crash")
+    cases=[
+        ("empty request",        b"\r\n\r\n",                                    "nothing at all"),
+        ("only CRLF",            b"\r\n",                                         "a blank line is not a request"),
+        ("garbage bytes",        b"\x00\x01\x02\xff binary junk\r\n\r\n",      "non-HTTP noise on the socket"),
+        ("no HTTP version",      b"GET /\r\nHost: x\r\n\r\n",                   "request line must have three parts"),
+        ("bad Content-Length",   b"POST /upload/x HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n", "non-numeric length"),
+        ("negative Content-Length", b"POST /upload/x HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\n", "length cannot be negative"),
+        ("two Content-Lengths",  b"POST /upload/x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 9\r\n\r\nhello", "conflicting framing"),
+        ("CL + chunked",         b"POST /upload/x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "smuggling shape: both framings"),
+        ("bad chunk size",       b"POST /upload/x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nab\r\n0\r\n\r\n", "chunk length must be hex"),
+        ("absolute-form URI",    b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: x\r\n\r\n", "RFC 9112 3.2.2: servers must accept it"),
+    ]
+    for name, raw, why in cases:
+        resp=send_raw(port, raw)
+        st=status(resp)
+        ok = (isinstance(st,int) and st>0) or resp==b""     # answered, or closed cleanly
+        r.check(ok, name, why, "a status line or a clean close", st, resp)
+    resp=req(port,path="/")
+    r.check(status(resp)==200, "server alive after the battery",
+            "none of the above may take it down", 200, status(resp), resp)
+
+def group_fdleak(r, port, srv):
+    r.group("descriptor hygiene — no hanging connections")
+    def nfd():
+        try: return len(os.listdir("/proc/%d/fd" % srv.p.pid))
+        except OSError: return -1
+    for _ in range(20): req(port,path="/")
+    before=nfd()
+    for _ in range(120): req(port,path="/")
+    after=nfd()
+    r.check(after>=0 and after<=before+2, "fd count stable over 120 requests",
+            "a closed connection must give its descriptor back",
+            f"<= {before+2}", after)
+    # abandoned connections must be reaped too
+    socks=[]
+    for _ in range(20):
+        try:
+            s=socket.socket(); s.settimeout(2); s.connect(("127.0.0.1",port)); socks.append(s)
+        except OSError: pass
+    for s in socks:
+        try: s.close()
+        except OSError: pass
+    for _ in range(10): req(port,path="/")
+    r.check(nfd()<=before+4, "fds released after abandoned connections",
+            "clients that connect and vanish must not accumulate",
+            f"<= {before+4}", nfd())
+
+def group_siege(r, port, srv, n=400):
+    r.group("sustained load (siege equivalent)")
+    def rss():
+        try:
+            for line in open("/proc/%d/status" % srv.p.pid):
+                if line.startswith("VmRSS:"): return int(line.split()[1])
+        except OSError: pass
+        return 0
+    for _ in range(50): req(port,path="/")
+    base_rss=rss()
+    good=0
+    for _ in range(n):
+        if status(req(port,path="/"))==200: good+=1
+    avail=100.0*good/n
+    r.check(avail>=99.5, f"availability over {n} GETs",
+            "the sheet requires >= 99.5% for a simple GET", ">= 99.5%", f"{avail:.1f}%")
+    grow=rss()-base_rss
+    r.check(grow<8192, "memory does not climb with traffic",
+            "the sheet: process memory must not go up indefinitely",
+            "< 8 MB growth", f"{grow//1024} MB")
+    r.check(srv.alive(), "still up after sustained load",
+            "siege -b must be usable without restarting the server", "alive", "gone")
+
 # ── main ────────────────────────────────────────────────────────────────────
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("-v","--verbose",action="store_true",help="print raw response on failure")
     ap.add_argument("-k",metavar="SUBSTR",help="only run groups matching this")
     ap.add_argument("--port",type=int,default=8300)
+    ap.add_argument("--heavy",action="store_true",
+                    help="also run the memory-under-load group (school test 24). Slow, and it "
+                         "deliberately pushes the box to its in-flight budget.")
+    ap.add_argument("--size",type=int,default=0,metavar="MB",
+                    help="MB per worker for --heavy (default: sized from MemTotal so the "
+                         "budget actually binds). Use 100 for the literal test 24.")
+    ap.add_argument("--workers",type=int,default=20,help="concurrent uploads for --heavy")
     a=ap.parse_args()
 
     if not os.path.isfile(BIN) or not os.access(BIN,os.X_OK):
@@ -512,7 +799,7 @@ def main():
         want=lambda n: (a.k is None) or (a.k.lower() in n.lower())
         if want("config"): group_config(r,base,port,www)
 
-        if any(want(g) for g in ("static","methods","http","limits","cgi","upload","robustness")):
+        if any(want(g) for g in ("static","methods","http","limits","cgi","upload","robustness","memory")):
             with Server(conf,base) as srv:
                 if not srv.wait_bound(port):
                     print(f"{C.R}server never bound on {port} — aborting{C.X}")
@@ -524,6 +811,50 @@ def main():
                 if want("cgi"):        group_cgi(r,port)
                 if want("upload"):     group_upload(r,port,base)
                 if want("robustness"): group_load(r,port,srv)
+                if want("malformed"):  group_malformed(r,port)
+                if want("cgi"):        group_cgi_errors(r,port)
+                if want("descriptor"): group_fdleak(r,port,srv)
+                if want("sustained"):  group_siege(r,port,srv)
+                if a.heavy and want("memory"):
+                    size=a.size
+                    if size<=0:
+                        # aim just past the 40% budget so it binds, without inviting the OOM killer
+                        size=max(4,int((mem_total_kb()/1024.0)*0.55/max(1,a.workers)))
+                    group_heavy(r,port,srv,size,a.workers)
+        # second config: two ports, two hostnames on one, a custom error page
+        if any(want(g) for g in ("multiple","error page","vhost","host")):
+            p1=free_port(port+10); p2=free_port(p1+1)
+            vconf=os.path.join(base,"vhost.conf")
+            open(vconf,"w").write(vhost_conf(base,p1,p2,www))
+            with Server(vconf,base) as v:
+                if v.wait_bound(p1):
+                    group_vhost(r,p1,p2,base,www)
+                    group_errorpage(r,p1)
+                else:
+                    r.bad("multi-server config binds","two ports, three server blocks",
+                          "bound","server never came up")
+
+        # the sheet says a duplicate listen "should not work"
+        if want("config"):
+            dup=os.path.join(base,"dup.conf")
+            dp=free_port(port+30)
+            open(dup,"w").write(
+                f"server {{ listen 127.0.0.1:{dp}; server_name same.test; root {www};\n"
+                f"  location / {{ allowed_methods GET; }} }}\n"
+                f"server {{ listen 127.0.0.1:{dp}; server_name same.test; root {www};\n"
+                f"  location / {{ allowed_methods GET; }} }}\n")
+            pr=subprocess.Popen([BIN,dup],cwd=base,
+                                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            time.sleep(0.35); running = pr.poll() is None
+            if running:
+                pr.terminate()
+                try: pr.wait(timeout=3)
+                except subprocess.TimeoutExpired: pr.kill(); pr.wait(timeout=3)
+            r.group("duplicate listen (correction sheet)")
+            r.check(not running, "same port + same server_name twice",
+                    "the sheet says this should not work (known: we accept it silently)",
+                    "rejected", "accepted")
+
         r.summary()
         return r.failed
     finally:
