@@ -11,11 +11,12 @@ mdFiles/UNDERSTANDING_GUIDE.md
 .idea/
 Makefile
 # tests/ sources ARE tracked — `make test` is useless if the tests it runs only
-# exist on one machine. Only the built binaries are ignored (no extension, so
-# they have to be listed by name).
-tests/test_config
-tests/test_http_parser
-tests/test_integration
+# exist on one machine. Only the built binaries are ignored. Listing them by name
+# drifted twice: tests/test_PostHandler was listed and does not exist here, and
+# four suites that gained a main() were never added. Match on "has no .cpp
+# extension" instead, so a new suite needs no edit here.
+tests/test_*
+!tests/test_*.cpp
 tests/dump_config
 # Scratch binaries built by hand at the repo root. rb_test (a 55 KB ELF) was
 # committed once already; this stops the next one.
@@ -30,11 +31,7 @@ report_chat
 /tester
 /cgi_tester
 /uploads/
-# built unit-test binaries (Makefile TEST_BINS)
-tests/test_config
-tests/test_PostHandler
-tests/test_integration
-tests/dump_config
+# (built unit-test binaries are covered by the tests/test_* rule above)
 
 # A's local session bootstrap. Deliberately NOT committed: CLAUDE.local.md
 # already shows what happens when a per-developer bootstrap becomes shared --

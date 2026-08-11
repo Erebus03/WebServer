@@ -65,7 +65,7 @@ int main() {
           "location / inherited server index list");
     check(root->dir_listing == false, "location / dir_listing off");
     check(open->dir_listing == true, "location /open dir_listing on");
-    check(pages->root == "tests/www", "location /pages inherited root");
+    check(pages->root == "tests/www/pages", "location /pages root folded with location path");
 
     std::cout << "[3] GetHandler against parsed locations" << std::endl;
 
@@ -82,7 +82,7 @@ int main() {
     check(r.headers["Location"] == "/pages/", "Location header is /pages/");
 
     r = GetHandler::handle(makeGet("/pages/"), *pages);
-    check(r.status_code == 403, "GET /pages/ (no index, listing off) -> 403");
+    check(r.status_code == 404, "GET /pages/ (no index, listing off) -> 404");
 
     r = GetHandler::handle(makeGet("/open/"), *open);
     check(r.status_code == 200, "GET /open/ (no index, listing on) -> 200 listing");

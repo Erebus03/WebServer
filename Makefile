@@ -62,16 +62,25 @@ LIB_OBJS = $(filter-out src/main.o,$(OBJS))
 # source against LIB_OBJS and nothing else. Verified with:
 #   for f in tests/test_*.cpp; do grep -qE '^\s*int\s+main\s*\(' $f && echo $f; done
 #
-# The other eight (test_router, test_http_parser, test_FileUtils, test_GetHandler,
-# test_Dispatcher, test_DirectoryLister, test_HttpStatus, test_DeleteHandler) have
-# NO main(). They cannot be built by this target and were never being run — they
-# used to sit in SRCS instead, which linked their test bodies into ./webserv as
-# dead weight. Listing one here fails the link with "undefined reference to main".
-# They need either a main() each or a shared runner; until then they are inert.
+# Re-derived 2026-08-11 with the command above, because this list had drifted
+# twice: it named tests/test_PostHandler.cpp, which exists only on origin/abdo and
+# not here, so `make test` died with "No rule to make target" before running
+# anything; and it claimed test_http_parser has no main(), which stopped being
+# true when B's suite merged. Five suites with a main() were therefore never run.
+#
+# The ones with NO main() (test_router, test_FileUtils, test_GetHandler,
+# test_Dispatcher, test_DirectoryLister, test_HttpStatus, test_DeleteHandler) still
+# cannot be built by this target: `tests/%` links one test source against LIB_OBJS
+# and nothing else, so listing one fails with "undefined reference to main". They
+# need a main() each or a shared runner; until then they are inert.
 TEST_SRCS = \
+	tests/test_cgi_response.cpp \
 	tests/test_config.cpp \
-	tests/test_PostHandler.cpp \
+	tests/test_http_parser.cpp \
 	tests/test_integration.cpp \
+	tests/test_mime_types.cpp \
+	tests/test_multipart.cpp \
+	tests/test_response_builder.cpp \
 
 TEST_BINS = $(TEST_SRCS:.cpp=)
 
