@@ -337,6 +337,12 @@ def main_conf(base, port, www):
         client_max_body_size 200;
     }}
 
+    location /files {{
+        allowed_methods GET;
+        alias {os.path.join(base,'uploads')};
+        directory_listing on;
+    }}
+
     location /cgi {{
         allowed_methods GET POST;
         client_max_body_size 500M;
@@ -584,9 +590,20 @@ def group_upload(r, port, base):
     resp=req(port,method="POST",path="/upload/up.txt",body=b"hello again")
     r.check(status(resp) in (200,201), "POST the same path twice",
             "re-uploading overwrites; it is not a 409 conflict", "200/201", status(resp), resp)
+    # The sheet asks for the round trip by name: "Upload some file to the server
+    # and get it back." Read back through /files, which aliases the same directory.
+    resp=req(port,path="/files/up.txt")
+    r.check(status(resp)==200 and b"hello again" in body_of(resp),
+            "GET the uploaded file back",
+            "the sheet asks for the round trip, not just the write",
+            "200 + the bytes we sent", f"{status(resp)} + {body_of(resp)[:20]!r}", resp)
     resp=req(port,method="DELETE",path="/upload/up.txt")
     r.check(status(resp) in (200,204), "DELETE the uploaded file",
             "DELETE removes it and answers 200/204", "200/204", status(resp), resp)
+    resp=req(port,path="/files/up.txt")
+    r.check(status(resp)==404, "the deleted file is really gone",
+            "a DELETE that answers 200 but leaves the file is worse than a failure",
+            404, status(resp), resp)
 
 # ── group 8: robustness ─────────────────────────────────────────────────────
 def group_load(r, port, srv):
