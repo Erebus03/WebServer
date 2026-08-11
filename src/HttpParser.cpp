@@ -216,6 +216,11 @@ bool HttpParser::parseHeaderLine(const std::string& line, std::string& name,
     size_t colon = line.find(':');
     if (colon == std::string::npos)
         return false;
+    // RFC 7230 3.2.4: no whitespace between field-name and colon. "Host :" would
+    // otherwise get silently trimmed to "Host" — but that's a request-smuggling
+    // vector (proxies disagree on it), so reject it with 400 instead of accepting.
+    if (colon > 0 && (line[colon - 1] == ' ' || line[colon - 1] == '\t'))
+        return false;
     name = toLowerCopy(trim(line.substr(0, colon)));
     if (name.empty())                  // ": value" or an all-whitespace name -> reject
         return false;
