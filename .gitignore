@@ -35,3 +35,9 @@ tests/test_config
 tests/test_PostHandler
 tests/test_integration
 tests/dump_config
+
+# A's local session bootstrap. Deliberately NOT committed: CLAUDE.local.md
+# already shows what happens when a per-developer bootstrap becomes shared --
+# it addresses Member B and misdirects everyone else who opens the repo.
+CLAUDE.md
+CLAUDE.local.md
