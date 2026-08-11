@@ -2,6 +2,7 @@
 #include "../includes/FileUtils.hpp"
 #include "../includes/DirectoryLister.hpp"
 #include "../includes/HttpStatus.hpp"
+#include "../includes/MimeTypes.hpp"
 #include <vector>
 #include <string>
 
@@ -71,5 +72,8 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
     if (!FileUtils::read_file(diskPath, response.body))
         return HttpStatus::make_response(500);
 
+    // label the file by its extension so browsers handle it right (css as css,
+    // json as json, ...). without this every file went out as text/html.
+    response.headers["Content-Type"] = MimeTypes::typeFor(diskPath);
     return response;
 }
