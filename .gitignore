@@ -25,6 +25,10 @@ a.out
 claude_chat
 .mcp.json
 study/
+# Outgoing teammate messages: local relay material, pasted by hand. Keeping them
+# out of the repo is the point -- a stale message that still names a teammate's
+# bug gets re-sent by accident.
+msgs/
 report_chat
 
 # school-provided binaries and runtime output
