@@ -177,8 +177,22 @@ void Server::run() {
         std::vector<struct pollfd> pollfds;
         _rebuildPollFds(pollfds);
         
-        // Wait for events (5 second timeout)
-        int nready = poll(&pollfds[0], pollfds.size(), 5000);
+        // A draining connection is waiting to be told its receive queue is
+        // empty, and that answer is "poll returned and POLLIN was not set" --
+        // which cannot arrive while poll itself is asleep for 5 s. With pending
+        // bytes poll returns immediately anyway; it is exactly the empty-queue
+        // case, the one we want to detect, that would otherwise block. Shorten
+        // the wait while any drain is open so the sweep in _handlePollEvents can
+        // run and close on a FIN.
+        //
+        // MEASURED: without this, a read-until-EOF client took 5.005s for a
+        // plain Connection: close GET -- the full poll timeout, every time.
+        int timeout_ms = 5000;
+        for (std::map<int, Client*>::const_iterator dit = clients.begin();
+             dit != clients.end(); ++dit) {
+            if (dit->second->draining) { timeout_ms = 50; break; }
+        }
+        int nready = poll(&pollfds[0], pollfds.size(), timeout_ms);
         
         if (nready < 0) {
             if (errno == EINTR) continue; // Interrupted by signal
@@ -321,7 +335,15 @@ void Server::_rebuildPollFds(std::vector<struct pollfd>& pollfds) {
         // core before this line existed.
         // POLLERR/POLLHUP/POLLNVAL are reported regardless of `events`, so we
         // still notice a hangup on a socket we are not reading.
-        pfd.events = (client->state == Client::READING) ? POLLIN : 0;
+        // `draining` earns POLLIN too: the connection is finished as far as HTTP
+        // goes, but we must keep pulling bytes off the socket so the receive
+        // queue is empty at close() and the peer gets FIN instead of RST.
+        pfd.events = (client->state == Client::READING || client->draining)
+                     ? POLLIN : 0;
+        if (client->draining) {
+            client->drain_polled = true;   // it takes part in THIS cycle
+            client->drain_active = false;  // set only if bytes actually arrive
+        }
 
         if (client->bytes_sent < client->output_buf.size()) {
             pfd.events |= POLLOUT;  // Ready to write if we have data
@@ -440,6 +462,28 @@ void Server::_handlePollEvents(const std::vector<struct pollfd>& pollfds) {
             _handleError(fd);
         }
     }
+
+    // Draining connections whose receive queue is now EMPTY.
+    //
+    // This is the normal way a drain ends, and it has to run here rather than in
+    // the read handler, because "nothing arrived" is not an event -- it is the
+    // ABSENCE of one, and only a completed poll cycle can tell us that. poll()
+    // is level-triggered, so unread bytes keep POLLIN asserted; a cycle in which
+    // we asked for POLLIN and got none means the queue is empty and close() will
+    // send FIN, not RST.
+    //
+    // The time bound in _checkTimeouts is only a backstop for a peer that never
+    // stops talking. Relying on it as the normal exit made every read-until-EOF
+    // client wait the full DRAIN_MAX_SEC -- it waits for our close, we wait for
+    // its, and nothing but the clock breaks the tie. MEASURED at exactly 5.00s.
+    std::vector<int> drained_done;
+    for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
+        Client* c = it->second;
+        if (c->draining && c->drain_polled && !c->drain_active)
+            drained_done.push_back(it->first);
+    }
+    for (size_t i = 0; i < drained_done.size(); ++i)
+        _removeClient(drained_done[i]);
 }
 
 void Server::_acceptNewClient(int listen_fd) {
@@ -526,6 +570,18 @@ static const size_t MAX_HEADER_BYTES = 8192;
 // silently govern body admission — see the ordering note in _advanceRequest for
 // what that kind of accidental coupling costs.
 static const size_t CHUNK_FRAMING_SLACK = 8192;
+
+// ── Bounds on the pre-close drain (see Client::draining) ─────────────────────
+// A peer that is told "Connection: close" mid-upload normally stops within a
+// round trip, so the drain almost always ends on EOF long before either bound.
+// They exist for the peer that does NOT stop: without them a client could pin a
+// descriptor open forever simply by never shutting up.
+//
+// Hitting a bound means we close with bytes still queued and the RST comes back
+// -- exactly the behaviour this whole mechanism removes. That is the correct
+// trade: the response is best-effort, the descriptor is not negotiable.
+static const time_t DRAIN_MAX_SEC   = 5;
+static const size_t DRAIN_MAX_BYTES = 8UL * 1024UL * 1024UL;
 
 // Below this, reclaiming input_buf's capacity costs more than it saves: the
 // allocation is cheap to keep and re-growing it for the next request on a
@@ -1346,6 +1402,31 @@ void Server::_handleClientRead(int client_fd) {
     if (it == clients.end()) return;
     Client* client = it->second;
 
+    // Draining: the response is already out and this connection is closing. Read
+    // and throw away, so the receive queue is empty when we close and the peer
+    // sees FIN rather than an RST that would wipe out the response it has not
+    // read yet. Nothing here touches input_buf or the parser.
+    if (client->draining) {
+        char sink[READ_CHUNK];
+        ssize_t d = recv(client_fd, sink, sizeof(sink), 0);
+        if (d <= 0) {
+            // 0 = peer finished and closed: the queue is empty, this is the good
+            // exit. <0 = gone or broken; either way there is nothing left to
+            // protect. No errno either way (SUBJECT_RULES.txt:19).
+            _removeClient(client_fd);
+            return;
+        }
+        client->drained_bytes += static_cast<size_t>(d);
+        client->drain_active = true;
+        client->last_activity = std::time(NULL);
+        if (client->drained_bytes >= DRAIN_MAX_BYTES) {
+            std::cout << "Client " << client_fd << " still sending after "
+                      << (client->drained_bytes / 1024) << " KB drained, closing" << std::endl;
+            _removeClient(client_fd);
+        }
+        return;
+    }
+
     // Only a client in READING may grow input_buf. A peer that pipelines a
     // second request gets POLLIN while we are still SENDING the first; taking
     // those bytes now would splice them into the request being served.
@@ -1652,8 +1733,29 @@ void Server::_finishResponse(int client_fd) {
             _advanceRequest(client);
         }
     } else {
-        std::cout << "Response sent to client " << client_fd << ", closing connection" << std::endl;
-        _removeClient(client_fd);
+        // The response is written, but closing NOW would RST if the peer is still
+        // mid-send -- and RST makes it discard the response it may not have read
+        // yet. Enter the drain instead; _handleClientRead closes on EOF, and the
+        // timeout scan closes if the peer never stops.
+        std::cout << "Response sent to client " << client_fd
+                  << ", draining before close" << std::endl;
+        client->draining = true;
+        client->drain_start = std::time(NULL);
+        client->drained_bytes = 0;
+        // Nothing will ever parse this connection again, so stop paying for it.
+        // swap-with-empty rather than clear(): clear() keeps the capacity, and
+        // capacity is exactly what is large here.
+        //
+        // Correctness, not an optimisation -- do not expect it to show up in a
+        // memory measurement. The drain costs about +300 MB of peak RSS on school
+        // test 24 (1.95 GB -> 2.26 GB, two runs each way), and releasing these
+        // buffers did NOT reduce it: 2.257 GB before this line, 2.269 GB after.
+        // So the extra memory is NOT the drained clients' own request buffers.
+        // Cause UNVERIFIED -- the likeliest explanation is that holding refused
+        // connections open lets more uploads be in flight at once, but that has
+        // not been demonstrated, so do not repeat it as fact.
+        std::string().swap(client->input_buf);
+        std::string().swap(client->request.body);
     }
 }
 // ---------------------------------------------------------------------------
@@ -2344,6 +2446,7 @@ void Server::_checkTimeouts() {
     std::vector<int> overdue;   // began a request, never finished it -> 408
     std::vector<int> stalled;   // stopped reading its response -> drop
     std::vector<int> idle;      // said nothing at all -> just drop
+    std::vector<int> drained;   // draining, but the peer will not shut up -> drop
     std::vector<int> awaiting;  // CGI hit EOF but its child was not reapable yet
     std::vector<int> cgi_late;  // script blew its deadline -> kill it
 
@@ -2351,6 +2454,19 @@ void Server::_checkTimeouts() {
 
     for (std::map<int, Client*>::iterator it = clients.begin(); it != clients.end(); ++it) {
         Client* c = it->second;
+
+        // A draining connection has already been answered; the only question
+        // left is how long we are willing to keep absorbing bytes so the close
+        // is a FIN. Checked FIRST and with `continue`, because every clock below
+        // would misread this state: the request clock sees no request, the stall
+        // clock sees a fully-flushed buffer, and the idle clock is refreshed by
+        // the very bytes we are discarding -- so a peer that keeps sending would
+        // never be reaped by any of them.
+        if (c->draining) {
+            if (now - c->drain_start >= DRAIN_MAX_SEC)
+                drained.push_back(it->first);
+            continue;
+        }
 
         // Any live CGI, past its deadline. Checked FIRST and for every CGI
         // state — still streaming, or parked waiting on a reap — because this
@@ -2431,6 +2547,13 @@ void Server::_checkTimeouts() {
         // closes on the next POLLOUT.
         // Gave up mid-request; the rest of it is still in flight.
         _startErrorResponse(it->second, 408, FRAMING_LOST);
+    }
+
+    for (size_t i = 0; i < drained.size(); ++i) {
+        // Bound reached. We close with bytes possibly still queued, so this peer
+        // may see the RST after all -- but it had its response and its 5 seconds.
+        std::cout << "Client " << drained[i] << " kept sending after its response, closing" << std::endl;
+        _removeClient(drained[i]);
     }
 
     for (size_t i = 0; i < stalled.size(); ++i) {

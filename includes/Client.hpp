@@ -155,6 +155,34 @@ public:
     // Only a peer that has stopped reading entirely trips this.
     bool isSendStalled(time_t stall_seconds) const;
 
+    // ── Draining before close ────────────────────────────────────────────────
+    // Set once a Connection: close response has been fully written and the peer
+    // may still be mid-send (every FRAMING_LOST error: 400, 408, 413, 431, 503).
+    //
+    // Why it exists: close() on a socket that still has unread bytes in its
+    // receive queue makes the kernel send RST instead of FIN, and RST tells the
+    // peer to DISCARD whatever it has already buffered -- including the very
+    // response we just wrote. So the 413 was built, sent, and then destroyed in
+    // flight. MEASURED: a 5 MB body against a 200 B cap, and a 20 KB header
+    // block, both reached the client as "connection reset by peer" with no status
+    // line at all.
+    //
+    // shutdown() is not in the subject's allowed function list, so a half-close
+    // is not available. The remedy is to keep reading and throwing the bytes away
+    // until the peer stops, then close on an empty queue -- which sends FIN.
+    bool    draining;
+    time_t  drain_start;      // when draining began, for the time bound
+    size_t  drained_bytes;    // how much has been discarded, for the byte bound
+    // Per-poll-cycle bookkeeping that decides when the queue is EMPTY.
+    // poll() is level-triggered: while unread bytes remain, POLLIN stays
+    // asserted. So one complete cycle in which we asked for POLLIN and got
+    // nothing means there is nothing left to drain, and we can close on an empty
+    // queue -- which sends FIN. Waiting for the time bound instead cost every
+    // read-until-EOF client a flat 5 s: it waits for our close, we wait for its,
+    // and only the clock breaks the tie. MEASURED at exactly 5.00s before this.
+    bool    drain_polled;     // POLLIN was requested for it this cycle
+    bool    drain_active;     // bytes actually arrived this cycle
+
     // Enter SENDING with the write-side cursor and clock reset. Every path that
     // queues a response goes through here so the stall clock can't be forgotten.
     void beginSending();

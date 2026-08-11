@@ -23,7 +23,14 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
       response_complete(false),
       cgi_headers_sent(false),
       cgi_chunked(false),
-      server_cfg(NULL)
+      server_cfg(NULL),
+      // declared after server_cfg in Client.hpp; the list must follow
+      // declaration order or -Werror=reorder rejects it
+      draining(false),
+      drain_start(0),
+      drained_bytes(0),
+      drain_polled(false),
+      drain_active(false)
 {
     // HttpRequest is a plain struct with no constructor, so its scalars are
     // indeterminate until we set them. The read handler branches on `state`,
@@ -83,6 +90,14 @@ void Client::resetForNextRequest() {
     // as it closes/reaps them — same ownership split as the comment above.
     cgi_body_sent = 0;
     cgi_head_buf.clear();
+    // A drained connection is never recycled -- draining only happens on a
+    // Connection: close response -- but reset it anyway so the flag can never
+    // survive into a reused Client and silently swallow the next request.
+    draining = false;
+    drain_start = 0;
+    drained_bytes = 0;
+    drain_polled = false;
+    drain_active = false;
 
     request = HttpRequest();        // drop every header/body of the old request
     request.state = READING_REQUEST_LINE;
