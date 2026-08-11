@@ -706,6 +706,7 @@ static std::string reasonPhrase(int code) {
         case 404: return "Not Found";
         case 408: return "Request Timeout";
         case 413: return "Content Too Large";
+        case 414: return "URI Too Long";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
@@ -910,9 +911,20 @@ bool Server::_enforceReadLimits(Client* client) {
     if (client->request.state != READING_BODY &&
         client->request.state != COMPLETE &&
         received > MAX_HEADER_BYTES) {
-        // Header section never closed, so we have no idea where this
-        // request ends. Stream is unusable.
-        _startErrorResponse(client, 431, FRAMING_LOST);
+        // WHICH part overran decides the code, and the parser state is what
+        // tells them apart: it only leaves READING_REQUEST_LINE once the request
+        // line has been terminated by its CRLF (HttpParser.cpp:119). So still
+        // being in that state at the cap means the REQUEST LINE itself is the
+        // thing that is too long -- RFC 9112 3 makes that 414, not 431. 431 is
+        // specifically "the header FIELDS are too large", which is the other
+        // case: a request line that ended, followed by too many headers.
+        //
+        // Both are FRAMING_LOST for the same reason: the header section never
+        // closed, so we never learned where this request ends and the stream is
+        // unusable regardless of which limit was hit.
+        const int code =
+            (client->request.state == READING_REQUEST_LINE) ? 414 : 431;
+        _startErrorResponse(client, code, FRAMING_LOST);
         return false;
     }
 

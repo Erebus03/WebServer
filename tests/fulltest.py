@@ -487,7 +487,7 @@ def group_http(r, port):
             "header block over the cap is 431 -- and it must ARRIVE, not be reset away", 431, status(resp), resp)
     resp=send_raw(port,"GET /"+"a"*20000+" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     r.check(status(resp)==414, "20 KB request line",
-            "RFC 9112 3: an over-long request line is 414 (known: we answer 431)",
+            "RFC 9112 3: an over-long request line is 414, not the 431 that covers header FIELDS",
             414, status(resp), resp)
     # keep-alive
     s=socket.socket(); s.settimeout(6)
