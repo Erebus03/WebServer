@@ -76,11 +76,19 @@ LIB_OBJS = $(filter-out src/main.o,$(OBJS))
 TEST_SRCS = \
 	tests/test_cgi_response.cpp \
 	tests/test_config.cpp \
+	tests/test_DeleteHandler.cpp \
+	tests/test_DirectoryLister.cpp \
+	tests/test_Dispatcher.cpp \
+	tests/test_FileUtils.cpp \
+	tests/test_GetHandler.cpp \
 	tests/test_http_parser.cpp \
+	tests/test_HttpStatus.cpp \
 	tests/test_integration.cpp \
 	tests/test_mime_types.cpp \
 	tests/test_multipart.cpp \
+	tests/test_PostHandler.cpp \
 	tests/test_response_builder.cpp \
+	tests/test_router.cpp \
 
 TEST_BINS = $(TEST_SRCS:.cpp=)
 
