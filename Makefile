@@ -109,7 +109,7 @@ test: $(TEST_BINS)
 # failure count. Python 3 stdlib only -- raw sockets, so it can send the malformed
 # requests curl cannot express.
 fulltest: $(NAME)
-	@./tests/fulltest.py
+	@python3 tests/fulltest.py $(ARGS)
 
 # Live-server tests: 50 concurrent clients, hostile mix. Needs the binary.
 stress: $(NAME)
