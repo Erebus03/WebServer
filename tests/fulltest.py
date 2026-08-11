@@ -18,6 +18,16 @@ Exit status is the number of failures (0 = all good), so CI can use it.
 
 import argparse, os, re, shutil, socket, subprocess, sys, tempfile, time
 
+if sys.version_info < (3, 6):
+    sys.stderr.write("needs python 3.6+ (f-strings); found %s\n"
+                     % ".".join(map(str, sys.version_info[:3])))
+    sys.exit(1)
+
+# Some groups read /proc (peak RSS, fd counts). That is Linux-only -- on a Mac
+# cluster they are SKIPPED rather than reported as failures, because "cannot
+# measure" is not "measured and wrong".
+HAVE_PROC = os.path.isdir("/proc/self")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN  = os.path.join(ROOT, "webserv")
 
@@ -609,6 +619,9 @@ def group_heavy(r, port, srv, size_mb, workers):
     import threading
     r.group(f"memory under load — {workers} x {size_mb} MB POST to a CGI (school test 24)")
     mt = mem_total_kb()
+    if not mt:
+        r.skip("memory under load", "needs /proc/meminfo to size the load safely (Linux only)")
+        return
     budget_kb = (mt // 10) * 4                       # server's own 40%-of-RAM rule
     hard_kb   = budget_kb + budget_kb // 4           # its hard ceiling
     total_mb  = workers * size_mb
@@ -721,6 +734,9 @@ def group_malformed(r, port):
 
 def group_fdleak(r, port, srv):
     r.group("descriptor hygiene — no hanging connections")
+    if not HAVE_PROC:
+        r.skip("fd count stable", "needs /proc (Linux); use `lsof -p <pid>` by hand here")
+        return
     def nfd():
         try: return len(os.listdir("/proc/%d/fd" % srv.p.pid))
         except OSError: return -1
@@ -754,17 +770,20 @@ def group_siege(r, port, srv, n=400):
         except OSError: pass
         return 0
     for _ in range(50): req(port,path="/")
-    base_rss=rss()
+    base_rss=rss()   # 0 when /proc is absent; the growth check is skipped below
     good=0
     for _ in range(n):
         if status(req(port,path="/"))==200: good+=1
     avail=100.0*good/n
     r.check(avail>=99.5, f"availability over {n} GETs",
             "the sheet requires >= 99.5% for a simple GET", ">= 99.5%", f"{avail:.1f}%")
-    grow=rss()-base_rss
-    r.check(grow<8192, "memory does not climb with traffic",
-            "the sheet: process memory must not go up indefinitely",
-            "< 8 MB growth", f"{grow//1024} MB")
+    if HAVE_PROC:
+        grow=rss()-base_rss
+        r.check(grow<8192, "memory does not climb with traffic",
+                "the sheet: process memory must not go up indefinitely",
+                "< 8 MB growth", f"{grow//1024} MB")
+    else:
+        r.skip("memory does not climb", "needs /proc (Linux); watch it with `top` here")
     r.check(srv.alive(), "still up after sustained load",
             "siege -b must be usable without restarting the server", "alive", "gone")
 
@@ -819,8 +838,13 @@ def main():
                     size=a.size
                     if size<=0:
                         # aim just past the 40% budget so it binds, without inviting the OOM killer
-                        size=max(4,int((mem_total_kb()/1024.0)*0.55/max(1,a.workers)))
-                    group_heavy(r,port,srv,size,a.workers)
+                        mt=mem_total_kb()
+                        if not mt:
+                            print(f"  {C.Y}SKIP{C.X}  --heavy needs /proc/meminfo; pass --size explicitly")
+                            size=0
+                        else:
+                            size=max(4,int((mt/1024.0)*0.55/max(1,a.workers)))
+                    if size>0: group_heavy(r,port,srv,size,a.workers)
         # second config: two ports, two hostnames on one, a custom error page
         if any(want(g) for g in ("multiple","error page","vhost","host")):
             p1=free_port(port+10); p2=free_port(p1+1)
