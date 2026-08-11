@@ -1742,6 +1742,20 @@ void Server::_finishResponse(int client_fd) {
         client->draining = true;
         client->drain_start = std::time(NULL);
         client->drained_bytes = 0;
+        // Nothing will ever parse this connection again, so stop paying for it.
+        // swap-with-empty rather than clear(): clear() keeps the capacity, and
+        // capacity is exactly what is large here.
+        //
+        // Correctness, not an optimisation -- do not expect it to show up in a
+        // memory measurement. The drain costs about +300 MB of peak RSS on school
+        // test 24 (1.95 GB -> 2.26 GB, two runs each way), and releasing these
+        // buffers did NOT reduce it: 2.257 GB before this line, 2.269 GB after.
+        // So the extra memory is NOT the drained clients' own request buffers.
+        // Cause UNVERIFIED -- the likeliest explanation is that holding refused
+        // connections open lets more uploads be in flight at once, but that has
+        // not been demonstrated, so do not repeat it as fact.
+        std::string().swap(client->input_buf);
+        std::string().swap(client->request.body);
     }
 }
 // ---------------------------------------------------------------------------

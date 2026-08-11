@@ -606,6 +606,47 @@ def group_load(r, port, srv):
             "the subject requires it stays operational at all times", "alive",
             "exited" if not srv.alive() else "alive")
 
+# ── group: latency — the guard that was missing ─────────────────────────────
+def group_latency(r, port):
+    """
+    Exists because a change to the close path once made every Connection: close
+    request take a flat 5.005s, and the whole suite reported 73/76 and called it
+    an improvement. Nothing here asserted time, so a 100x latency regression was
+    invisible. It is not any more.
+
+    The client reads until EOF on purpose: that is the shape that regressed. A
+    client which stops at Content-Length (curl) never saw the bug at all, so
+    testing only that shape would have missed it again.
+    """
+    r.group("latency — a closed connection must close promptly")
+    times=[]
+    for _ in range(10):
+        t0=time.time()
+        resp=req(port,path="/")          # sends Connection: close, reads to EOF
+        times.append(time.time()-t0)
+        if status(resp)!=200:
+            r.bad("Connection: close latency","the request must actually succeed","200",status(resp))
+            return
+    times.sort()
+    med=times[len(times)//2]; worst=times[-1]
+    r.check(worst < 0.5, "10 x Connection: close, read to EOF",
+            f"the server must close on an empty queue, not wait out a timer (median {med*1000:.0f}ms)",
+            "< 500ms worst", f"{worst*1000:.0f}ms")
+    # keep-alive must not pay the drain cost at all
+    t0=time.time()
+    s=socket.socket(); s.settimeout(6)
+    try:
+        s.connect(("127.0.0.1",port))
+        for _ in range(10):
+            s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"); read_one(s)
+        dur=time.time()-t0
+        r.check(dur < 0.5, "10 keep-alive requests, one connection",
+                "a reused connection never drains, so it must be far faster",
+                "< 500ms total", f"{dur*1000:.0f}ms")
+    except OSError as e:
+        r.bad("10 keep-alive requests","a reused connection must stay fast","< 500ms",f"error {e}")
+    finally: s.close()
+
 # ── group 9: memory under load — the school tester's test 24 ────────────────
 def group_heavy(r, port, srv, size_mb, workers):
     """
@@ -824,7 +865,7 @@ def main():
         # keyword in the guard, so the server never started and the filter
         # silently ran nothing.
         SOCKET_GROUPS = ("static","methods","http","limits","cgi","upload",
-                         "robustness","malformed","descriptor","sustained","memory","error page")
+                         "robustness","malformed","descriptor","sustained","memory","error page","latency")
         if want("config"): group_config(r,base,port,www)
 
         if any(want(g) for g in SOCKET_GROUPS):
@@ -845,6 +886,7 @@ def main():
                 if want("sustained"):  group_siege(r,port,srv)
                 # on the MAIN config, so a vhost fault cannot mask a mandatory feature
                 if want("error page"): group_errorpage(r,port)
+                if want("latency"):    group_latency(r,port)
                 if a.heavy and want("memory"):
                     size=a.size
                     if size<=0:
