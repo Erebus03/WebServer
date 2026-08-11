@@ -103,6 +103,14 @@ test: $(TEST_BINS)
 	done
 	@echo "=== all unit tests passed"
 
+# One runner covering the ground the school tester, cgi_tester and the third-party
+# testers each cover separately, PLUS the config parser, which none of them touch.
+# Every line states what it checks; failures print want-vs-got. Exit status is the
+# failure count. Python 3 stdlib only -- raw sockets, so it can send the malformed
+# requests curl cannot express.
+fulltest: $(NAME)
+	@./tests/fulltest.py
+
 # Live-server tests: 50 concurrent clients, hostile mix. Needs the binary.
 stress: $(NAME)
 	@./tests/stress.sh
@@ -119,4 +127,4 @@ fclean: clean
 
 re: fclean all
 
-.PHONY: all clean fclean re test stress valgrind
+.PHONY: all clean fclean re test fulltest stress valgrind
