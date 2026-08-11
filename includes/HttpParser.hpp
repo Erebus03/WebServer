@@ -28,6 +28,18 @@ class HttpParser {
         // from request N's offset and decode a wrong body. See readChunkedBody.
         void reset();
 
+        // --- streaming hooks for A (chunked path). PURELY ADDITIVE: if the caller
+        // never calls dropDecodedRaw(), parse() behaves exactly as before. ---
+        // The raw bytes in [bodyStart(), decodedRawOffset()) have already been
+        // decoded and appended to request.body, so once A drains request.body he
+        // may also erase those raw bytes from his own buffer to cap memory. He must
+        // KEEP the header bytes [0, bodyStart()) (parse re-scans them each call),
+        // erase only within the body region, then call dropDecodedRaw(n) with the
+        // number erased so the resume offset stays pointing at the same byte.
+        size_t bodyStart() const;         // index where the body begins (just past the blank line)
+        size_t decodedRawOffset() const;  // end of decoded raw body (chunked); == bodyStart otherwise
+        void   dropDecodedRaw(size_t n);  // A erased n raw body bytes from the front of the body region
+
     private:
         // One step of parse(), each doing exactly one thing (easy to test / debug):
         bool parseRequestLine(const std::string& line, HttpRequest& request) const;
@@ -39,6 +51,7 @@ class HttpParser {
         // chunked-decode resume state (carried across recvs within ONE request):
         size_t chunk_scan_pos_;   // where to resume scanning the raw buffer
         bool   chunk_started_;    // has this request's chunked body begun decoding?
+        size_t body_start_;       // where the body begins in the buffer (for the streaming hooks)
 };
 
 #endif

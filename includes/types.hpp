@@ -55,6 +55,11 @@ struct HttpRequest {
     std::map<std::string, std::string> headers;
     std::string                        body;
     bool                               is_complete;
+    bool                               body_complete;   // true once `body` holds the WHOLE body.
+                                                        // A sets it false when he streams/drains the
+                                                        // body away, so C can tell "streamed off" from
+                                                        // "genuinely 0 bytes" and not write a silent
+                                                        // 0-byte file + 201. Parser sets it on COMPLETE.
     int                                status;   // code to send on PARSE_ERROR (400 unless set otherwise)
 };
 
