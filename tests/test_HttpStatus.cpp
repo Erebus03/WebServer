@@ -51,7 +51,7 @@ static void test_client_error_codes()
 static void test_server_error_codes()
 {
     check(500, "Internal Server Error");
-    check(501, "Not implemented");
+    check(501, "Not Implemented");   // RFC 9110 15.6.2 capitalises both words
     std::cout << "[OK] 5xx codes carry their reason phrases" << std::endl;
 }
 
