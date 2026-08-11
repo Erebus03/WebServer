@@ -42,3 +42,7 @@ report_chat
 # it addresses Member B and misdirects everyone else who opens the repo.
 CLAUDE.md
 CLAUDE.local.md
+
+# private fixture tree for tests/test_FileUtils (removed by teardown, but an
+# assert() abort skips teardown and would leave it behind)
+tests/.fixtures_fileutils/
