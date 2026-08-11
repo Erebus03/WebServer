@@ -115,6 +115,51 @@ int main()
         std::cout << "[PASS] tab before colon (Host\\t:) -> PARSE_ERROR" << std::endl;
     }
 
+    // --- A space INSIDE the field-name is illegal too (RFC 9110 5.6.2: token) ---
+    // The whitespace-before-colon check above only inspects the one character
+    // before the ':', so this line slipped past it and was accepted as the name
+    // "bad header". A field-name is 1*tchar and SP is not a tchar.
+    {
+        HttpRequest request;
+        request.state = READING_REQUEST_LINE;
+        size_t consumed = 0;
+
+        std::string raw = "GET / HTTP/1.1\r\nBad Header: v\r\n\r\n";
+        ParseResult r = parser.parse(raw, request, consumed);
+        assert(r == PARSE_ERROR);
+        assert(request.status == 400);
+
+        std::cout << "[PASS] space inside field-name (Bad Header:) -> PARSE_ERROR 400" << std::endl;
+    }
+
+    // --- A delimiter in the field-name is illegal for the same reason ---
+    {
+        HttpRequest request;
+        request.state = READING_REQUEST_LINE;
+        size_t consumed = 0;
+
+        std::string raw = "GET / HTTP/1.1\r\nBad@Header: v\r\n\r\n";
+        ParseResult r = parser.parse(raw, request, consumed);
+        assert(r == PARSE_ERROR);
+
+        std::cout << "[PASS] delimiter in field-name (Bad@Header:) -> PARSE_ERROR" << std::endl;
+    }
+
+    // --- The tchar punctuation that IS legal must still be accepted ---
+    // Guards against over-tightening: X-Foo_bar.baz is a perfectly legal name.
+    {
+        HttpRequest request;
+        request.state = READING_REQUEST_LINE;
+        size_t consumed = 0;
+
+        std::string raw = "GET / HTTP/1.1\r\nHost: x\r\nX-Foo_bar.baz!~*: v\r\n\r\n";
+        ParseResult r = parser.parse(raw, request, consumed);
+        assert(r == PARSE_COMPLETE);
+        assert(request.headers.count("x-foo_bar.baz!~*") == 1);
+
+        std::cout << "[PASS] legal tchar punctuation in a field-name accepted" << std::endl;
+    }
+
     // --- Two requests in one buffer (keep-alive): consumed splits them ---
     {
         HttpRequest first;

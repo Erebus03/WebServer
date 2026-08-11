@@ -209,6 +209,31 @@ bool HttpParser::parseHeaders(const std::string& bytes, size_t start, size_t end
     return true;
 }
 
+// RFC 9110 5.6.2: a field-name is a token, and a token is 1*tchar. Everything
+// outside this set -- SP and HTAB above all, but also the delimiters
+// "(),/:;<=>?@[\]{} and DQUOTE, and any control character -- is illegal in a
+// name. The neighbouring whitespace-before-colon check only inspects the ONE
+// character before the ':', so "Bad Header: v" walked straight past it and was
+// accepted as the name "bad header". Same smuggling concern as that check: two
+// proxies can disagree about what such a line means, so it must be refused
+// rather than normalised.
+static bool isFieldNameToken(const std::string& name) {
+    for (size_t i = 0; i < name.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        if (std::isalnum(c))
+            continue;
+        switch (c) {
+            case '!': case '#': case '$': case '%': case '&': case '\'':
+            case '*': case '+': case '-': case '.': case '^': case '_':
+            case '`': case '|': case '~':
+                continue;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
 // split header on FIRST colon (values can hold colons: localhost:8080)
 bool HttpParser::parseHeaderLine(const std::string& line, std::string& name,
                                  std::string& value) const
@@ -223,6 +248,8 @@ bool HttpParser::parseHeaderLine(const std::string& line, std::string& name,
         return false;
     name = toLowerCopy(trim(line.substr(0, colon)));
     if (name.empty())                  // ": value" or an all-whitespace name -> reject
+        return false;
+    if (!isFieldNameToken(name))       // e.g. "Bad Header:" -- SP is not a tchar
         return false;
     value = trim(line.substr(colon + 1));
     return true;
