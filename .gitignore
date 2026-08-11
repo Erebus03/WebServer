@@ -23,6 +23,7 @@ tests/dump_config
 rb_test
 a.out
 claude_chat
+latest_claude
 .mcp.json
 study/
 # Outgoing teammate messages: local relay material, pasted by hand. Keeping them
@@ -34,7 +35,13 @@ report_chat
 # school-provided binaries and runtime output
 /tester
 /cgi_tester
-/uploads/
+# Uploaded files are runtime output and stay out of git -- but the DIRECTORY has
+# to exist, because config/tester.conf writes there and PostHandler answers 500
+# when upload_directory is missing (PostHandler.cpp:65). Ignoring the whole
+# directory meant a fresh clone could not accept a single upload: MEASURED, POST
+# /post_body returned 500 before uploads/.gitkeep was tracked and 200 after.
+/uploads/*
+!/uploads/.gitkeep
 # (built unit-test binaries are covered by the tests/test_* rule above)
 
 # A's local session bootstrap. Deliberately NOT committed: CLAUDE.local.md
