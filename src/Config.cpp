@@ -398,6 +398,25 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
     if (!bodySet)
         srv.client_max_body_size = 1024UL * 1024UL; // 1M
 
+    // `error_page` names a URI, not a filesystem path. Both consumers
+    // (Dispatcher's error filler and _startErrorResponse) hand the stored value
+    // straight to FileUtils::read_file, so an unresolved "/404.html" opened the
+    // literal path /404.html at the filesystem root and always failed -- which is
+    // why custom error pages silently never loaded and the generated page was
+    // always used. Resolved ONCE here, where srv.root is final, so neither
+    // consumer has to know about roots. Both still fall back to the generated
+    // page if the file cannot be read, so a wrong path degrades, never breaks.
+    for (std::map<int, std::string>::iterator it = srv.error_pages.begin();
+         it != srv.error_pages.end(); ++it) {
+        std::string& page = it->second;
+        if (page.empty())
+            continue;
+        std::string base = srv.root;
+        while (base.size() > 1 && base[base.size() - 1] == '/')
+            base.erase(base.size() - 1);
+        page = base + (page[0] == '/' ? page : "/" + page);
+    }
+
     // Second pass: resolve location inheritance only now that `srv` is final
     // (all directives seen, all defaults applied). Doing this inside the loop
     // above snapshots a half-built server, which makes the parse result depend

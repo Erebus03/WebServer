@@ -274,7 +274,7 @@ def build_tree(base):
                      ("loop.py",CGI_LOOP),("relpath.py",CGI_REL)):
         f=os.path.join(w,"cgi",name); open(f,"w").write(src); os.chmod(f,0o755)
     open(os.path.join(w,"cgi","data.txt"),"w").write("RELDATA")
-    open(os.path.join(base,"custom404.html"),"w").write("<html>CUSTOM404</html>\n")
+    open(os.path.join(w,"custom404.html"),"w").write("<html>CUSTOM404</html>\n")
     return w
 
 def vhost_conf(base, p1, p2, www):

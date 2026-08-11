@@ -140,8 +140,45 @@ void test_error_page_multi_code() {
     CHECK_EQ(c[0].error_pages.count(500), (size_t)1);
     CHECK_EQ(c[0].error_pages.count(502), (size_t)1);
     CHECK_EQ(c[0].error_pages.count(503), (size_t)1);
-    if (c[0].error_pages.count(404)) CHECK_EQ(c[0].error_pages[404], std::string("/404.html"));
-    if (c[0].error_pages.count(503)) CHECK_EQ(c[0].error_pages[503], std::string("/50x.html"));
+    // The stored value is a FILESYSTEM path, not the URI that was typed: the
+    // parser folds it against the server root once, so the two consumers can just
+    // open it. This block sets no root, so it gets the default /var/www/html.
+    // Before the fold, "/404.html" was opened literally at the filesystem root and
+    // custom error pages silently never loaded.
+    if (c[0].error_pages.count(404)) CHECK_EQ(c[0].error_pages[404], std::string("/var/www/html/404.html"));
+    if (c[0].error_pages.count(503)) CHECK_EQ(c[0].error_pages[503], std::string("/var/www/html/50x.html"));
+}
+
+void test_error_page_folds_against_root() {
+    SUITE("error_page is resolved against the server root");
+    Config c = parse(
+        "server {\n"
+        "    listen 80;\n"
+        "    root /srv/site;\n"
+        "    error_page 404 /oops.html;\n"
+        "    error_page 500 deep/boom.html;\n"
+        "}\n");
+    CHECK(!c.empty());
+    if (c.empty()) return;
+    // leading slash: a URI rooted at the server root, not the filesystem root
+    if (c[0].error_pages.count(404)) CHECK_EQ(c[0].error_pages[404], std::string("/srv/site/oops.html"));
+    // no leading slash: still relative to the root, and no doubled separator
+    if (c[0].error_pages.count(500)) CHECK_EQ(c[0].error_pages[500], std::string("/srv/site/deep/boom.html"));
+}
+
+void test_error_page_root_declared_after() {
+    SUITE("error_page resolves even when root comes later in the block");
+    Config c = parse(
+        "server {\n"
+        "    listen 80;\n"
+        "    error_page 404 /late.html;\n"
+        "    root /srv/late;\n"
+        "}\n");
+    CHECK(!c.empty());
+    if (c.empty()) return;
+    // The fold runs in the second pass, so directive ORDER must not matter --
+    // folding inline would have snapshotted a root that was still empty here.
+    if (c[0].error_pages.count(404)) CHECK_EQ(c[0].error_pages[404], std::string("/srv/late/late.html"));
 }
 
 void test_locations_and_methods() {
@@ -502,6 +539,8 @@ int main() {
     test_server_name();
     test_body_size_suffixes();
     test_error_page_multi_code();
+    test_error_page_folds_against_root();
+    test_error_page_root_declared_after();
     test_locations_and_methods();
     test_location_directives();
     test_body_size_inheritance();
