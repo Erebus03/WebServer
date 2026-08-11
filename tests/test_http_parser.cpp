@@ -18,7 +18,7 @@ int main()
 
         std::string raw =
             "GET /api/users/1024 HTTP/1.1\r\n"
-            "HosT : api.example.com\r\n"
+            "Host: api.example.com\r\n"
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
             "Accept: application/json\r\n"
             "Authorization: Bearer eyJ0eXAiOiJKV1Qi....\r\n"
@@ -86,6 +86,33 @@ int main()
         assert(r == PARSE_ERROR);
 
         std::cout << "[PASS] header with no colon -> PARSE_ERROR" << std::endl;
+    }
+
+    // --- Whitespace before the colon ("Host :") is smuggling -> reject (RFC 7230) ---
+    {
+        HttpRequest request;
+        request.state = READING_REQUEST_LINE;
+        size_t consumed = 0;
+
+        std::string raw = "GET / HTTP/1.1\r\nHost : api.example.com\r\n\r\n";
+        ParseResult r = parser.parse(raw, request, consumed);
+        assert(r == PARSE_ERROR);                // must NOT be silently trimmed to "Host"
+        assert(request.status == 400);           // and the code we'd send is 400
+
+        std::cout << "[PASS] space before colon (Host :) -> PARSE_ERROR 400" << std::endl;
+    }
+
+    // --- A tab before the colon must be rejected too ---
+    {
+        HttpRequest request;
+        request.state = READING_REQUEST_LINE;
+        size_t consumed = 0;
+
+        std::string raw = "GET / HTTP/1.1\r\nHost\t: api.example.com\r\n\r\n";
+        ParseResult r = parser.parse(raw, request, consumed);
+        assert(r == PARSE_ERROR);
+
+        std::cout << "[PASS] tab before colon (Host\\t:) -> PARSE_ERROR" << std::endl;
     }
 
     // --- Two requests in one buffer (keep-alive): consumed splits them ---

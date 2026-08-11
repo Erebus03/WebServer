@@ -8,18 +8,13 @@ private:
     FileUtils();
 public:
     static bool resolve_path(const std::string& root, const std::string& uri, std::string& outPath);
-
     static bool is_path_safe(const std::string& uri);
-
     static std::string strip_location_prefix(const std::string& uri, const std::string& location_path);
-
+    static bool is_header_safe(const std::string &value);
     static bool file_exists(const std::string& path);
     static bool is_directory(const std::string& path);
-
     static bool is_readable(const std::string& path);
-
     static bool is_writable(const std::string& path);
-
     static bool write_file(const std::string &path, const std::string &data);
     static bool read_file(const std::string& path, std::string& out);
 };

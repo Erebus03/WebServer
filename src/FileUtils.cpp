@@ -54,7 +54,6 @@ bool FileUtils::is_path_safe(const std::string& uri)
 
 std::string FileUtils::strip_location_prefix(const std::string& uri, const std::string& location_path)
 {
-
     if (location_path.empty() || location_path == "/")
         return uri;
 
@@ -71,6 +70,17 @@ std::string FileUtils::strip_location_prefix(const std::string& uri, const std::
     if (rest[0] != '/')
         return "/" + rest;
     return rest;
+}
+
+bool FileUtils::is_header_safe(const std::string& value)
+{
+    for (size_t i = 0; i < value.size(); ++i)
+    {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if (c < 0x20 || c == 0x7F)
+            return false;
+    }
+    return true;
 }
 
 bool FileUtils::file_exists(const std::string& path)
