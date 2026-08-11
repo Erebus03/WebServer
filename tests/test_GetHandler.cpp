@@ -255,8 +255,13 @@ static void test_no_index_listing_off()
 
     HttpResponse response = GetHandler::handle(request, location);
 
-    assert(response.status_code == 403);
-    std::cout << "[OK] no index + listing off is refused" << std::endl;
+    // 404, not 403 -- the F4 decision. A directory with listing off is not
+    // "forbidden", it is indistinguishable from absent as far as the client is
+    // entitled to know; 403 leaks that the path exists. Same change already
+    // applied to tests/test_integration.cpp:85, and confirmed against the real
+    // handler with a probe before either was touched.
+    assert(response.status_code == 404);
+    std::cout << "[OK] no index + listing off is 404 (not 403: no existence leak)" << std::endl;
 }
 
 static void test_no_index_listing_on()
@@ -275,18 +280,24 @@ static void test_no_index_listing_on()
     std::cout << "[OK] no index + listing on returns a labelled generated body" << std::endl;
 }
 
-static void test_static_file_leaves_content_type_unset()
+static void test_static_file_gets_its_mime_type()
 {
-    // The other half of the C7 contract: for a body read from disk the handler
-    // stays out of it, and absence is the evidence ResponseBuilder acts on.
+    // This used to assert the OPPOSITE -- that the handler leaves Content-Type
+    // unset and absence is the signal ResponseBuilder acts on ("the C7
+    // contract"). That contract is gone: B wired MimeTypes in at
+    // GetHandler.cpp:77, and it has to be the handler that does it, because
+    // HttpResponse carries no filename so ResponseBuilder cannot derive a type
+    // from a body it did not read. Every static file was being served as
+    // text/html before that landed.
     LocationConfig location = make_location(ROOT, false);
     HttpRequest request = make_request("/index.html", "");
 
     HttpResponse response = GetHandler::handle(request, location);
 
     assert(response.status_code == 200);
-    assert(!has_header(response, "Content-Type"));
-    std::cout << "[OK] static file leaves Content-Type absent" << std::endl;
+    assert(has_header(response, "Content-Type"));
+    assert(header_value(response, "Content-Type").find("text/html") == 0);
+    std::cout << "[OK] static file is labelled from its extension" << std::endl;
 }
 
 static void test_unreadable_file()
@@ -336,7 +347,7 @@ int main()
     test_index_first_match_wins();
     test_no_index_listing_off();
     test_no_index_listing_on();
-    test_static_file_leaves_content_type_unset();
+    test_static_file_gets_its_mime_type();
     test_unreadable_file();
     test_percent_encoding_precondition();
 

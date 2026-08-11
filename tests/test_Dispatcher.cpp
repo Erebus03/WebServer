@@ -324,10 +324,13 @@ static void test_delete_reaches_delete_handler()
 
 static void test_post_reaches_post_handler()
 {
-    // PostHandler is a stub returning 501 until the multipart parser lands. What
-    // this pins is the routing decision -- POST passed the gates and was handed
-    // to a handler rather than refused. Update the expected code, not the
-    // routing, when the real handler arrives.
+    // What this pins is the routing decision -- POST passed the gates and was
+    // handed to a handler rather than refused. The comment here used to say
+    // "PostHandler is a stub returning 501 ... update the expected code, not the
+    // routing, when the real handler arrives". It has arrived, so this is that
+    // update: make_location() leaves upload_dir empty, and the real handler
+    // refuses that with 403 (PostHandler.cpp:62). The routing assertion below is
+    // unchanged and is still the point of the test.
     setup_fixtures();
 
     ServerConfig server = make_server();
@@ -337,8 +340,8 @@ static void test_post_reaches_post_handler()
     HttpResponse response = Dispatcher::dispatch(request, server);
 
     assert(response.status_code != 405);   // it was not refused at the gate
-    assert(response.status_code == 501);
-    std::cout << "[OK] POST reaches the PostHandler stub" << std::endl;
+    assert(response.status_code == 403);   // reached PostHandler; no upload_dir
+    std::cout << "[OK] POST reaches PostHandler (403: no upload_dir configured)" << std::endl;
 }
 
 static void test_config_allowed_but_unimplemented_method()
