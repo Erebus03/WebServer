@@ -5,6 +5,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <limits>
+#include <set>
+#include <utility>
 
 namespace {
 
@@ -444,8 +446,65 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
     return srv;
 }
 
+// ── Reject a server block that can never be selected ────────────────────────
+// The correction sheet: "try to setup the same port multiple times. It should
+// not work." Taken literally that would forbid virtual hosts -- which the SAME
+// sheet demands two items earlier ("multiple servers with different hostnames").
+// The subject settles it: a website is keyed by its interface:port pair, and the
+// virtual host feature is out of scope. We implemented vhosts anyway (the subject
+// permits it), so a repeated endpoint is only undecidable when the NAME repeats
+// too. That is the case refused here, and only that case. See study/A16.
+//
+// What makes a block unreachable is exactly how Server::_resolveServerConfig
+// picks one: candidates[0] is the default for the endpoint, and the name scan
+// returns on its FIRST match. So:
+//   - a later block whose (endpoint, name) pair is already claimed loses the
+//     name scan to the earlier one, always;
+//   - a later block with NO server_name is competing for the default slot, and
+//     the default is whichever block came first on that endpoint -- named or not.
+// Neither can be reached by any request, from any client. Refusing them removes
+// no working configuration; it only stops us accepting config that does nothing
+// while printing "+ virtual host" as though it worked.
+static std::string lowerName(const std::string& s) {
+    std::string out(s);
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(out[i])));
+    return out;
+}
+
+static void claimServer(const ServerConfig& srv,
+                        std::set<std::string>& endpoints_seen,
+                        std::set<std::pair<std::string, std::string> >& claimed,
+                        int line)
+{
+    std::stringstream key;
+    key << srv.host << ":" << srv.port;
+    const std::string endpoint = key.str();
+
+    if (srv.server_names.empty()) {
+        // Reachable only as the endpoint's default, and the default is the first
+        // block on it. Being here after the endpoint is known means something
+        // already holds that slot.
+        if (endpoints_seen.count(endpoint) != 0)
+            fail("this server block listens on " + endpoint + " with no 'server_name', "
+                 "but another block already answers there; it could never be "
+                 "selected. Give it a server_name, or remove it", line);
+    } else {
+        for (size_t i = 0; i < srv.server_names.size(); ++i) {
+            const std::string name = lowerName(srv.server_names[i]);
+            if (!claimed.insert(std::make_pair(endpoint, name)).second)
+                fail("server_name '" + srv.server_names[i] + "' is already used by "
+                     "another server block on " + endpoint + "; the Host header "
+                     "carries one name, so this block could never be selected", line);
+        }
+    }
+    endpoints_seen.insert(endpoint);
+}
+
 Config parseTokens(const std::vector<Token>& toks) {
     Config config;
+    std::set<std::string> endpoints_seen;
+    std::set<std::pair<std::string, std::string> > claimed;
     size_t pos = 0;
     while (pos < toks.size()) {
         const Token& t = toks[pos];
@@ -454,6 +513,8 @@ Config parseTokens(const std::vector<Token>& toks) {
         ++pos;
         expect(toks, pos, "{");
         config.push_back(parseServer(toks, pos));
+        // t.line is the 'server' keyword, so the error points at the block itself
+        claimServer(config.back(), endpoints_seen, claimed, t.line);
     }
     return config;
 }

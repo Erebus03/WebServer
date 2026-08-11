@@ -945,7 +945,7 @@ def main():
                 except subprocess.TimeoutExpired: pr.kill(); pr.wait(timeout=3)
             r.group("duplicate listen (correction sheet)")
             r.check(not running, "same port + same server_name twice",
-                    "the sheet says this should not work (known: we accept it silently)",
+                    "the sheet says this should not work; the block is unreachable, so refusing it loses nothing",
                     "rejected", "accepted")
 
         r.summary()
