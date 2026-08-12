@@ -89,6 +89,7 @@ TEST_SRCS = \
 	tests/test_PostHandler.cpp \
 	tests/test_response_builder.cpp \
 	tests/test_router.cpp \
+	tests/test_stream_hooks.cpp \
 
 TEST_BINS = $(TEST_SRCS:.cpp=)
 
