@@ -2,7 +2,7 @@
 #include "../includes/HttpVersion.hpp"
 #include <cctype>
 
-HttpParser::HttpParser() : chunk_scan_pos_(0), chunk_started_(false) {}
+HttpParser::HttpParser() : chunk_scan_pos_(0), chunk_started_(false), body_start_(0) {}
 
 // clear per-request decode state. the caller must call this between requests on
 // a kept-alive connection, otherwise the next chunked body resumes from the old
@@ -11,6 +11,7 @@ void HttpParser::reset()
 {
     chunk_scan_pos_ = 0;
     chunk_started_ = false;
+    body_start_ = 0;
 }
 
 // trim spaces/tabs off both ends
@@ -108,6 +109,7 @@ ParseResult HttpParser::parse(const std::string& bytes, HttpRequest& request, si
 {
     consumed = 0;
     request.status = 400;   // set now, so any error path already has a code
+    request.body_complete = false;   // flip to true only once the whole body is in (see COMPLETE below)
 
     size_t line_end = bytes.find("\r\n");
     if (line_end == std::string::npos)
@@ -128,10 +130,13 @@ ParseResult HttpParser::parse(const std::string& bytes, HttpRequest& request, si
         return PARSE_ERROR;
     }
 
-    readBody(bytes, blank_line + 4, request, consumed);   // +4 skips the \r\n\r\n
+    body_start_ = blank_line + 4;                         // +4 skips the \r\n\r\n
+    readBody(bytes, body_start_, request, consumed);
 
-    if (request.state == COMPLETE)
+    if (request.state == COMPLETE) {
+        request.body_complete = true;   // whole body is in request.body (until A drains it for streaming)
         return PARSE_COMPLETE;
+    }
     if (request.state == ERROR)
         return PARSE_ERROR;
     return PARSE_INCOMPLETE;
@@ -374,4 +379,34 @@ void HttpParser::readChunkedBody(const std::string& bytes, size_t body_start,
         pos = data_start + chunk_size + 2;                    // past the data + its \r\n
         chunk_scan_pos_ = pos;                                // committed: chunk fully done
     }
+}
+
+// --- streaming hooks for A (see HttpParser.hpp). These do NOT touch parse()'s
+// logic; they only expose/adjust the resume offset so A can shrink his buffer. ---
+
+// where the body begins (just past the blank line). Meaningful once headers parsed.
+size_t HttpParser::bodyStart() const
+{
+    return body_start_;
+}
+
+// end of the decoded raw body: bytes in [bodyStart(), decodedRawOffset()) are done
+// and already in request.body, so A can drop them. For non-chunked bodies nothing
+// is decoded incrementally yet, so there's nothing extra to drop -> == bodyStart().
+size_t HttpParser::decodedRawOffset() const
+{
+    return chunk_started_ ? chunk_scan_pos_ : body_start_;
+}
+
+// A erased n raw body bytes from the front of the body region (keeping the headers),
+// so the buffer shrank by n. Slide our resume offset back by the same n. Clamp so we
+// can never point before the body or drop a chunk that isn't fully decoded yet.
+void HttpParser::dropDecodedRaw(size_t n)
+{
+    if (!chunk_started_)
+        return;                                  // nothing decoded to drop yet
+    size_t droppable = chunk_scan_pos_ - body_start_;
+    if (n > droppable)
+        n = droppable;                           // never slide past un-decoded bytes
+    chunk_scan_pos_ -= n;
 }
