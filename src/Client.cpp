@@ -37,6 +37,14 @@ Client::Client(int socket_fd, int accepted_on, const std::string& remote_addr)
     // which makes leaving it uninitialised a real bug, not a style issue.
     request.state = READING_REQUEST_LINE;
     request.is_complete = false;
+    // Added when B introduced the field (0fa9a4d). It belongs in this list for
+    // exactly the reason the comment above gives: the struct has no constructor,
+    // so anything not named here is indeterminate on a NEW connection.
+    // resetForNextRequest() is safe already -- it does `request = HttpRequest()`,
+    // which value-initialises -- so only the freshly-accepted case was exposed.
+    // Nothing reads the flag yet, so this was latent rather than live; it stops
+    // being latent the moment PostHandler checks it, which is its whole purpose.
+    request.body_complete = false;
 }
 
 bool Client::isTimedOut(time_t timeout_seconds) const {
