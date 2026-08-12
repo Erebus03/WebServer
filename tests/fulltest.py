@@ -36,24 +36,38 @@ class C:
     G="\033[32m"; R="\033[31m"; Y="\033[33m"; D="\033[2m"; B="\033[1m"; X="\033[0m"
     @classmethod
     def off(cls):
-        for k in ("G","R","Y","D","B","X"): setattr(cls,k,"")
+        for k in ("G","R","Y","D","B","X","DIM_CODE"): setattr(cls,k,"")
 if not sys.stdout.isatty(): C.off()
 
 class Report:
-    def __init__(self, verbose=False):
-        self.passed=0; self.failed=0; self.skipped=0; self.verbose=verbose
+    def __init__(self, verbose=False, brief=False):
+        self.passed=0; self.failed=0; self.skipped=0
+        self.verbose=verbose; self.brief=brief
         self.failures=[]; self._group=None
     def group(self, name):
         self._group=name
         print(f"\n{C.B}── {name} {'─'*max(0,58-len(name))}{C.X}")
-    def ok(self, what, why):
+    def _detail(self, want, got, colour):
+        """The two lines under a result: what was actually sent, and want vs got.
+        Printed for PASSES too -- a green line that does not say what it proved is
+        not evidence, it is decoration."""
+        if self.brief: return
+        act = last_action()
+        if act:
+            print(f"        {C.D}did  {C.X}{C.DIM_CODE}{act}{C.X}")
+        print(f"        {C.D}want {C.X}{want}{C.D}   got {C.X}{colour}{got}{C.X}")
+
+    def ok(self, what, why, want=None, got=None):
         self.passed+=1
         print(f"  {C.G}PASS{C.X}  {what:<34} {C.D}{why}{C.X}")
+        if want is not None: self._detail(want, got, C.G)
     def bad(self, what, why, want, got, raw=b""):
         self.failed+=1
         self.failures.append((self._group, what, want, got))
         print(f"  {C.R}FAIL{C.X}  {what:<34} {C.D}{why}{C.X}")
-        print(f"        {C.R}want {want}  ·  got {got}{C.X}")
+        self._detail(want, got, C.R)
+        if self.brief:
+            print(f"        {C.R}want {want}  ·  got {got}{C.X}")
         if self.verbose and raw:
             body = raw.decode("latin1")[:400].replace("\r\n","\n        | ")
             print(f"        {C.D}| {body}{C.X}")
@@ -61,7 +75,7 @@ class Report:
         self.skipped+=1
         print(f"  {C.Y}SKIP{C.X}  {what:<34} {C.D}{why}{C.X}")
     def check(self, cond, what, why, want, got, raw=b""):
-        if cond: self.ok(what, why)
+        if cond: self.ok(what, why, want, got)
         else:    self.bad(what, why, want, got, raw)
     def summary(self):
         t=self.passed+self.failed
@@ -77,7 +91,38 @@ class Report:
         print()
 
 # ── wire helpers ─────────────────────────────────────────────────────────────
+# The last thing this suite DID, in one line, so every result can show it without
+# each of the ~80 call sites having to pass it in. send_raw() is the single funnel
+# every request goes through, so recording it there covers the lot; anything that
+# is not an HTTP request (starting a binary on a config, say) calls note() itself.
+_ACTION = [""]
+def note(s):        _ACTION[0] = s
+def last_action():  return _ACTION[0]
+
+def _describe(data):
+    """One readable line for the request being sent -- request line + the headers
+    that change the meaning of the test, never the boilerplate."""
+    try:    txt = data.decode("latin1") if isinstance(data, bytes) else data
+    except Exception: return "<binary>"
+    head = txt.split("\r\n\r\n", 1)[0]
+    lines = head.split("\r\n")
+    if not lines: return "<empty>"
+    out = lines[0].strip() or "<empty request line>"
+    if len(out) > 62: out = out[:59] + "..."
+    keep = []
+    for ln in lines[1:]:
+        low = ln.lower()
+        if low.startswith(("content-length", "transfer-encoding", "expect",
+                           "content-type", "x-pad", "bad ", "x-bad")):
+            keep.append(ln.strip()[:44])
+        elif low.startswith("host:") and "127.0.0.1" not in ln:
+            keep.append(ln.strip()[:44])
+    body_n = len(txt.split("\r\n\r\n", 1)[1]) if "\r\n\r\n" in txt else 0
+    if body_n: keep.append("+%d B body" % body_n)
+    return out + (("  ·  " + "  ·  ".join(keep[:3])) if keep else "")
+
 def send_raw(port, data, timeout=6.0, read_until_close=True):
+    note(_describe(data))
     """Send exact bytes, read the whole reply. Returns b'' on connection error."""
     s=socket.socket(); s.settimeout(timeout)
     try:
@@ -155,6 +200,8 @@ def post_stream_chunked(port, path, total, block=65536, timeout=240):
     s = socket.socket(); s.settimeout(timeout)
     try:
         s.connect(("127.0.0.1", port))
+        note("POST %s  ·  Transfer-Encoding: chunked  ·  %d MB streamed from one reused block"
+             % (path, total // (1024*1024)))
         s.sendall((f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
                    "Transfer-Encoding: chunked\r\n"
                    "Content-Type: application/octet-stream\r\n"
@@ -361,6 +408,9 @@ def group_config(r, base, port, www):
     def run(conf_text, name, why, expect_ok):
         path=os.path.join(base,"c_%s.conf"%re.sub(r'\W','_',name))
         open(path,"w").write(conf_text)
+        # not an HTTP request: say which config was fed to the binary
+        flat=" ".join(conf_text.split()).replace(base, "<tmp>").replace(www, "<www>")
+        note("./webserv with:  " + (flat[:96] + " ..." if len(flat)>96 else flat))
         p=subprocess.Popen([BIN,path],cwd=base,
                            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         time.sleep(0.35)
@@ -370,9 +420,11 @@ def group_config(r, base, port, www):
             try: p.wait(timeout=3)
             except subprocess.TimeoutExpired: p.kill(); p.wait(timeout=3)
         if expect_ok:
-            r.check(running, name, why, "accepted (starts)", "rejected (exited)")
+            r.check(running, name, why, "accepted (starts)",
+                    "accepted (still running)" if running else "REJECTED (exited)")
         else:
-            r.check(not running, name, why, "rejected", "accepted — invalid config ran")
+            r.check(not running, name, why, "rejected at load",
+                    "rejected at load" if not running else "ACCEPTED — the invalid config ran")
 
     good = main_conf(base, free_port(port+50), www)
     run(good, "valid config", "the full grammar this suite uses", True)
@@ -499,6 +551,7 @@ def group_http(r, port):
     s=socket.socket(); s.settimeout(6)
     try:
         s.connect(("127.0.0.1",port))
+        note("GET / HTTP/1.1 twice on ONE socket, no Connection: close")
         s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"); a=read_one(s)
         s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"); b=read_one(s)
         r.check(status(a)==200 and status(b)==200, "two requests, one connection",
@@ -511,6 +564,7 @@ def group_http(r, port):
     s=socket.socket(); s.settimeout(6)
     try:
         s.connect(("127.0.0.1",port))
+        note("two GETs sent back-to-back in ONE write, before reading either reply")
         s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         out=b""
         while True:
@@ -530,10 +584,12 @@ def group_http(r, port):
     # a truncated request must not take the server down
     s=socket.socket(); s.settimeout(2)
     try:
+        note("GET / HTTP/1.1 + Host, then CLOSE mid-headers (no blank line)")
         s.connect(("127.0.0.1",port)); s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n")
     except OSError: pass
     finally: s.close()
     resp=req(port,path="/")
+    note("a peer sent half a request then vanished; THEN a normal GET / on a new socket")
     r.check(status(resp)==200, "server survives a truncated request",
             "a client that vanishes mid-headers must not affect others", 200, status(resp), resp)
 
@@ -616,12 +672,14 @@ def group_load(r, port, srv):
     ts=[threading.Thread(target=one) for _ in range(40)]
     for t in ts: t.start()
     for t in ts: t.join()
+    note("40 GET / issued CONCURRENTLY from 40 threads")
     good=sum(1 for c in codes if c==200)
     r.check(good==40, "40 concurrent GETs", "every client gets an answer, none dropped",
-            "40x200", f"{good}x200")
-    r.check(srv.alive(), "server still up afterwards",
+            "40 x 200", f"{good} x 200")
+    alive_now = srv.alive()
+    r.check(alive_now, "server still up afterwards",
             "the subject requires it stays operational at all times", "alive",
-            "exited" if not srv.alive() else "alive")
+            "alive" if alive_now else "EXITED (crash or OOM)")
 
 # ── group: latency — the guard that was missing ─────────────────────────────
 def group_latency(r, port):
@@ -640,6 +698,7 @@ def group_latency(r, port):
     for _ in range(10):
         t0=time.time()
         resp=req(port,path="/")          # sends Connection: close, reads to EOF
+        note("10 x GET / with Connection: close, each read until EOF")
         times.append(time.time()-t0)
         if status(resp)!=200:
             r.bad("Connection: close latency","the request must actually succeed","200",status(resp))
@@ -656,6 +715,7 @@ def group_latency(r, port):
         s.connect(("127.0.0.1",port))
         for _ in range(10):
             s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"); read_one(s)
+        note("10 x GET / on ONE keep-alive socket")
         dur=time.time()-t0
         r.check(dur < 0.5, "10 keep-alive requests, one connection",
                 "a reused connection never drains, so it must be far faster",
@@ -705,9 +765,10 @@ def group_heavy(r, port, srv, size_mb, workers):
     refused  = sum(1 for c in codes if isinstance(c,int) and c in (503,507,413))
     broken   = [c for c in codes if not isinstance(c,int) or c<=0]
 
+    note("%d concurrent chunked POSTs of %d MB each to the CGI" % (workers, size_mb))
     r.check(alive, "server survives the load",
             "subject: must remain operational at all times -- an OOM kill is a zero",
-            "alive", "process gone (OOM/crash)")
+            "alive", "alive" if alive else "process GONE (OOM/crash)")
     r.check(answered==workers, f"all {workers} clients get an answer",
             "a refusal is fine; silence, a reset or a hang is not",
             f"{workers} status lines", f"{answered} ({len(broken)} broken: {sorted(set(map(str,broken)))[:3]})")
@@ -784,10 +845,12 @@ def group_malformed(r, port):
     ]
     for name, raw, why in cases:
         resp=send_raw(port, raw)
+        note("%d bytes: %r" % (len(raw), raw[:52]))
         st=status(resp)
         ok = (isinstance(st,int) and st>0) or resp==b""     # answered, or closed cleanly
         r.check(ok, name, why, "a status line or a clean close", st, resp)
     resp=req(port,path="/")
+    note("a normal GET / , after all %d malformed requests above" % len(cases))
     r.check(status(resp)==200, "server alive after the battery",
             "none of the above may take it down", 200, status(resp), resp)
 
@@ -803,9 +866,10 @@ def group_fdleak(r, port, srv):
     before=nfd()
     for _ in range(120): req(port,path="/")
     after=nfd()
+    note("120 sequential GET / on fresh connections, counting the server's open fds")
     r.check(after>=0 and after<=before+2, "fd count stable over 120 requests",
             "a closed connection must give its descriptor back",
-            f"<= {before+2}", after)
+            f"<= {before+2} fds", f"{after} fds (was {before})")
     # abandoned connections must be reaped too
     socks=[]
     for _ in range(20):
@@ -816,9 +880,10 @@ def group_fdleak(r, port, srv):
         try: s.close()
         except OSError: pass
     for _ in range(10): req(port,path="/")
+    note("20 sockets connected then closed WITHOUT sending anything, then 10 GETs")
     r.check(nfd()<=before+4, "fds released after abandoned connections",
             "clients that connect and vanish must not accumulate",
-            f"<= {before+4}", nfd())
+            f"<= {before+4} fds", f"{nfd()} fds")
 
 def group_siege(r, port, srv, n=400):
     r.group("sustained load — sequential, measures leak growth not concurrency")
@@ -834,6 +899,7 @@ def group_siege(r, port, srv, n=400):
     for _ in range(n):
         if status(req(port,path="/"))==200: good+=1
     avail=100.0*good/n
+    note("%d sequential GET / , counting non-200s and watching RSS" % n)
     r.check(avail>=99.5, f"availability over {n} sequential GETs",
             "the sheet wants >= 99.5%; concurrency is covered by robustness/memory, not here",
             ">= 99.5%", f"{avail:.1f}%")
@@ -844,13 +910,18 @@ def group_siege(r, port, srv, n=400):
                 "< 8 MB growth", f"{grow//1024} MB")
     else:
         r.skip("memory does not climb", "needs /proc (Linux); watch it with `top` here")
-    r.check(srv.alive(), "still up after sustained load",
-            "siege -b must be usable without restarting the server", "alive", "gone")
+    up = srv.alive()
+    r.check(up, "still up after sustained load",
+            "siege -b must be usable without restarting the server", "alive",
+            "alive" if up else "GONE")
 
 # ── main ────────────────────────────────────────────────────────────────────
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument("-v","--verbose",action="store_true",help="print raw response on failure")
+    ap.add_argument("-v","--verbose",action="store_true",help="also print the raw response of failures")
+    ap.add_argument("--brief",action="store_true",
+                    help="one line per check (the old format). Default shows what was "
+                         "sent and want-vs-got for every check, passes included.")
     ap.add_argument("-k",metavar="SUBSTR",help="only run groups matching this")
     ap.add_argument("--port",type=int,default=8300)
     ap.add_argument("--heavy",action="store_true",
@@ -865,7 +936,7 @@ def main():
     if not os.path.isfile(BIN) or not os.access(BIN,os.X_OK):
         print(f"{C.R}no ./webserv binary — run `make` first{C.X}"); return 1
 
-    r=Report(a.verbose)
+    r=Report(a.verbose, a.brief)
     base=tempfile.mkdtemp(prefix="webserv-fulltest-")
     try:
         www=build_tree(base)
@@ -936,6 +1007,7 @@ def main():
                 f"  location / {{ allowed_methods GET; }} }}\n"
                 f"server {{ listen 127.0.0.1:{dp}; server_name same.test; root {www};\n"
                 f"  location / {{ allowed_methods GET; }} }}\n")
+            note("./webserv <conf>   two server blocks, same listen + same server_name")
             pr=subprocess.Popen([BIN,dup],cwd=base,
                                 stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             time.sleep(0.35); running = pr.poll() is None
@@ -946,7 +1018,8 @@ def main():
             r.group("duplicate listen (correction sheet)")
             r.check(not running, "same port + same server_name twice",
                     "the sheet says this should not work; the block is unreachable, so refusing it loses nothing",
-                    "rejected", "accepted")
+                    "rejected at load",
+                    "rejected at load" if not running else "ACCEPTED — it started")
 
         r.summary()
         return r.failed
