@@ -36,7 +36,7 @@ class C:
     G="\033[32m"; R="\033[31m"; Y="\033[33m"; D="\033[2m"; B="\033[1m"; X="\033[0m"
     @classmethod
     def off(cls):
-        for k in ("G","R","Y","D","B","X","DIM_CODE"): setattr(cls,k,"")
+        for k in ("G","R","Y","D","B","X"): setattr(cls,k,"")
 if not sys.stdout.isatty(): C.off()
 
 class Report:
@@ -54,7 +54,7 @@ class Report:
         if self.brief: return
         act = last_action()
         if act:
-            print(f"        {C.D}did  {C.X}{C.DIM_CODE}{act}{C.X}")
+            print(f"        {C.D}did  {C.X}{act}")
         print(f"        {C.D}want {C.X}{want}{C.D}   got {C.X}{colour}{got}{C.X}")
 
     def ok(self, what, why, want=None, got=None):
