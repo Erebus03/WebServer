@@ -58,6 +58,13 @@ cp "$W/my page.htm" "$W/my page.html"
 [ -f "$W/static/a/b/nested.htm" ] || \
   printf '<html><body>NESTED-PATH-SENTINEL</body></html>\n' > "$W/static/a/b/nested.htm"
 
+# ── upload dir: wiped, not just re-seeded ───────────────────────────────
+# Multipart upload answers 409 Conflict when the target file already exists
+# (src/PostHandler.cpp:120), so every uploaded file left behind makes the next
+# run fail a test that passed the first time. Ten chunked-multipart checks flip
+# on exactly this. Wipe the directory, then re-seed the DELETE fixtures.
+find "$W/upload" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+
 # ── DELETE fixtures (consumed by the run -- always re-seeded) ────────────
 printf 'delete me\n' > "$W/upload/delete_me.txt"
 # 1x1 PNG: real binary with NUL bytes, proves no string truncation on read.
@@ -186,5 +193,7 @@ SUBJ="$ROOT/www-subject-tester"
 if [ -x "$SUBJ/cgi_tester" ] && [ ! -x "$SUBJ/directory/cgi_tester" ]; then
   cp "$SUBJ/cgi_tester" "$SUBJ/directory/cgi_tester" && chmod +x "$SUBJ/directory/cgi_tester"
 fi
+
+find "$ROOT/www-subject-tester/uploads" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
 
 echo "config: $CONF  (interpreter $PY)"
