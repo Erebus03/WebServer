@@ -2080,22 +2080,49 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
         if (reserve_fd >= 0) close(reserve_fd);
         close(fds[1]);
 
-        // V7: run the script from its own directory, so relative paths inside
-        // it resolve the way its author meant. Derived from script_path, the
-        // SAME absolute path execve is about to run, so the two cannot
-        // disagree. On failure _exit(1): the parent sees the pipe close with no
-        // header block and answers 502, which is the existing path for a child
-        // that dies before producing output.
+        // Run the script from its own directory, so relative paths inside it
+        // resolve the way its author meant -- the correction sheet requires it:
+        // "The CGI should be run in the correct directory for relative path file
+        // access." On failure _exit(1): the parent sees the pipe close with no
+        // header block and answers 502.
+        //
+        // AND HAND THE INTERPRETER THE BASENAME, NOT THE PATH WE STARTED WITH.
+        //
+        // script_path is relative whenever `root` is relative -- `root ./www` in
+        // config/tester.conf, for instance. Once we have chdir'd into the
+        // script's directory, a relative script_path no longer points anywhere:
+        // from `www/scripts`, the string "www/scripts/hello.py" means
+        // "www/scripts/www/scripts/hello.py". The interpreter then cannot open
+        // the very file it was told to run, exits without emitting a header
+        // block, and the request becomes a 502 that names no cause.
+        //
+        // MEASURED with a handler that simply prints what it received:
+        //     cwd     = .../argvproof/www/scripts
+        //     argv[1] = www/scripts/hello.py       <- resolves from cwd? NO
+        //
+        // Nothing caught this because the school's cgi_tester IGNORES argv[1] --
+        // it reads the body from stdin and never opens a file. Every real
+        // interpreter (python3, php-cgi, perl) must open it, so the whole CGI
+        // suite of a third-party tester failed on a config our own tester.conf
+        // uses. The previous comment here claimed script_path was "the SAME
+        // absolute path", which is exactly the assumption that was false.
+        //
+        // After the chdir the script IS the basename, so that is what argv[1]
+        // must be. Correct for an absolute root too: the file is in the
+        // directory we just moved to either way. No getcwd needed, which matters
+        // -- it is not in the subject's allowed function list.
+        std::string script_arg = script_path;
         {
             const size_t slash = script_path.find_last_of('/');
             if (slash != std::string::npos && slash > 0) {
                 if (chdir(script_path.substr(0, slash).c_str()) != 0) _exit(1);
+                script_arg = script_path.substr(slash + 1);
             }
         }
 
         char* argv[3];
         argv[0] = const_cast<char*>(interpreter.c_str());
-        argv[1] = const_cast<char*>(script_path.c_str());
+        argv[1] = const_cast<char*>(script_arg.c_str());
         argv[2] = NULL;
 
         // Pointers are taken only now that env_storage is fully built and will
