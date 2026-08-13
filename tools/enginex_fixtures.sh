@@ -182,6 +182,10 @@ server {
         index youpi.bad_extension;
         directory_listing on;
         cgi_extension .bla ./cgi_tester;
+        # Tests 16/16b/17 POST a 100000000-byte body here. The default cap is
+        # 1M (src/Config.cpp:401), so without this they get 413 and look like a
+        # server fault. config/tester.conf uses the same 200M for the same test.
+        client_max_body_size 200M;
     }
 }
 EOF
