@@ -61,3 +61,4 @@ YoupiBanane/cgi_tester
 # Output of tools/schoolrun.sh.
 .testlogs/
 report.txt
+run-school.txt

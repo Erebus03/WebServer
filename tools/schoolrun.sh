@@ -12,7 +12,8 @@ REPO="$PWD"
 AZZ="${1:-}"
 LOGS="$REPO/.testlogs"; rm -rf "$LOGS"; mkdir -p "$LOGS"
 R="$REPO/report.txt"; : > "$R"
-CAP=20000000                       # 20 MB per raw log, hard ceiling
+DEADLINE=900   # hard stop for the EngineX tester
+QUIET=90       # ...or stop once no new result line has appeared for this long
 
 say(){ printf '%s\n' "$*" | tee -a "$R"; }
 strip(){ sed 's/\x1b\[[0-9;]*m//g' | tr '\r' '\n'; }
@@ -71,9 +72,11 @@ else
     ( exec ./webserv config/tester.conf ) > "$LOGS/school-srv.log" 2>&1 &
     SRV=$!; sleep 2
     if kill -0 $SRV 2>/dev/null; then
-        # It waits on "press enter to continue"; with no stdin it just sits
-        # there until the timeout and reports nothing.
-        printf '\n\n' | timeout 300 ./tester http://127.0.0.1:8080 > "$LOGS/school.log" 2>&1
+        # It stops at "press enter to continue" FIVE times, not once (counted
+        # from a real run). Two newlines left it depending on how its reader
+        # behaves at EOF. Ten is bounded and covers every prompt -- never use
+        # `yes ''` here, that is what produced 8.7M lines once.
+        printf '\n%.0s' $(seq 10) | timeout 300 ./tester http://127.0.0.1:8080 > "$LOGS/school.log" 2>&1
         N=$(grep -c '^Test ' "$LOGS/school.log")
         if grep -qi 'FATAL' "$LOGS/school.log"; then
             say "$N tests run, FAILED on #$N"
@@ -110,11 +113,30 @@ else
         ( cd "$AZZ" && exec ./webserv webserv-enginex.conf ) > "$LOGS/azz-srv.log" 2>&1 &
         SRV=$!; sleep 2
         if kill -0 $SRV 2>/dev/null; then
-            # head -c caps it: when the cap is hit, SIGPIPE kills the tester.
-            # That is what stops the menu spinning forever once stdin ends.
-            ( cd "$AZZ" && printf '1-13\n14\n' | timeout 900 ./servTester.out 2>&1 ) \
-                | head -c $CAP > "$LOGS/azz-raw.log"
-            strip < "$LOGS/azz-raw.log" | grep -E '✔ PASS|✘ FAIL' > "$LOGS/azz.log"
+            # Do NOT cap by bytes: the tester calls signal(SIGPIPE, SIG_IGN) as
+            # the first statement in main(), so closing its stdout cannot stop
+            # it -- it ran the full 900s after the cap fired. Instead filter as
+            # it streams (nothing large is ever written) and stop it by pid when
+            # the results go quiet. pgrep -x matches the binary only; pkill -f
+            # would match this script.
+            ( cd "$AZZ" && printf '1-13\n14\n' | ./servTester.out 2>&1 ) \
+                | sed -u 's/\x1b\[[0-9;]*m//g' \
+                | grep -a --line-buffered -E '✔ PASS|✘ FAIL' > "$LOGS/azz.log" &
+            PIPE=$!
+            start=$SECONDS; last_size=0; last_change=$SECONDS
+            while kill -0 $PIPE 2>/dev/null; do
+                sleep 5
+                size=$(stat -c%s "$LOGS/azz.log" 2>/dev/null || echo 0)
+                [ "$size" != "$last_size" ] && { last_size=$size; last_change=$SECONDS; }
+                if { [ "$size" -gt 0 ] && [ $((SECONDS-last_change)) -ge $QUIET ]; } \
+                   || [ $((SECONDS-start)) -ge $DEADLINE ]; then
+                    t=$(pgrep -x servTester.out | head -1)
+                    [ -n "${t:-}" ] && kill -9 "$t" 2>/dev/null
+                    break
+                fi
+            done
+            wait $PIPE 2>/dev/null
+            t=$(pgrep -x servTester.out | head -1); [ -n "${t:-}" ] && kill -9 "$t" 2>/dev/null
             P=$(grep -c '✔ PASS' "$LOGS/azz.log"); F=$(grep -c '✘ FAIL' "$LOGS/azz.log")
             say "$P passed / $((P+F)) total"
             say "failures:"
@@ -131,5 +153,5 @@ fi
 freeport 8080 1025 1026 1027
 say ""
 say "== end =="
-say "raw logs in .testlogs/ (capped at $((CAP/1000000)) MB each)"
+say "logs in .testlogs/ (results are filtered as they stream, so nothing grows)"
 printf '\nreport written to %s (%s bytes) -- paste that\n' "$R" "$(stat -c%s "$R")"
