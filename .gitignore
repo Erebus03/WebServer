@@ -53,3 +53,7 @@ CLAUDE.local.md
 # private fixture tree for tests/test_FileUtils (removed by teardown, but an
 # assert() abort skips teardown and would leave it behind)
 tests/.fixtures_fileutils/
+
+# Third-party tester tree + its CGI binary: 12 MB of test data, not ours.
+EngineX/
+YoupiBanane/cgi_tester
