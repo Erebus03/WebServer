@@ -61,6 +61,26 @@ explain any line from memory, re-read that function.
 
 ---
 
+## Cookie/session demo (`www/cgi-bin/cookies.py`, `config/browser.conf`)
+Not a new C++ function — a CGI script + config wiring, using the plumbing above
+as-is. `Cookie:` in becomes `HTTP_COOKIE` for the script (existing env-building
+in Server.cpp, not mine); the script's `Set-Cookie:` line out is forwarded
+unchanged by `CgiResponse::parseHead` (mine, §CgiResponse above — no code
+change needed there). First hit: no cookie, script mints a `session_id` and
+sets it. Reload: script sees it in `HTTP_COOKIE`, says "Welcome back". Proven
+live with curl round-trips and a real browser.
+
+While testing this I hit a CGI bug (child chdir's into the script's directory
+but execve got handed the now-stale pre-chdir path) — **not my file, not my
+fix**: it's in `Server.cpp`'s fork/exec code, and Anouar had already found and
+fixed it independently before I pushed. My commit rebases onto his fix; I
+carry no CGI-launch code of my own.
+
+**Known limitation, not fixed:** `HttpResponse`/`CgiHeaders` keep headers in a
+`std::map`, so only one `Set-Cookie` survives per response. Fine for this demo.
+
+---
+
 ## The two ideas behind ALL of it (say these first at eval)
 1. **TCP is a byte stream** → `parse()` is a restartable state machine; "not all here yet" waits, never errors.
 2. **Parser reads the HTTP wire format, ResponseBuilder writes it** — same `\r\n`/blank-line shape, opposite directions.

@@ -132,12 +132,12 @@ passes end-to-end.
     ("multiple definition") → deduped.
 
 ### STILL OPEN
-- **Space-before-colon** (`Host :`) → should reject with **400** (RFC 7230,
-  smuggling). NOT done: the repo test `tests/test_http_parser.cpp` line ~21 has
-  `"HosT : api.example.com"` and **asserts it's ACCEPTED** (B's intentional edit).
-  Implementing strict rejection means flipping that test. **Waiting on B's OK.**
+- **Space-before-colon → 400 — ✅ DONE** (`c7aefe4`). `parseHeaderLine` rejects
+  whitespace/tab before the colon; `tests/test_http_parser.cpp` flipped to
+  expect `PARSE_ERROR` and passes. This section is stale on this point.
+- **Cookies — ✅ DONE**, see §9.B above.
 - **README** — subject requires a "Resources" section incl. *how AI was used*. Not
-  written.
+  written. **The one real open item left.**
 - MimeTypes integration (C's call). Confirm test 14 passes end-to-end.
 
 ---
@@ -206,11 +206,11 @@ Deps: parser needs `HttpParser.cpp HttpVersion.cpp`; ResponseBuilder needs
 
 ## 8. What to do next (pick up here)
 
-1. **Space-before-colon → 400** — ask B to confirm flipping the `HosT :` test, then
-   reject whitespace-before-colon in `parseHeaderLine` and flip that test case.
-2. **README** — write B's parsing/response section + the required "Resources" /
-   how-AI-was-used section.
-3. **Confirm integrations** with the team: MimeTypes called by C; chunked test 14
+1. ~~Space-before-colon → 400~~ — done, see §5.
+2. ~~Cookies~~ — done, see §9.B.
+3. **README** — write B's parsing/response section + the required "Resources" /
+   how-AI-was-used section. **The only thing left on B's list.**
+4. **Confirm integrations** with the team: MimeTypes called by C; chunked test 14
    passes end-to-end; MultipartParser wired in PostHandler.
 
 Full narrative of decisions is in memory (`project-webserver`, `user-webserver-
@@ -253,41 +253,41 @@ easy. Also: B codes with Claude and isn't deep in C++ — explain in plain words
   for the body delta) as a proposal for A+C to sign off BEFORE any code.
 - Reference: A's audit `study/A14_streaming_audit.md`; his memory numbers.
 
-### B. Cookies (BONUS — only graded if mandatory is fully done)
-- **Already works at B's layer for the simple (one-cookie) case, no new code:** the
-  `Cookie:` request header is parsed into `request.headers["cookie"]` by the existing
-  parser; a handler sets `response.headers["Set-Cookie"] = "..."` and ResponseBuilder
-  emits it. Some cookie handling already exists in `Server.cpp` / `CgiResponse.cpp`.
-- **Known real gap for MULTIPLE cookies:** `HttpResponse.headers` is
-  `std::map<std::string,std::string>` → it can hold only ONE `Set-Cookie`. Two
-  cookies = the map overwrites. Fixing that (multi-value Set-Cookie) touches the
-  shared struct + ResponseBuilder + handlers — a coordinated change, not a quick one.
-  For a simple bonus demo, ONE cookie is enough and already works.
-- **The actual cookie/session DEMO** (set a cookie, read it back, track a session)
-  lives in **C's handler or a CGI script** — not B's parser/response. So there's
-  little for B to *code*; it's mostly wiring a demo with C.
-- **Plan for a fresh session:** (1) confirm one-cookie round-trip end-to-end
-  (Set-Cookie out, Cookie in) with a small CGI or handler demo — C's side; (2) decide
-  whether multi-Set-Cookie support is worth the shared-struct change; (3) a tiny
-  cookie-parse helper (`Cookie: a=1; b=2` → map) is a legit small B utility if C wants
-  it. Don't build a new tracked file hastily (Makefile/merge-dup risk — see §7).
+### B. Cookies (BONUS — only graded if mandatory is fully done) — ✅ DONE (2026-08-13)
+- **Demo shipped:** `www/cgi-bin/cookies.py`, wired into `config/browser.conf`'s
+  `/cgi-bin` location. First hit: no `session_id` cookie → script mints one,
+  `Set-Cookie`s it. Reload: script reads it back from `HTTP_COOKIE` → "Welcome
+  back". Proven live with curl round-trips and a real browser.
+- **No new code in B's owned files** — the existing plumbing was already
+  correct: `Cookie:` → `HTTP_COOKIE` (Server.cpp's env loop, not B's file) and
+  `Set-Cookie:` out → forwarded as-is by `CgiResponse::parseHead` (B's file,
+  unchanged). This was wiring + one demo script, per the plan below.
+- **CGI bug found while testing this — explicitly NOT B's responsibility or
+  fix.** The CGI child chdir's into the script's directory but was handing
+  execve the pre-chdir (now-stale) path — 502 on every real interpreter under
+  a relative `root`. That's `Server.cpp` fork/exec code, A's file. Anouar had
+  already found and fixed it independently (`d54ef20`/`7ffbf51`) before B's
+  cookie commit landed; B's push rebases onto that fix and carries no CGI-launch
+  code of its own. Do not log this fix under B's name.
+- **Known real gap for MULTIPLE cookies, still unfixed:** `HttpResponse.headers`
+  / `CgiHeaders.headers` are `std::map<std::string,std::string>` → only ONE
+  `Set-Cookie` survives per response. Fine for this single-cookie demo. Multi-
+  cookie support would touch the shared struct + ResponseBuilder + handlers —
+  a coordinated change, not done, not currently planned.
 
-### C. Static HTML page (mandatory feature, but C/config-owned)
-- Serving a static site is mandatory, but it's **C's GetHandler + config + content
-  files**, not B's code. B's ResponseBuilder already serializes it.
-- Repo already has `www/index.html`. But `config/default.conf` roots point at
-  **absolute paths that likely don't exist on the box** (`/var/www/html`,
-  `/home/dev/www`, `/var/www/api`). So the demo won't serve until a config points its
-  `root` at a real directory (e.g. the repo's `www/`). That alignment is A/C/config
-  work. Left for a fresh session to do with the team — quick once the root is fixed.
+### C. Static HTML page (mandatory feature, but C/config-owned) — ✅ resolved
+- Still not B's code — C's GetHandler + config + content, B's ResponseBuilder just
+  serializes it, unchanged.
+- The old worry (`config/default.conf` roots pointing at absolute paths that don't
+  exist on the box) is moot: `config/browser.conf` (Anouar) uses a relative
+  `root www;` and is the actual demo config now — home page, `/about.html`, a 404,
+  a directory listing, a 301 redirect, all live. Nothing left to align here.
 
-### D. B's own open items (unchanged)
-1. **Space-before-colon → 400** — reject whitespace before the colon in
-   `parseHeaderLine`; then FLIP the repo test (`tests/test_http_parser.cpp` ~line 21
-   `"HosT :"` currently asserts ACCEPTED → change to expect PARSE_ERROR). Waiting on
-   B's OK to flip that test.
-2. **README** — SKIPPED for now per B (still owed eventually: Resources / how-AI-was-
-   used section, subject-required).
+### D. B's own open items
+1. ~~Space-before-colon → 400~~ — **done**, `c7aefe4`, test flipped.
+2. ~~Cookies~~ — **done**, see §9.B.
+3. **README** — still the only thing owed (Resources / how-AI-was-used section,
+   subject-required).
 
 ### E. Also new this session
 - `mdFiles/MEMBER_B_REVISION.md` — one-line-per-function self-review sheet.

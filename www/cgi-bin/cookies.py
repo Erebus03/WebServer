@@ -71,6 +71,9 @@ body = """<!DOCTYPE html>
            browser is now sending it back in the <code>Cookie</code> header.</p>
         <p class="note">Open a private/incognito window to see the
            "Nice to meet you" state again -- that's a fresh cookie jar.</p>
+        <p class="note">Second example: <a href="/cgi-bin/visits.py">visits.py</a>
+           -- a cookie whose VALUE changes every visit, instead of one that
+           stays fixed like this session id.</p>
     </main>
 </body>
 </html>
