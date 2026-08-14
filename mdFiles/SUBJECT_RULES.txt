@@ -86,6 +86,15 @@ algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
             getpeername is NOT) or skip printing the IP. Simplest: don't
            pretty-print the peer IP, or reconstruct it manually from
            ntohl(addr.sin_addr.s_addr).
+[X] unlink / remove(2) / rmdir  -> NOT listed. The table has NO deletion
+                         syscall at all, yet DELETE is mandatory. Use
+                         std::remove() from <cstdio>: it is ISO C++98 (27.8.2),
+                         so it rides on the standard library, not on the
+                         External Function table — the same cover as
+                         memset/atoi/time. See DeleteHandler.cpp.
+[X] _exit             -> NOT listed, and std::exit IS (<cstdlib>, C++98) -- but
+                         we KEEP _exit deliberately. Decided 2026-08-14; see
+                         section 5 DECIDED. Do not "fix" it to std::exit.
 [X] perror            -> NOT listed. Use: std::cerr << msg << ": "
                                        << strerror(errno) << std::endl;
                          (only after non-read/write calls, e.g. socket/bind).
@@ -141,6 +150,16 @@ algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
 -------------------------------------------------------------------------------
  5. CURRENT-CODE COMPLIANCE (audit 2026-08-01, branch Anouar)
 -------------------------------------------------------------------------------
+RESOLVED (fixed 2026-08-14):
+  - unlink -> std::remove(). DeleteHandler.cpp:25 called unlink(), which is not
+    in the PDF's External Function table (re-read the PDF directly on
+    2026-08-14 to confirm — this file's section 1 list is faithful, it had just
+    never been checked against the DELETE path). Runtime-verified on
+    config/default.conf :8000 — DELETE of an existing file 204 and the file is
+    gone, repeat DELETE 404, DELETE of a directory 403, server still up.
+    The errno switch below the call stays legal: the ban is only after
+    read/write.
+
 RESOLVED (fixed 2026-07-24):
   - inet_pton  -> replaced by static parseIPv4() (dotted-quad -> host order,
                   then htonl) in src/Server.cpp. Runtime-verified: binds
@@ -169,7 +188,11 @@ COMPLIANT:
     _rebuildPollFds(), dispatched in _handlePollEvents()
   - parent's pipe read end non-blocking via the exact allowed fcntl form
   - no errno inspected after the pipe read; >0 / 0 / <0 only
-  - child ends in execve or _exit(1) — never exit(), never a return
+  - child ends in execve or _exit(1) — never a return
+    ^ CORRECTED 2026-08-14: this line used to read "never exit()" and marked
+      _exit as compliant. _exit is NOT in the External Function table either;
+      exit() is reachable as std::exit (<cstdlib>, C++98). RESOLVED: see
+      section 5 DECIDED (2026-08-14) -- _exit stays, deliberately.
   - waitpid(WNOHANG) on every path driven by the script's own pace. The ONE
     deliberate exception is _killCgi(): after SIGKILL it waits blocking, which
     is safe because SIGKILL cannot be caught or ignored, so the wait is bounded
@@ -296,7 +319,50 @@ OPEN:
     advertised in no config and implemented nowhere. Same 501 trap as HEAD if
     an evaluator writes it into their own config.
 
-  - (none for CGI)
+  - _exit(1) in the CGI child: MOVED to DECIDED below (2026-08-14).
+
+
+DECIDED (2026-08-14, A and C):
+
+  - _exit(1) in the CGI child STAYS. Server.cpp:2046, 2047, 2118, 2138.
+    Not in the External Function table -- and neither is any other way to end a
+    process: not exit, not _exit, not abort. The table licenses fork and execve,
+    and terminating a child whose execve failed is inseparable from that pair,
+    so this is an omission in the list, not a prohibition.
+
+    std::exit (<cstdlib>) would carry the same C++98 cover std::remove does, and
+    the swap was considered seriously. Rejected on MEASUREMENT, not preference:
+
+      exit() flushes the stdio/iostream buffers inherited across fork(). By then
+      the child has dup2'd stdout onto the CGI pipe, so buffered std::cout lands
+      INSIDE the CGI response body.
+
+      Measured 2026-08-14: all 14 std::cout uses in Server.cpp end in std::endl
+      (the three that look otherwise are multi-line statements flushing on the
+      continuation line), so the buffer IS empty at fork() and std::exit would
+      be safe TODAY. No static objects with nontrivial destructors either --
+      the two `static` hits in src/ are functions.
+
+    That is precisely why _exit stays: std::exit would be safe by coincidence of
+    logging style, not by construction. One future log line without std::endl
+    silently reintroduces a load-dependent corrupted CGI response that vanishes
+    under a debugger. _exit is safe by construction.
+
+    Line to give an evaluator:
+
+      "The table licenses fork and execve. Terminating a child whose execve
+       failed is inseparable from that pair, and the table names no termination
+       function at all. _exit is the correct one: exit() would flush stdio
+       buffers inherited across fork into a stdout already dup2'd onto the CGI
+       pipe, corrupting the response body. We chose correctness over an
+       omission in the list."
+
+  - Whole-binary audit, same date: `nm -u webserv` diffed against the 45-entry
+    table plus the C++98 headers. After C's std::remove fix, _exit is the ONLY
+    off-list, non-C++98 symbol in the whole program. Everything else linked is
+    in the table or ISO C++98 (memset, memmove, memcmp, strlen, atoi, isalnum,
+    isalpha, isspace, tolower, toupper, time, gmtime, strftime). Nothing hides
+    in PUT or anywhere else. Repeat any time with:  nm -u webserv
 
 ===============================================================================
  Source of truth: the official 42 "Webserv" subject PDF. If the evaluation
