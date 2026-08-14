@@ -86,6 +86,14 @@ algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
             getpeername is NOT) or skip printing the IP. Simplest: don't
            pretty-print the peer IP, or reconstruct it manually from
            ntohl(addr.sin_addr.s_addr).
+[X] unlink / remove(2) / rmdir  -> NOT listed. The table has NO deletion
+                         syscall at all, yet DELETE is mandatory. Use
+                         std::remove() from <cstdio>: it is ISO C++98 (27.8.2),
+                         so it rides on the standard library, not on the
+                         External Function table — the same cover as
+                         memset/atoi/time. See DeleteHandler.cpp.
+[X] _exit             -> NOT listed. std::exit IS (<cstdlib>, C++98). See the
+                         OPEN item in section 5 before touching the CGI child.
 [X] perror            -> NOT listed. Use: std::cerr << msg << ": "
                                        << strerror(errno) << std::endl;
                          (only after non-read/write calls, e.g. socket/bind).
@@ -141,6 +149,16 @@ algorithm, cctype, cstdlib, ctime, cstring...) is fine — it is not an
 -------------------------------------------------------------------------------
  5. CURRENT-CODE COMPLIANCE (audit 2026-08-01, branch Anouar)
 -------------------------------------------------------------------------------
+RESOLVED (fixed 2026-08-14):
+  - unlink -> std::remove(). DeleteHandler.cpp:25 called unlink(), which is not
+    in the PDF's External Function table (re-read the PDF directly on
+    2026-08-14 to confirm — this file's section 1 list is faithful, it had just
+    never been checked against the DELETE path). Runtime-verified on
+    config/default.conf :8000 — DELETE of an existing file 204 and the file is
+    gone, repeat DELETE 404, DELETE of a directory 403, server still up.
+    The errno switch below the call stays legal: the ban is only after
+    read/write.
+
 RESOLVED (fixed 2026-07-24):
   - inet_pton  -> replaced by static parseIPv4() (dotted-quad -> host order,
                   then htonl) in src/Server.cpp. Runtime-verified: binds
@@ -169,7 +187,10 @@ COMPLIANT:
     _rebuildPollFds(), dispatched in _handlePollEvents()
   - parent's pipe read end non-blocking via the exact allowed fcntl form
   - no errno inspected after the pipe read; >0 / 0 / <0 only
-  - child ends in execve or _exit(1) — never exit(), never a return
+  - child ends in execve or _exit(1) — never a return
+    ^ CORRECTED 2026-08-14: this line used to read "never exit()" and marked
+      _exit as compliant. _exit is NOT in the External Function table either;
+      exit() is reachable as std::exit (<cstdlib>, C++98). See the OPEN item.
   - waitpid(WNOHANG) on every path driven by the script's own pace. The ONE
     deliberate exception is _killCgi(): after SIGKILL it waits blocking, which
     is safe because SIGKILL cannot be caught or ignored, so the wait is bounded
@@ -296,7 +317,24 @@ OPEN:
     advertised in no config and implemented nowhere. Same 501 trap as HEAD if
     an evaluator writes it into their own config.
 
-  - (none for CGI)
+  - _exit(1) in the CGI child: Server.cpp:2046, 2047, 2118, 2138. Not in the
+    External Function table. std::exit (<cstdlib>) is C++98 standard library
+    and so carries the same cover std::remove does — but swapping it in is NOT
+    a free rename, which is why this is OPEN rather than fixed:
+
+      exit() runs atexit handlers and FLUSHES the stdio/iostream buffers the
+      child inherited from the parent across fork(). The child has already
+      dup2'd its stdout onto the CGI pipe, so anything the parent had buffered
+      in std::cout at fork time gets flushed INTO the CGI response body — a
+      corrupted response that only appears when the parent happens to have
+      unflushed output, i.e. intermittently and never under a debugger.
+
+    If we take this: flush std::cout and std::cerr immediately BEFORE fork(),
+    then use std::exit(1) in the child. Verify by logging to std::cout without
+    std::endl right before a CGI request and confirming the body is clean.
+    Decide as a team — unlike unlink, there is a real behavioural risk here and
+    _exit is defensible as "the POSIX half of a fork/exec pair the table does
+    license". Whichever way it goes, record it here.
 
 ===============================================================================
  Source of truth: the official 42 "Webserv" subject PDF. If the evaluation
