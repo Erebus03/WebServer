@@ -62,3 +62,6 @@ YoupiBanane/cgi_tester
 .testlogs/
 report.txt
 run-school.txt
+
+# Captured test logs from the school machine (10 MB).
+school_log_for_all_tests/
