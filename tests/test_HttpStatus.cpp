@@ -44,7 +44,11 @@ static void test_client_error_codes()
     check(403, "Forbidden");
     check(404, "Not Found");
     check(405, "Method Not Allowed");
+    check(408, "Request Timeout");
+    check(409, "Conflict");
     check(413, "Content Too Large");
+    check(414, "URI Too Long");
+    check(431, "Request Header Fields Too Large");
     std::cout << "[OK] 4xx codes carry their reason phrases" << std::endl;
 }
 
@@ -52,13 +56,25 @@ static void test_server_error_codes()
 {
     check(500, "Internal Server Error");
     check(501, "Not Implemented");   // RFC 9110 15.6.2 capitalises both words
+    // The four A's layer sends. They are asserted HERE, in C's suite, because this
+    // table is the one ResponseBuilder falls back to -- a code missing from it goes
+    // out as "Unknown Status" and no other suite would notice.
+    check(502, "Bad Gateway");
+    check(503, "Service Unavailable");
+    check(504, "Gateway Timeout");
+    check(505, "HTTP Version Not Supported");
     std::cout << "[OK] 5xx codes carry their reason phrases" << std::endl;
 }
 
 static void test_unmapped_code_falls_back()
 {
-    HttpResponse response = HttpStatus::make_response(502);
-    assert(response.status_code == 502);
+    // 418 is not in the table and nothing in this program sends it. It used to be
+    // 502 -- but 502 is a code A's CGI path really does emit, and pinning it here
+    // pinned the bug: the table stopped at 501, so a real 502 shipped as
+    // "HTTP/1.1 502 Unknown Status". 502 is mapped now and asserted below; the
+    // fallback needs a code we genuinely never send, or this test defends nothing.
+    HttpResponse response = HttpStatus::make_response(418);
+    assert(response.status_code == 418);
     assert(response.status_message == "Unknown Status");
     std::cout << "[OK] an unmapped code falls back to \"Unknown Status\"" << std::endl;
 }

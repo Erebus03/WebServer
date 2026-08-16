@@ -119,6 +119,7 @@ static HttpRequest make_request(const std::string& uri,
         request.headers["content-type"] = contentType;
     request.body = body;
     request.is_complete = true;
+    request.body_complete = true;   // the parser sets this on COMPLETE
 
     return request;
 }
@@ -496,6 +497,41 @@ static void test_multipart_writes_every_file()
     std::cout << "[OK] every file part in a batch is written" << std::endl;
 }
 
+static void test_batch_rolls_back_when_a_later_write_fails()
+{
+    setup_fixtures();
+
+    // Forcing a write to fail HALF WAY through a batch, deterministically.
+    //
+    // A dangling symlink is the lever. The validation loop asks file_exists(),
+    // which is stat() and therefore FOLLOWS the link -- the target is missing, so
+    // it reports "free" and the part passes validation. write_file() then opens an
+    // ofstream on the same path, which also follows the link, tries to create a
+    // file inside a directory that does not exist, and fails. So part one writes
+    // and part two cannot, which is exactly the state the rollback exists for and
+    // is otherwise very hard to produce on demand.
+    assert(symlink("/no_such_directory_for_this_test/x", at("/up/2.txt").c_str()) == 0);
+
+    std::string body =
+        "--XYZ\r\nContent-Disposition: form-data; name=\"a\"; filename=\"1.txt\"\r\n\r\nONE\r\n"
+        "--XYZ\r\nContent-Disposition: form-data; name=\"b\"; filename=\"2.txt\"\r\n\r\nTWO\r\n"
+        "--XYZ--\r\n";
+
+    HttpResponse response = PostHandler::handle(
+        make_request("/up/", MULTIPART, body),
+        make_location(UPLOAD));
+
+    assert(response.status_code == 500);
+    // The load-bearing assertion. 1.txt was written before 2.txt failed; without
+    // the rollback it would still be sitting there under a 500 -- a half-finished
+    // upload the client is never told about and cannot retry, because a retry
+    // would then collide with it and get a 409.
+    assert(!exists_on_disk(at("/up/1.txt")));
+
+    std::cout << "[OK] a failed write rolls back the files already written"
+              << std::endl;
+}
+
 static void test_batch_is_all_or_nothing_on_collision()
 {
     // The whole reason validation runs as a separate pass. The first part is
@@ -632,6 +668,7 @@ int main()
     test_multipart_traversal_filename_is_refused();
     test_malformed_multipart_is_bad_request();
     test_multipart_writes_every_file();
+    test_batch_rolls_back_when_a_later_write_fails();
     test_batch_is_all_or_nothing_on_collision();
     test_batch_is_all_or_nothing_on_bad_filename();
     test_duplicate_filenames_in_one_batch_are_refused();

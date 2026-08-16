@@ -68,11 +68,10 @@ LIB_OBJS = $(filter-out src/main.o,$(OBJS))
 # anything; and it claimed test_http_parser has no main(), which stopped being
 # true when B's suite merged. Five suites with a main() were therefore never run.
 #
-# The ones with NO main() (test_router, test_FileUtils, test_GetHandler,
-# test_Dispatcher, test_DirectoryLister, test_HttpStatus, test_DeleteHandler) still
-# cannot be built by this target: `tests/%` links one test source against LIB_OBJS
-# and nothing else, so listing one fails with "undefined reference to main". They
-# need a main() each or a shared runner; until then they are inert.
+# Re-derived again 2026-08-16: ALL 17 suites below define a main(), all 17 build,
+# and `make test` runs all 17. A paragraph here used to claim seven of them were
+# inert; it had drifted for the third time. This list is DERIVED, not maintained --
+# re-run the command above rather than editing from memory.
 TEST_SRCS = \
 	tests/test_cgi_response.cpp \
 	tests/test_config.cpp \

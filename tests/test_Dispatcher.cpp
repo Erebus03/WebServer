@@ -118,6 +118,7 @@ static HttpRequest make_request(const std::string& method, const std::string& ur
     request.headers.clear();
     request.body = "";
     request.is_complete = true;
+    request.body_complete = true;   // the parser sets this on COMPLETE
 
     return request;
 }

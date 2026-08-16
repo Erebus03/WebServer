@@ -22,30 +22,28 @@ int main () {
      loc4.path = "/cgi-bin";
      server.locations.push_back(loc4);
 
-     Router router;
-
      // Case 1: exact root match
-     const LocationConfig *result = router.match("/", server);
+     const LocationConfig *result = Router::match("/", server);
      assert(result != NULL);
      assert(result->path == "/");
 
      // Case 2: longest prefix wins
-     result = router.match("/uploads/photos/cat.jpg", server);
+     result = Router::match("/uploads/photos/cat.jpg", server);
      assert(result != NULL);
      assert(result->path == "/uploads/photos");
 
      // Case 3: falls back to shorter location
-     result = router.match("/uploads/document.pdf", server);
+     result = Router::match("/uploads/document.pdf", server);
      assert(result != NULL);
      assert(result->path == "/uploads");
 
      // Case 4: falls back to root
-     result = router.match("/anything-else", server);
+     result = Router::match("/anything-else", server);
      assert(result != NULL);
      assert(result->path == "/");
 
      // Case 5: CGI route
-     result = router.match("/cgi-bin/test.py", server);
+     result = Router::match("/cgi-bin/test.py", server);
      assert(result != NULL);
      assert(result->path == "/cgi-bin");
 
@@ -53,7 +51,7 @@ int main () {
      loc_trap.path = "/up";
      server.locations.push_back(loc_trap);
 
-     result = router.match("/uploads/photo.jpg", server);
+     result = Router::match("/uploads/photo.jpg", server);
      assert(result != NULL);
      assert(result->path == "/uploads");   // must NOT be "/up"
 
@@ -62,7 +60,7 @@ int main () {
      only_uploads.path = "/uploads";
      empty_server.locations.push_back(only_uploads);
 
-     result = router.match("/no-such-route", empty_server);
+     result = Router::match("/no-such-route", empty_server);
      assert(result == NULL);
 
      std::cout << "All router tests passed." << std::endl;

@@ -25,3 +25,26 @@ std::string UrlCodec::encode(const std::string& raw)
 
     return result;
 }
+
+std::string UrlCodec::encode_path(const std::string& path)
+{
+    std::string result;
+    size_t start = 0;
+
+    while (true)
+    {
+        const size_t slash = path.find('/', start);
+
+        if (slash == std::string::npos)
+        {
+            result += encode(path.substr(start));
+            break;
+        }
+
+        result += encode(path.substr(start, slash - start));
+        result += '/';
+        start = slash + 1;
+    }
+
+    return result;
+}

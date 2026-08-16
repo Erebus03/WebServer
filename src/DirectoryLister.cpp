@@ -60,7 +60,8 @@ std::string DirectoryLister::render(const std::string& diskPath, const std::stri
     for (std::vector<std::string>::const_iterator it = sortedNames.begin(); it != sortedNames.end(); ++it)
     {
         std::string fullPath;
-        FileUtils::resolve_path(diskPath, *it, fullPath);
+        if (!FileUtils::resolve_path(diskPath, *it, fullPath))
+            continue;
 
         struct stat st = {};
         if (stat(fullPath.c_str(), &st) != 0)
@@ -83,10 +84,20 @@ std::string DirectoryLister::render(const std::string& diskPath, const std::stri
             sizeCol = ss.str();
         }
 
+        // The href needs BOTH encodings, and so does the uri PREFIX -- percent
+        // encoding so the value survives as a URL, then HTML escaping because it
+        // lands inside a double-quoted attribute.
+        //
+        // The prefix used to be concatenated raw. A uri containing '"' closed the
+        // attribute and let markup escape into the page:
+        //     <a href="/x"><script>alert(1)</script>/a.txt">a.txt</a>
+        // The same uri was already escaped in the <title> and <h1> above; only
+        // this one interpolation was missed. Entry names were always handled
+        // correctly -- see html_escape/UrlCodec::encode on `name` either side.
         std::string safeName = html_escape(name);
+        std::string href = html_escape(UrlCodec::encode_path(uri) + encodedName);
         html += "<a href=\"";
-        html += uri;
-        html += encodedName;
+        html += href;
         html += "\">";
         html += safeName;
         html += "</a>  ";
