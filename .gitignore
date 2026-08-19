@@ -65,3 +65,11 @@ run-school.txt
 
 # Captured test logs from the school machine (10 MB).
 school_log_for_all_tests/
+
+# Same reasoning as /uploads above, for the console/demo upload directory that
+# config/webapp.conf writes to. The directory must EXIST in a fresh clone or
+# every upload answers 500, but nothing that lands in it belongs in git -- a
+# 100 MB test blob was sitting here untracked, and one `git add -A` would have
+# put it in the history permanently.
+/www/uploads/*
+!/www/uploads/.gitkeep
