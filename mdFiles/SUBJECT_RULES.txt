@@ -364,6 +364,33 @@ DECIDED (2026-08-14, A and C):
     isalpha, isspace, tolower, toupper, time, gmtime, strftime). Nothing hides
     in PUT or anywhere else. Repeat any time with:  nm -u webserv
 
+CLOSED (added 2026-08-19, found by A's review, fixed by B same day):
+
+  - Absolute-form request-target -> 404. `GET http://host/path HTTP/1.1`
+    (the form every HTTP/1.1 proxy sends) was parsed with the WHOLE thing --
+    scheme, host, port included -- as the path, so it always 404'd. RFC 7230
+    §5.3.2: a server "MUST accept the absolute-form in requests". Fix:
+    HttpParser.cpp, stripAbsoluteFormPrefix() strips scheme://authority
+    before the URI is split/decoded, so origin-form and absolute-form become
+    identical from that point on. Virtual-host selection is unaffected --
+    it's driven by the Host header (Server.cpp), never by request.uri.
+    Verified live: origin-form, absolute-form, absolute-form+query, and
+    absolute-form with no path at all (bare "http://host") all answer 200
+    against the same file. `make test` + full suite still green.
+
+  - CGI script setting only `Location:` (no `Status:`) answered 200 with the
+    Location header glued on, instead of a redirect. RFC 3875 §6.2.2/§6.2.3:
+    a Location with no Status is either a local redirect (path-only) or a
+    client redirect (absolute URI) -- never a plain 200. Full local-redirect
+    reprocessing is out of scope for a single-poll() server; the fix defaults
+    BOTH shapes to 302, the same simplification nginx-class servers use for
+    the local case. Fix: CgiResponse.cpp, parseHead() tracks whether the
+    script sent its own Status line; Location-without-Status now sets
+    status_code=302, status_message="Found". A script that DOES send its own
+    Status (e.g. `201 Created` + a Location pointing at the new resource) is
+    untouched -- verified live, 201 stays 201. Verified: Location-only ->
+    "302 Found" with Location intact; make test green.
+
 ===============================================================================
  Source of truth: the official 42 "Webserv" subject PDF. If the evaluation
  machine's subject differs from this file, the PDF wins — update this file.

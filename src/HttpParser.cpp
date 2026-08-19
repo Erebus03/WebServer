@@ -103,6 +103,49 @@ static bool percentDecode(const std::string& in, std::string& out)
     return true;
 }
 
+// RFC 7230 §5.3.2: a request-target MAY arrive in absolute-form --
+// "GET http://host:port/path HTTP/1.1" instead of the usual origin-form
+// "GET /path HTTP/1.1" -- and the RFC says a server "MUST accept the
+// absolute-form in requests". Every HTTP/1.1 proxy sends requests this way,
+// so a server in front of a proxy sees this on every single request.
+// Strips scheme://authority off the front, leaving just the path(+query), so
+// the rest of the parser (and everything downstream: Router, GetHandler, ...)
+// never has to know the difference from plain origin-form.
+// Virtual-host selection is untouched by this: it is driven entirely by the
+// Host header (Server.cpp), never by request.uri, so ignoring the authority
+// here does not affect which server{} block answers.
+// NOT handled (different request-target grammars, tied to methods this
+// server does not implement): authority-form ("CONNECT host:port"),
+// asterisk-form ("OPTIONS *").
+static std::string stripAbsoluteFormPrefix(const std::string& uri)
+{
+    // Cheap check before the real one: every scheme is letters then "://", so
+    // bail immediately on the overwhelmingly common case -- a plain "/path".
+    if (uri.empty() || uri[0] == '/')
+        return uri;
+
+    size_t scheme_end = uri.find("://");
+    if (scheme_end == std::string::npos)
+        return uri;
+
+    // scheme must be letters only (RFC 3986 §3.1) -- otherwise this "://" is
+    // something odd inside an origin-form path, not a real scheme, and must
+    // be left alone.
+    for (size_t i = 0; i < scheme_end; ++i) {
+        if (!std::isalpha(static_cast<unsigned char>(uri[i])))
+            return uri;
+    }
+
+    // authority runs up to the next '/' or '?', or to the end of the string.
+    size_t authority_start = scheme_end + 3;
+    size_t path_start = uri.find_first_of("/?", authority_start);
+    if (path_start == std::string::npos)
+        return "/";                             // "http://host", no path at all
+    if (uri[path_start] == '?')
+        return "/" + uri.substr(path_start);     // "http://host?query", no path
+    return uri.substr(path_start);
+}
+
 // bytes -> filled HttpRequest. returns COMPLETE / INCOMPLETE / ERROR.
 // on COMPLETE, consumed = how many bytes this request used.
 ParseResult HttpParser::parse(const std::string& bytes, HttpRequest& request, size_t& consumed)
@@ -162,6 +205,11 @@ bool HttpParser::parseRequestLine(const std::string& line, HttpRequest& request)
         request.status = vstatus;
         return false;
     }
+
+    // absolute-form ("GET http://host/path HTTP/1.1") -> origin-form
+    // ("/path"), so everything below treats it exactly like a normal
+    // request. See stripAbsoluteFormPrefix for why this must happen at all.
+    raw_uri = stripAbsoluteFormPrefix(raw_uri);
 
     // split on FIRST '?'. query stays raw — CGI decodes it itself.
     size_t q = raw_uri.find('?');
