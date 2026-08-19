@@ -550,6 +550,19 @@ static void validateServer(const ServerConfig& srv, int line) {
         const LocationConfig& loc = srv.locations[i];
         const std::string where = "location '" + loc.path + "'";
 
+        // A redirect location never touches the filesystem and never reaches a
+        // handler: Dispatcher.cpp:18 answers from redirect_url before any of
+        // that. Its inherited root, its methods and its upload directory are all
+        // dead fields, so warning about them is noise.
+        //
+        // MEASURED: `location /old { redirect 301 /; }` in config/browser.conf
+        // inherits root www/old, which does not exist. The old code warned that
+        // every request there answers 404 -- and the location answers 301, as
+        // it is supposed to. A validator that cries wolf gets ignored, which
+        // costs more than the check was ever worth.
+        if (!loc.redirect_url.empty())
+            continue;
+
         if (listsMethod(loc, "POST") && loc.upload_dir.empty() && loc.cgi_ext.empty())
             std::cerr << "config warning: " << where << " allows POST but declares "
                       << "neither upload_directory nor cgi_extension -- every POST "
