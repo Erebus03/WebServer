@@ -1276,8 +1276,59 @@ void Server::_processRequest(Client* client) {
             Router::match(client->request.uri, *client->server_cfg);
         if (loc) {
             std::string script_name, path_info;
-            const std::string interpreter =
+            std::string interpreter =
                 _cgiSplitPath(client->request.uri, *loc, script_name, path_info);
+
+            // An index that IS a script has to RUN, not be shipped as text.
+            // _cgiSplitPath only ever inspects the URI's own extensions, so a
+            // request naming a directory ("/php/") matched no cgi_extension and
+            // fell through to GetHandler, which resolved `index index.php` and
+            // sent the PHP SOURCE back with 200 -- source disclosure, not merely
+            // a missing feature. OBSERVED before this block:
+            //     GET /php/ -> 200, Content-Type: application/octet-stream,
+            //                  body `<?php echo "PHP INDEX PAGE\n"; ?>`
+            //
+            // The candidate walk mirrors GetHandler.cpp:49-60 deliberately: go
+            // through index_files IN ORDER, stop at the first one that EXISTS,
+            // and only then ask whether it is a CGI. Selecting the first CGI
+            // candidate instead would run the script for `index index.html
+            // index.php` even when index.html exists, which is not the file
+            // GetHandler would serve -- the two must not disagree about which
+            // index won.
+            //
+            // A candidate that does not exist is skipped rather than handed to
+            // the interpreter. The "a missing script still reaches the handler"
+            // rule below is about a URI the client actually typed; applying it
+            // here would turn `index index.php` with no index.php on disk into a
+            // 502, stealing the directory listing or 404 that GetHandler owes.
+            if (interpreter.empty() && !loc->cgi_ext.empty() &&
+                !client->request.uri.empty() &&
+                client->request.uri[client->request.uri.size() - 1] == '/') {
+                for (std::vector<std::string>::const_iterator idx =
+                         loc->index_files.begin();
+                     idx != loc->index_files.end(); ++idx) {
+                    const std::string cand_uri = client->request.uri + *idx;
+                    std::string cand_disk;
+                    if (!FileUtils::resolve_path(
+                            loc->root,
+                            FileUtils::strip_location_prefix(cand_uri, loc->path),
+                            cand_disk))
+                        continue;
+                    if (!FileUtils::file_exists(cand_disk) ||
+                        FileUtils::is_directory(cand_disk))
+                        continue;
+                    // First EXISTING index wins, CGI or not.
+                    std::string cand_script, cand_path_info;
+                    const std::string cand_interp =
+                        _cgiSplitPath(cand_uri, *loc, cand_script, cand_path_info);
+                    if (!cand_interp.empty()) {
+                        interpreter = cand_interp;
+                        script_name = cand_script;
+                        path_info   = cand_path_info;
+                    }
+                    break;
+                }
+            }
             // Two rules run BEFORE handler selection in Dispatcher: the
             // redirect at Dispatcher.cpp:18-26 and the method check at :28-54.
             // This branch returns at the _startCgi() call below, so the
@@ -2008,10 +2059,34 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
                        const std::string& script_path,
                        const std::string& script_name,
                        const std::string& path_info) {
+    // The child chdir's into the script's directory and runs it by basename (see
+    // the block just before execve). SCRIPT_FILENAME therefore has to name the
+    // file AS SEEN FROM THAT DIRECTORY, not from where the server was started.
+    // The split is computed once, here, and both consumers read these same two
+    // strings -- keeping it in one place IS the fix.
+    //
+    // What was wrong: argv[1] had already been corrected for the post-chdir cwd
+    // while SCRIPT_FILENAME kept the pre-chdir path, and the two silently
+    // disagreed. python3 takes argv[1], so it worked; php-cgi ignores argv[1]
+    // and opens SCRIPT_FILENAME, so it answered `404 No input file specified`
+    // for scripts sitting right there. MEASURED, same location and code path:
+    // .py -> 200 OK, .php -> 404. Reproduced outside the server too -- identical
+    // env from cwd=www/php fails with SCRIPT_FILENAME=./www/php/hello.php and
+    // succeeds with SCRIPT_FILENAME=hello.php.
+    std::string cgi_dir;
+    std::string cgi_file = script_path;
+    {
+        const size_t slash = script_path.find_last_of('/');
+        if (slash != std::string::npos && slash > 0) {
+            cgi_dir  = script_path.substr(0, slash);
+            cgi_file = script_path.substr(slash + 1);
+        }
+    }
+
     // Built BEFORE fork: allocating in the child after fork is asking for
     // trouble, and this cannot fail in a way the child could report.
     const std::vector<std::string> env_storage =
-        _cgiEnv(client, script_path, script_name, path_info);
+        _cgiEnv(client, cgi_file, script_name, path_info);
     int fds[2];                       // script stdout -> us
     if (pipe(fds) < 0) {
         _startErrorResponse(client, 500, FRAMING_INTACT);
@@ -2100,29 +2175,21 @@ bool Server::_startCgi(Client* client, const std::string& interpreter,
         //     cwd     = .../argvproof/www/scripts
         //     argv[1] = www/scripts/hello.py       <- resolves from cwd? NO
         //
-        // Nothing caught this because the school's cgi_tester IGNORES argv[1] --
-        // it reads the body from stdin and never opens a file. Every real
-        // interpreter (python3, php-cgi, perl) must open it, so the whole CGI
-        // suite of a third-party tester failed on a config our own tester.conf
-        // uses. The previous comment here claimed script_path was "the SAME
-        // absolute path", which is exactly the assumption that was false.
+        // cgi_dir/cgi_file are split ONCE before the fork precisely so that
+        // SCRIPT_FILENAME in the environment and argv[1] here always name the
+        // same file. Do not recompute either of them locally: that divergence is
+        // what broke every php-cgi request, and it is invisible to the school's
+        // cgi_tester, which ignores argv[1] AND SCRIPT_FILENAME -- it reads the
+        // body from stdin and never opens a file. Every real interpreter
+        // (python3, php-cgi, perl) opens one or the other.
         //
-        // After the chdir the script IS the basename, so that is what argv[1]
-        // must be. Correct for an absolute root too: the file is in the
-        // directory we just moved to either way. No getcwd needed, which matters
-        // -- it is not in the subject's allowed function list.
-        std::string script_arg = script_path;
-        {
-            const size_t slash = script_path.find_last_of('/');
-            if (slash != std::string::npos && slash > 0) {
-                if (chdir(script_path.substr(0, slash).c_str()) != 0) _exit(1);
-                script_arg = script_path.substr(slash + 1);
-            }
-        }
+        // No getcwd needed, which matters -- it is not in the subject's allowed
+        // function list.
+        if (!cgi_dir.empty() && chdir(cgi_dir.c_str()) != 0) _exit(1);
 
         char* argv[3];
         argv[0] = const_cast<char*>(interpreter.c_str());
-        argv[1] = const_cast<char*>(script_arg.c_str());
+        argv[1] = const_cast<char*>(cgi_file.c_str());
         argv[2] = NULL;
 
         // Pointers are taken only now that env_storage is fully built and will
