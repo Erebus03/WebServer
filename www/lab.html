@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>webserv — test lab</title>
+    <link rel="stylesheet" href="/style.css">
+    <style>
+        section { margin: 2rem 0; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; }
+        section h2 { margin-top: 0; }
+        button { cursor: pointer; }
+        input[type="text"], textarea { width: 100%; box-sizing: border-box; font-family: monospace; }
+        .result { margin-top: .5rem; padding: .5rem; background: #f4f4f4; font-family: monospace;
+                  white-space: pre-wrap; word-break: break-all; border-radius: 4px; min-height: 1.2em; }
+        .result.ok  { border-left: 4px solid #2a2; }
+        .result.err { border-left: 4px solid #c33; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>webserv — test lab</h1>
+        <p class="tag">click through every feature; each box shows the real response</p>
+    </header>
+
+    <main>
+        <section>
+            <h2>1. Static files &amp; errors</h2>
+            <p>Plain links — check headers/Content-Type with your browser's dev tools (Network tab).</p>
+            <ul>
+                <li><a href="/">/</a> — the home page</li>
+                <li><a href="/about.html">/about.html</a> — a second static page</li>
+                <li><a href="/nope.html">/nope.html</a> — doesn't exist → custom 404</li>
+                <li><a href="/listing/">/listing/</a> — directory listing (no index file there)</li>
+                <li><a href="/old">/old</a> — redirected (301) back to /</li>
+            </ul>
+        </section>
+
+        <section>
+            <h2>2. Cookies &amp; session</h2>
+            <ul>
+                <li><a href="/cgi-bin/cookies.py">/cgi-bin/cookies.py</a> — fixed session id, reload to confirm it stays the same</li>
+                <li><a href="/cgi-bin/visits.py">/cgi-bin/visits.py</a> — a counter cookie, reload to watch it climb</li>
+            </ul>
+        </section>
+
+        <section>
+            <h2>3. Upload text (POST, raw body)</h2>
+            <p>Writes exactly what you type, byte for byte, to a file on the server.</p>
+            <input type="text" id="rawName" value="note.txt">
+            <textarea id="rawBody" rows="3">hello from the test lab</textarea>
+            <button id="rawUpload">POST</button>
+            <div id="rawResult" class="result"></div>
+        </section>
+
+        <section>
+            <h2>4. Upload a file — e.g. the team photo, or one with the correctors</h2>
+            <p>Real file upload (multipart/form-data). Any file works; a picture shows a preview.</p>
+            <input type="file" id="fileInput" accept="image/*,*/*">
+            <button id="fileUpload">POST</button>
+            <div id="fileResult" class="result"></div>
+            <img id="filePreview" style="display:none; max-width:100%; margin-top:.5rem; border-radius:6px;">
+        </section>
+
+        <section>
+            <h2>5. Delete</h2>
+            <p>Path defaults to whatever you just uploaded above — change it to delete anything else in <code>/uploads</code>.</p>
+            <input type="text" id="delPath" placeholder="/uploads/note.txt">
+            <button id="delGo">DELETE</button>
+            <div id="delResult" class="result"></div>
+        </section>
+
+        <section>
+            <h2>6. See what's on disk</h2>
+            <p><a href="/uploads/">/uploads/</a> — directory listing of everything uploaded so far</p>
+        </section>
+    </main>
+
+    <footer><p>webserv · test lab</p></footer>
+
+    <script>
+        function show(el, status, extra) {
+            el.textContent = "HTTP " + status + (extra ? "\n" + extra : "");
+            el.className = "result " + (status >= 200 && status < 400 ? "ok" : "err");
+        }
+
+        async function upload(path, body, resultEl, delField) {
+            try {
+                const res = await fetch(path, { method: "POST", body: body });
+                const location = res.headers.get("Location") || path;
+                show(resultEl, res.status, "Location: " + location);
+                if (res.status < 400) delField.value = location;
+            } catch (e) {
+                show(resultEl, "—", "request failed: " + e);
+            }
+        }
+
+        document.getElementById("rawUpload").addEventListener("click", () => {
+            const name = document.getElementById("rawName").value || "note.txt";
+            const body = document.getElementById("rawBody").value;
+            upload("/uploads/" + encodeURIComponent(name), body,
+                   document.getElementById("rawResult"), document.getElementById("delPath"));
+        });
+
+        document.getElementById("fileUpload").addEventListener("click", async () => {
+            const file = document.getElementById("fileInput").files[0];
+            const resultEl = document.getElementById("fileResult");
+            const preview = document.getElementById("filePreview");
+            preview.style.display = "none";
+            if (!file) { show(resultEl, "—", "pick a file first"); return; }
+            const form = new FormData();
+            form.append("file", file, file.name);
+            // trailing slash matters here: PostHandler builds the multipart
+            // Location header from the request URI's own directory portion,
+            // so POSTing to the bare "/uploads" (no slash) reports the file
+            // at "/<name>" instead of "/uploads/<name>". Not our file to fix
+            // (PostHandler.cpp, C's), so route around it here instead.
+            await upload("/uploads/", form, resultEl, document.getElementById("delPath"));
+            if (file.type.startsWith("image/")) {
+                preview.src = "/uploads/" + encodeURIComponent(file.name) + "?t=" + Date.now();
+                preview.style.display = "block";
+            }
+        });
+
+        document.getElementById("delGo").addEventListener("click", async () => {
+            const resultEl = document.getElementById("delResult");
+            const path = document.getElementById("delPath").value;
+            if (!path) { show(resultEl, "—", "nothing to delete yet — upload something first"); return; }
+            try {
+                const res = await fetch(path, { method: "DELETE" });
+                show(resultEl, res.status);
+            } catch (e) {
+                show(resultEl, "—", "request failed: " + e);
+            }
+        });
+    </script>
+</body>
+</html>

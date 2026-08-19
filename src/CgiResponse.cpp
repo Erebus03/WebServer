@@ -44,6 +44,9 @@ bool CgiResponse::parseHead(const std::string& leading, CgiHeaders& out)
     out.body_offset = sep + skip;
     std::string headers = leading.substr(0, sep);
 
+    bool saw_status   = false;   // script gave its own code -> never override it
+    bool saw_location = false;   // Location with no Status = a redirect, not 200
+
     // walk header lines (split on \n, drop a trailing \r so \r\n works too)
     size_t pos = 0;
     while (pos < headers.size()) {
@@ -61,18 +64,41 @@ bool CgiResponse::parseHead(const std::string& leading, CgiHeaders& out)
             value = (s == std::string::npos) ? "" : value.substr(s);
 
             std::string lname = lower(name);
-            if (lname == "status")
+            if (lname == "status") {
                 applyStatus(value, out);                  // consumed, not a real header
+                saw_status = true;
+            }
             else if (lname == "content-type")
                 out.headers["Content-Type"] = value;      // canonical case
             else if (lname == "content-length")
                 out.headers["Content-Length"] = value;
-            else
+            else {
                 out.headers[name] = value;                // Location, Set-Cookie, ...
+                if (lname == "location")
+                    saw_location = true;
+            }
         }
         if (nl == std::string::npos)
             break;
         pos = nl + 1;
     }
+
+    // RFC 3875 §6.2.2/6.2.3: a script emitting Location with no Status is
+    // issuing a redirect, not a plain 200. The RFC actually splits this into
+    // two shapes -- a path-only Location ("/x") is a LOCAL redirect the
+    // server should silently re-serve internally, an absolute Location
+    // ("http://...") is a CLIENT redirect the server sends as 302 -- but
+    // implementing local-redirect's internal reprocessing is real scope
+    // creep for a single-poll() server. Defaulting BOTH shapes to 302 is the
+    // common, documented simplification (nginx-class servers behave the same
+    // for the local case): the browser still lands on the right page, it
+    // just takes one visible hop instead of a silent one, and it stops the
+    // real bug this exists to fix -- a client seeing 200 for what the script
+    // clearly meant as a redirect.
+    if (saw_location && !saw_status) {
+        out.status_code    = 302;
+        out.status_message = "Found";
+    }
+
     return true;
 }
