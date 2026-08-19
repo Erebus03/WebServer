@@ -7,6 +7,7 @@
 #include <limits>
 #include <set>
 #include <utility>
+#include <sys/stat.h>
 
 namespace {
 
@@ -501,6 +502,80 @@ static void claimServer(const ServerConfig& srv,
     endpoints_seen.insert(endpoint);
 }
 
+// ── Config that parses but cannot do what it says ───────────────────────────
+// Nothing here is a syntax error, so the parser was happy with all of it and a
+// broken config loaded in silence. Each case below cost real debugging time:
+//
+//   - config/default.conf declares `location /test-upload` TWICE with
+//     contradictory settings. Router::match keeps the FIRST on a tie
+//     (`path.length() > best_length` is strictly greater), so the second block
+//     was dead config that looked live.
+//   - Its main server roots at /var/www/html, which does not exist on this
+//     machine. Every request that server could answer was already a 404.
+//   - A peer testing with Postman hit `allowed_methods GET POST DELETE` on a
+//     location with no upload_directory and got 403 with no explanation. The
+//     config says POST is fine; PostHandler.cpp refuses it because there is
+//     nowhere to put a body. Both are behaving as written -- the config is the
+//     bug, and now it says so at startup instead of at request time.
+//
+// Only the duplicate is fatal: it is unambiguous, no correct config ever has
+// one, and the discarded block is invisible otherwise. The rest warn, because a
+// server that refuses to boot in front of an evaluator is worse than one that
+// explains itself and runs.
+static bool statIsDir(const std::string& p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool listsMethod(const LocationConfig& loc, const std::string& m) {
+    // An EMPTY methods list means the author said nothing, and Dispatcher skips
+    // the check entirely. Only an explicit mention counts here, so a location
+    // that never meant to take a POST is not nagged about one.
+    for (size_t i = 0; i < loc.methods.size(); ++i)
+        if (loc.methods[i] == m) return true;
+    return false;
+}
+
+static void validateServer(const ServerConfig& srv, int line) {
+    std::set<std::string> seen_paths;
+    for (size_t i = 0; i < srv.locations.size(); ++i) {
+        if (!seen_paths.insert(srv.locations[i].path).second)
+            fail("duplicate location '" + srv.locations[i].path +
+                 "' in one server block -- only the first is ever matched, so the "
+                 "second is silently dead. Merge them or give them distinct paths",
+                 line);
+    }
+
+    for (size_t i = 0; i < srv.locations.size(); ++i) {
+        const LocationConfig& loc = srv.locations[i];
+        const std::string where = "location '" + loc.path + "'";
+
+        if (listsMethod(loc, "POST") && loc.upload_dir.empty() && loc.cgi_ext.empty())
+            std::cerr << "config warning: " << where << " allows POST but declares "
+                      << "neither upload_directory nor cgi_extension -- every POST "
+                      << "here answers 403, because there is nowhere to put the body"
+                      << std::endl;
+
+        if (!loc.upload_dir.empty() && !statIsDir(loc.upload_dir))
+            std::cerr << "config warning: " << where << " has upload_directory '"
+                      << loc.upload_dir << "', which is not an existing directory -- "
+                      << "every upload here answers 500" << std::endl;
+
+        if (!loc.upload_dir.empty() && !loc.cgi_ext.empty())
+            std::cerr << "config warning: " << where << " declares upload_directory "
+                      << "AND cgi_extension. A multipart upload names its own file in "
+                      << "the request body, so the URL carries no script extension and "
+                      << "the upload is not intercepted -- then the next GET executes "
+                      << "what was uploaded. Put uploads on a location with no CGI"
+                      << std::endl;
+
+        if (!loc.root.empty() && !statIsDir(loc.root))
+            std::cerr << "config warning: " << where << " resolves to root '"
+                      << loc.root << "', which does not exist -- every request that "
+                      << "reaches it answers 404" << std::endl;
+    }
+}
+
 Config parseTokens(const std::vector<Token>& toks) {
     Config config;
     std::set<std::string> endpoints_seen;
@@ -515,6 +590,7 @@ Config parseTokens(const std::vector<Token>& toks) {
         config.push_back(parseServer(toks, pos));
         // t.line is the 'server' keyword, so the error points at the block itself
         claimServer(config.back(), endpoints_seen, claimed, t.line);
+        validateServer(config.back(), t.line);
     }
     return config;
 }
