@@ -54,6 +54,9 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
             if (!location.dir_listing)
                 return HttpStatus::make_response(404);
 
+            if (!FileUtils::is_readable(diskPath))
+                return HttpStatus::make_response(403);
+
             std::string listing;
             if (!DirectoryLister::generate(diskPath, request.uri, listing))
                 return HttpStatus::make_response(500);
