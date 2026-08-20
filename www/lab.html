@@ -86,11 +86,16 @@
         async function upload(path, body, resultEl, delField) {
             try {
                 const res = await fetch(path, { method: "POST", body: body });
-                const location = res.headers.get("Location") || path;
-                show(resultEl, res.status, "Location: " + location);
-                if (res.status < 400) delField.value = location;
+                const location = res.headers.get("Location");
+                let note = "";
+                if (location) note = "Location: " + location;
+                else if (res.status === 409) note = "already on disk — nothing written. multipart never overwrites; delete it first.";
+                show(resultEl, res.status, note);
+                if (res.status < 400) delField.value = location || path;
+                return res;
             } catch (e) {
                 show(resultEl, "—", "request failed: " + e);
+                return null;
             }
         }
 
@@ -114,8 +119,8 @@
             // so POSTing to the bare "/uploads" (no slash) reports the file
             // at "/<name>" instead of "/uploads/<name>". Not our file to fix
             // (PostHandler.cpp, C's), so route around it here instead.
-            await upload("/uploads/", form, resultEl, document.getElementById("delPath"));
-            if (file.type.startsWith("image/")) {
+            const res = await upload("/uploads/", form, resultEl, document.getElementById("delPath"));
+            if (res && res.ok && file.type.startsWith("image/")) {
                 preview.src = "/uploads/" + encodeURIComponent(file.name) + "?t=" + Date.now();
                 preview.style.display = "block";
             }
