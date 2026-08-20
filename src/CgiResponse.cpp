@@ -1,4 +1,5 @@
 #include "../includes/CgiResponse.hpp"
+#include "../includes/FileUtils.hpp"
 #include <cctype>
 
 static std::string lower(std::string s)
@@ -13,7 +14,11 @@ static void applyStatus(const std::string& value, CgiHeaders& out)
     size_t i = 0;
     int code = 0;
     while (i < value.size() && value[i] >= '0' && value[i] <= '9')
-        code = code * 10 + (value[i++] - '0');
+    {
+        if (code <= 99999)
+            code = code * 10 + (value[i] - '0');
+        ++i;
+    }
     if (code >= 100 && code <= 599)
         out.status_code = code;
     size_t s = value.find_first_not_of(" \t", i);
@@ -60,19 +65,21 @@ bool CgiResponse::parseHead(const std::string& leading, CgiHeaders& out)
             size_t s = value.find_first_not_of(" \t");
             value = (s == std::string::npos) ? "" : value.substr(s);
 
-            std::string lname = lower(name);
-            if (lname == "status") {
-                applyStatus(value, out);
-                saw_status = true;
-            }
-            else if (lname == "content-type")
-                out.headers["Content-Type"] = value;
-            else if (lname == "content-length")
-                out.headers["Content-Length"] = value;
-            else {
-                out.headers[name] = value;
-                if (lname == "location")
-                    saw_location = true;
+            if (FileUtils::is_header_safe(name) && FileUtils::is_header_safe(value)) {
+                std::string lname = lower(name);
+                if (lname == "status") {
+                    applyStatus(value, out);
+                    saw_status = true;
+                }
+                else if (lname == "content-type")
+                    out.headers["Content-Type"] = value;
+                else if (lname == "content-length")
+                    out.headers["Content-Length"] = value;
+                else {
+                    out.headers[name] = value;
+                    if (lname == "location")
+                        saw_location = true;
+                }
             }
         }
         if (nl == std::string::npos)
