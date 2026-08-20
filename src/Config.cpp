@@ -436,11 +436,6 @@ static void claimServer(const ServerConfig& srv,
     endpoints_seen.insert(endpoint);
 }
 
-static bool statIsDir(const std::string& p) {
-    struct stat st;
-    return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-}
-
 static bool listsMethod(const LocationConfig& loc, const std::string& m) {
     for (size_t i = 0; i < loc.methods.size(); ++i)
         if (loc.methods[i] == m) return true;
@@ -474,36 +469,22 @@ static void validateServer(const ServerConfig& srv, int line) {
         if (!loc.redirect_url.empty())
             continue;
 
-        if (listsMethod(loc, "POST") && loc.upload_dir.empty() && loc.cgi_ext.empty())
-            std::cerr << "config warning: " << where << " allows POST but declares "
-                      << "neither upload_directory nor cgi_extension -- every POST "
-                      << "here answers 403, because there is nowhere to put the body"
-                      << std::endl;
-
-        if (!loc.upload_dir.empty() && !statIsDir(loc.upload_dir))
-            std::cerr << "config warning: " << where << " has upload_directory '"
-                      << loc.upload_dir << "', which is not an existing directory -- "
-                      << "every upload here answers 500" << std::endl;
-
+        // FATAL: uploads + CGI on one location is RCE -- an upload drops a
+        // script, the next GET runs it. No config ever needs both.
         if (!loc.upload_dir.empty() && !loc.cgi_ext.empty())
-            std::cerr << "config warning: " << where << " declares upload_directory "
-                      << "AND cgi_extension. A multipart upload names its own file in "
-                      << "the request body, so the URL carries no script extension and "
-                      << "the upload is not intercepted -- then the next GET executes "
-                      << "what was uploaded. Put uploads on a location with no CGI"
-                      << std::endl;
+            fail(where + " sets both upload_directory and cgi_extension -- an "
+                 "uploaded file runs on the next GET (RCE); split them", line);
 
-        if (!loc.root.empty() && !statIsDir(loc.root))
-            std::cerr << "config warning: " << where << " resolves to root '"
-                      << loc.root << "', which does not exist -- every request that "
-                      << "reaches it answers 404" << std::endl;
+        // Advisory: the config runs, but a request there answers 403/405.
+        if (listsMethod(loc, "POST") && loc.upload_dir.empty() && loc.cgi_ext.empty())
+            std::cerr << "config warning: " << where << " allows POST but has no "
+                      << "upload_directory or cgi_extension -- POST here answers 403"
+                      << std::endl;
 
         if (listsMethod(loc, "GET") && !listsMethod(loc, "HEAD"))
             std::cerr << "config warning: " << where << " allows GET but not HEAD -- "
-                      << "`curl -I` here answers 405, though RFC 7231 4.1 makes HEAD "
-                      << "mandatory wherever GET works. Add HEAD unless refusing it is "
-                      << "deliberate (config/tester.conf needs the refusal)"
-                      << std::endl;
+                      << "HEAD here answers 405 (add HEAD unless the refusal is "
+                      << "deliberate)" << std::endl;
     }
 }
 
