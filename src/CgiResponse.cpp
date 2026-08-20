@@ -8,7 +8,6 @@ static std::string lower(std::string s)
     return s;
 }
 
-// a CGI "Status: 404 Not Found" line -> code (+ message if given)
 static void applyStatus(const std::string& value, CgiHeaders& out)
 {
     size_t i = 0;
@@ -24,12 +23,11 @@ static void applyStatus(const std::string& value, CgiHeaders& out)
 
 bool CgiResponse::parseHead(const std::string& leading, CgiHeaders& out)
 {
-    out.status_code = 200;   // CGI default when no Status header
+    out.status_code = 200;
     out.status_message.clear();
     out.headers.clear();
     out.body_offset = 0;
 
-    // the blank line ends the CGI headers. scripts use \n\n or \r\n\r\n.
     size_t sep, skip;
     size_t p1 = leading.find("\r\n\r\n");
     size_t p2 = leading.find("\n\n");
@@ -38,16 +36,15 @@ bool CgiResponse::parseHead(const std::string& leading, CgiHeaders& out)
     } else if (p2 != std::string::npos) {
         sep = p2; skip = 2;
     } else {
-        return false;   // headers not fully here yet -> read more from the pipe
+        return false;
     }
 
     out.body_offset = sep + skip;
     std::string headers = leading.substr(0, sep);
 
-    bool saw_status   = false;   // script gave its own code -> never override it
-    bool saw_location = false;   // Location with no Status = a redirect, not 200
+    bool saw_status   = false;
+    bool saw_location = false;
 
-    // walk header lines (split on \n, drop a trailing \r so \r\n works too)
     size_t pos = 0;
     while (pos < headers.size()) {
         size_t nl = headers.find('\n', pos);
@@ -65,15 +62,15 @@ bool CgiResponse::parseHead(const std::string& leading, CgiHeaders& out)
 
             std::string lname = lower(name);
             if (lname == "status") {
-                applyStatus(value, out);                  // consumed, not a real header
+                applyStatus(value, out);
                 saw_status = true;
             }
             else if (lname == "content-type")
-                out.headers["Content-Type"] = value;      // canonical case
+                out.headers["Content-Type"] = value;
             else if (lname == "content-length")
                 out.headers["Content-Length"] = value;
             else {
-                out.headers[name] = value;                // Location, Set-Cookie, ...
+                out.headers[name] = value;
                 if (lname == "location")
                     saw_location = true;
             }
@@ -83,18 +80,6 @@ bool CgiResponse::parseHead(const std::string& leading, CgiHeaders& out)
         pos = nl + 1;
     }
 
-    // RFC 3875 §6.2.2/6.2.3: a script emitting Location with no Status is
-    // issuing a redirect, not a plain 200. The RFC actually splits this into
-    // two shapes -- a path-only Location ("/x") is a LOCAL redirect the
-    // server should silently re-serve internally, an absolute Location
-    // ("http://...") is a CLIENT redirect the server sends as 302 -- but
-    // implementing local-redirect's internal reprocessing is real scope
-    // creep for a single-poll() server. Defaulting BOTH shapes to 302 is the
-    // common, documented simplification (nginx-class servers behave the same
-    // for the local case): the browser still lands on the right page, it
-    // just takes one visible hop instead of a silent one, and it stops the
-    // real bug this exists to fix -- a client seeing 200 for what the script
-    // clearly meant as a redirect.
     if (saw_location && !saw_status) {
         out.status_code    = 302;
         out.status_message = "Found";

@@ -2,7 +2,7 @@
 
 int checkHttpVersion(const std::string& version)
 {
-    
+
     if (version.size() != 8 || version.compare(0, 5, "HTTP/") != 0)
         return 400;
 

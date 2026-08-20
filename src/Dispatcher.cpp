@@ -70,9 +70,6 @@ HttpResponse Dispatcher::produce_response(const HttpRequest& request, const Serv
 void Dispatcher::attach_error_body(const HttpRequest& request, HttpResponse& response,
                                    const ServerConfig& server)
 {
-    // HEAD is not special-cased here on purpose: the error page is generated
-    // normally so Content-Length describes what a GET would have returned, and
-    // Server.cpp drops the body at the wire.
     (void)request;
 
     if (response.status_code < 400)

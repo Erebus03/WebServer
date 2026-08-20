@@ -64,16 +64,6 @@ std::string FileUtils::strip_location_prefix(const std::string& uri, const std::
     if (uri.size() < cut)
         return uri;
 
-    // Cutting `cut` bytes is only meaningful if the uri REALLY starts with the
-    // location path, at a segment boundary. Router::locationMatches guarantees
-    // exactly that for every caller today (GetHandler, DeleteHandler and the CGI
-    // script path in Server.cpp all route through Router::match first) -- but
-    // that guarantee is invisible from in here, and nothing enforces it.
-    //
-    // Without these two lines, ("/uploadsX/a", "/uploads") returned "/X/a": a
-    // path with no relation to the request, and no error to say so. Refusing to
-    // cut is the safe answer -- the caller then joins the untouched uri, which
-    // resolves to a path that does not exist and produces an honest 404.
     if (uri.compare(0, cut, location_path, 0, cut) != 0)
         return uri;
     if (uri.size() > cut && uri[cut] != '/')
@@ -125,13 +115,6 @@ bool FileUtils::is_writable(const std::string& path)
 
 bool FileUtils::read_file(const std::string& path, std::string& out)
 {
-    // A DIRECTORY can be handed to ifstream on Linux and is_open() succeeds; the
-    // rdbuf extraction below then yields nothing. So without this guard read_file
-    // returned TRUE with an empty `out` for a directory -- indistinguishable, to
-    // a caller, from "I read a genuinely empty file". Both call sites happened to
-    // be protected (GetHandler checks is_directory first, Dispatcher checks the
-    // body is non-empty afterwards), but the protection belongs here, once,
-    // rather than in every caller that ever gets added.
     struct stat info = {};
     if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode))
         return false;

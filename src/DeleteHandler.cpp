@@ -9,7 +9,7 @@ HttpResponse DeleteHandler::handle(const HttpRequest& request, const LocationCon
 {
     if (!FileUtils::is_path_safe(request.uri))
         return HttpStatus::make_response(403);
-    
+
     std::string diskPath;
     const std::string relative =
         FileUtils::strip_location_prefix(request.uri, location.path);
@@ -22,11 +22,6 @@ HttpResponse DeleteHandler::handle(const HttpRequest& request, const LocationCon
     if (FileUtils::is_directory(diskPath))
         return HttpStatus::make_response(403);
 
-    // unlink() is NOT in the subject's External Function table (verified against
-    // en.subject.pdf v24.0, ch. IV) — and neither is remove()/rmdir(), so DELETE
-    // has no listed syscall at all. std::remove is ISO C++98 <cstdio> (27.8.2),
-    // so it rides on the standard library rather than on that table, the same
-    // cover that lets us use memset/atoi/time. Do not "fix" this back to unlink.
     const int result = std::remove(diskPath.c_str());
     if (result == 0)
         return HttpStatus::make_response(204);
@@ -42,8 +37,6 @@ HttpResponse DeleteHandler::handle(const HttpRequest& request, const LocationCon
     case EISDIR:
         return HttpStatus::make_response(403);
     default:
-        // TODO(team): an errno we did not anticipate becomes a silent 500. Decide
-        // whether this should log, or assert in debug builds.
         return HttpStatus::make_response(500);
     }
 }

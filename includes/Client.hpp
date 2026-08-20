@@ -6,200 +6,70 @@
 #include <ctime>
 #include <sys/types.h>
 #include "HttpParser.hpp"
-// #include "Request.hpp"
-// #include "Response.hpp"
 
-// Defined as `struct ServerConfig` in Config.hpp. Client never owns it.
 struct ServerConfig;
-
-// B writes into `request`, C writes into `response`. Fields are public by
-// design so B and C can touch them directly without an accessor vocabulary.
 
 class Client {
 public:
-    // READING covers both header and body reading; the parser tracks the
-    // header-vs-body sub-state internally, so it does not need its own state.
     enum State {
         READING,
-        PROCESSING, // routing + building the response
+        PROCESSING,
         SENDING,
-        WAITING_FOR_CGI,  // blocked waiting on a CGI child
+        WAITING_FOR_CGI,
         DONE
     };
 
-    // connection identity
     int          fd;
-    int          listen_fd;       // socket we were accepted on; picks the vhost candidates
-    int          cgi_pipe_fd;     // CGI stdout pipe read end; -1 if none
-    // CGI stdin pipe WRITE end; -1 if none or already drained. Closing this is
-    // how the child learns the body is over: a pipe read returns EOF only when
-    // every write end is shut, so holding it open makes a script that reads its
-    // body to EOF hang until our own timeout kills it.
+    int          listen_fd;
+    int          cgi_pipe_fd;
     int          cgi_stdin_fd;
-    size_t       cgi_body_sent;   // bytes of request.body handed to the child
-    pid_t        cgi_pid;         // CGI child pid for waitpid(); -1 if none
-    // When the script was forked; 0 = none running. Its own clock, separate
-    // from every request/idle timer: a client waiting on a script is neither
-    // idle nor late, but it must still be bounded or a script that never exits
-    // holds the connection forever.
+    size_t       cgi_body_sent;
+    pid_t        cgi_pid;
     time_t       cgi_start_time;
     std::string  remote_address;
     State        state;
 
-    // I/O buffers. The types differ on purpose — do not "unify" them.
-    //
-    // input_buf is std::string because HttpParser::parse() takes a
-    // `const std::string&`. As std::vector<char> it had to be copied whole into
-    // a temporary string on EVERY recv, which made reading a body quadratic:
-    // measured 4.0x cost per doubling of body size, with the copy accounting for
-    // 99% of it (2 MB body: 0.405s copying vs 0.0031s parsing). Nothing takes
-    // its address — recv() reads into a stack buffer and we append() — so the
-    // C++98 rule that only vector guarantees contiguous storage does not bite.
-    // append(ptr, n) is length-based and binary-safe, embedded NULs included.
-    //
-    // output_buf stays std::vector<char> because send() DOES index into it:
-    // &output_buf[bytes_sent]. There the contiguity guarantee is load-bearing.
-    // It also costs nothing to keep — output_buf is assign()ed once per response
-    // and then drained through the bytes_sent cursor, never re-copied, so it is
-    // linear where input_buf was not.
     std::string        input_buf;
     std::vector<char>  output_buf;
     size_t             bytes_sent;
 
-    // Offset in input_buf where the CURRENT request's body starts, i.e. the
-    // length of its request line + headers + the terminating blank line.
-    // 0 means "not known yet" — a real header block is never shorter than the
-    // 4-byte terminator, so 0 is unambiguous as a sentinel.
-    //
-    // Cached rather than recomputed because the body-size check needs it on
-    // every recv, and HttpParser re-parses from byte zero each time. A
-    // find("\r\n\r\n") per recv over a growing buffer is O(n^2) in the body
-    // size — the same quadratic that was already deleted from input_buf (see
-    // the note above it). The header block cannot move once it has closed, so
-    // one scan per request is the true cost.
-    //
-    // Reset by resetForNextRequest(), because the bytes it indexes into are
-    // erased when the request completes and the next request starts at 0.
     size_t             header_bytes;
 
     time_t  last_activity;
-    // When the first byte of the CURRENT request arrived; 0 = none in flight.
-    // Deliberately not refreshed as more bytes come in — that is what makes the
-    // header deadline immune to a client dribbling just enough to keep
-    // isTimedOut() happy forever (slow-loris). Read by Server::_isReadOverdue(),
-    // which owns the read deadline because its body-phase ceiling needs the
-    // resolved config and this struct does not have it.
     time_t  request_start;
-    // Last time send() actually moved bytes; 0 = not sending. Refreshed on
-    // PROGRESS, not on attempts — see isSendStalled().
     time_t  last_send_progress;
 
-    // Reuse this connection once the current response has drained? Decided when
-    // the response is framed, from the request's version and Connection header.
     bool    keep_alive;
 
-    // --- response completion ---
-    // Is every byte of this response now in output_buf? For an ordinary response
-    // that is true the moment it is framed. For a STREAMING CGI it stays false
-    // until the script's pipe hits EOF, because output_buf running empty only
-    // means "the script has not printed the next piece yet".
-    //
-    // The write path must consult this and NOT the buffer level: treating a
-    // drained buffer as a finished response would recycle or close the
-    // connection mid-script, truncating every CGI response at its first pause.
     bool    response_complete;
 
-    // --- CGI streaming state (all unused when cgi_pipe_fd == -1) ---
-    // Script output that has not yet formed a complete header block. Parsed by
-    // CgiResponse::parseHead() on each read; once that succeeds this is dropped
-    // and everything after body_offset streams straight through. Capped by
-    // MAX_HEADER_BYTES so a script that never emits a blank line cannot grow it
-    // without bound.
     std::string cgi_head_buf;
-    // Have we written this response's status line and headers into output_buf?
-    // Until then nothing of the body may be emitted — the framing headers must
-    // precede the first chunk.
     bool        cgi_headers_sent;
-    // Is this CGI body framed with chunked encoding, or by closing?
-    //
-    // Chunked is HTTP/1.1 ONLY — 1.0 has no Transfer-Encoding, so a 1.0 client
-    // would render the hex sizes as body text. For those the body is delimited
-    // by the close instead, which forces keep_alive off no matter what the
-    // request asked for: the close IS the terminator, so reusing the connection
-    // would leave the body unterminated. Decided once, when the headers are
-    // framed, and read by both the body-append and EOF paths.
     bool        cgi_chunked;
 
-    // --- config + parsed data ---
-    ServerConfig*  server_cfg;  // server block that accepted this client; never owns
+    ServerConfig*  server_cfg;
 
-    // The parser writes here; the router reads here. `state` is the completeness
-    // signal the read handler gates on — see ParseState in types.hpp.
     HttpRequest    request;
-    // Response       response;    // response to send (B's type — see header note)
 
-
-    HttpParser     parser;      // incremental parse state
-                                // PROVISIONAL: location of parser state is a
-                                // B decision — may move into Request later.
+    HttpParser     parser;
 
     Client(int socket_fd, int accepted_on, const std::string& remote_addr);
 
-    // Silent for too long. Refreshed by activity, so it only catches connections
-    // that have genuinely gone quiet.
     bool isTimedOut(time_t timeout_seconds) const;
 
-    // A response that has stopped draining. Measures time since the last byte
-    // actually went out, NOT total response time — a big file to a genuinely
-    // slow client keeps making progress and must not be killed for being slow.
-    // Only a peer that has stopped reading entirely trips this.
     bool isSendStalled(time_t stall_seconds) const;
 
-    // ── Draining before close ────────────────────────────────────────────────
-    // Set once a Connection: close response has been fully written and the peer
-    // may still be mid-send (every FRAMING_LOST error: 400, 408, 413, 431, 503).
-    //
-    // Why it exists: close() on a socket that still has unread bytes in its
-    // receive queue makes the kernel send RST instead of FIN, and RST tells the
-    // peer to DISCARD whatever it has already buffered -- including the very
-    // response we just wrote. So the 413 was built, sent, and then destroyed in
-    // flight. MEASURED: a 5 MB body against a 200 B cap, and a 20 KB header
-    // block, both reached the client as "connection reset by peer" with no status
-    // line at all.
-    //
-    // shutdown() is not in the subject's allowed function list, so a half-close
-    // is not available. The remedy is to keep reading and throwing the bytes away
-    // until the peer stops, then close on an empty queue -- which sends FIN.
     bool    draining;
-    time_t  drain_start;      // when draining began, for the time bound
-    size_t  drained_bytes;    // how much has been discarded, for the byte bound
-    // Per-poll-cycle bookkeeping that decides when the queue is EMPTY.
-    // poll() is level-triggered: while unread bytes remain, POLLIN stays
-    // asserted. So one complete cycle in which we asked for POLLIN and got
-    // nothing means there is nothing left to drain, and we can close on an empty
-    // queue -- which sends FIN. Waiting for the time bound instead cost every
-    // read-until-EOF client a flat 5 s: it waits for our close, we wait for its,
-    // and only the clock breaks the tie. MEASURED at exactly 5.00s before this.
-    bool    drain_polled;     // POLLIN was requested for it this cycle
-    bool    drain_active;     // bytes actually arrived this cycle
+    time_t  drain_start;
+    size_t  drained_bytes;
+    bool    drain_polled;
+    bool    drain_active;
 
-    // Enter SENDING with the write-side cursor and clock reset. Every path that
-    // queues a response goes through here so the stall clock can't be forgotten.
     void beginSending();
 
-    // Recycle a live connection for the next request instead of destroying it.
-    // Clears every piece of per-request state so nothing leaks across requests —
-    // a stale byte in input_buf or a stale header in `request` would corrupt the
-    // next one.
     void resetForNextRequest();
 
 private:
-    // Orthodox Canonical Form, restrictive branch — same reasoning as Server.
-    // A Client is identified by its fd: two copies would both refer to one
-    // connection, and whichever is cleaned up first closes the fd out from
-    // under the other. Clients are always held as `Client*` in Server::clients
-    // and never copied, so forbidding this costs nothing and makes the
-    // never-copied assumption enforced rather than merely intended.
     Client(const Client& other);
     Client& operator=(const Client& other);
 };

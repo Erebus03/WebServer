@@ -17,7 +17,6 @@ struct Token {
     Token(const std::string& t, int l) : text(t), line(l) {}
 };
 
-// Throw a formatted diagnostic. Never returns.
 void fail(const std::string& msg, int line) {
     std::ostringstream os;
     os << "config error: " << msg << " (line " << line << ")";
@@ -33,13 +32,12 @@ bool isAllDigits(const std::string& s) {
     return true;
 }
 
-// Parse "1024", "512K", "2M", "1g" -> bytes. Returns false on malformed input.
 bool parseSize(const std::string& tok, size_t& out) {
     size_t i = 0;
     while (i < tok.size() && std::isdigit(static_cast<unsigned char>(tok[i])))
         ++i;
     if (i == 0)
-        return false; // no leading digits
+        return false;
 
     std::string num = tok.substr(0, i);
     std::string suf = tok.substr(i);
@@ -49,17 +47,14 @@ bool parseSize(const std::string& tok, size_t& out) {
     else if (suf == "K" || suf == "k")     mult = 1024UL;
     else if (suf == "M" || suf == "m")     mult = 1024UL * 1024UL;
     else if (suf == "G" || suf == "g")     mult = 1024UL * 1024UL * 1024UL;
-    else                                   return false; // unknown suffix
+    else                                   return false;
 
-    // On overflow C++98 sets failbit and leaves `val` untouched, so a silent 0
-    // would be indistinguishable from a genuine "0". Check the stream instead.
     std::istringstream is(num);
     size_t val = 0;
     is >> val;
     if (is.fail())
-        return false; // number too large for size_t
+        return false;
 
-    // val * mult would wrap; reject rather than store a wrong (smaller) limit.
     if (mult > 1 && val > std::numeric_limits<size_t>::max() / mult)
         return false;
 
@@ -67,7 +62,6 @@ bool parseSize(const std::string& tok, size_t& out) {
     return true;
 }
 
-// "127.0.0.1:8080" or "8080" -> host/port on the server, with validation.
 void parseListen(const std::string& arg, ServerConfig& s, int line) {
     std::string host;
     std::string portStr;
@@ -96,7 +90,6 @@ void parseListen(const std::string& arg, ServerConfig& s, int line) {
     s.port = static_cast<int>(p);
 }
 
-// Split the file into tokens with line numbers.
 std::vector<Token> tokenize(std::istream& in) {
     std::vector<Token> toks;
     std::string line;
@@ -105,7 +98,6 @@ std::vector<Token> tokenize(std::istream& in) {
     while (std::getline(in, line)) {
         ++lineno;
 
-        // strip comment
         size_t hash = line.find('#');
         if (hash != std::string::npos)
             line = line.substr(0, hash);
@@ -132,7 +124,6 @@ int lastLine(const std::vector<Token>& toks) {
     return toks.empty() ? 0 : toks.back().line;
 }
 
-// Consume the token at pos; error if it is missing or not `what`.
 void expect(const std::vector<Token>& toks, size_t& pos, const std::string& what) {
     if (pos >= toks.size())
         fail("expected '" + what + "' but reached end of file", lastLine(toks));
@@ -141,7 +132,6 @@ void expect(const std::vector<Token>& toks, size_t& pos, const std::string& what
     ++pos;
 }
 
-// Collect a directive's arguments up to and consuming the terminating ';'.
 std::vector<std::string> readArgs(const std::vector<Token>& toks, size_t& pos,
                                   const std::string& directive, int dline) {
     std::vector<std::string> args;
@@ -155,10 +145,9 @@ std::vector<std::string> readArgs(const std::vector<Token>& toks, size_t& pos,
         ++pos;
     }
     fail("missing ';' after '" + directive + "'", dline);
-    return args; // unreachable
+    return args;
 }
 
-// root + location path, one slash between them, no trailing one.
 std::string joinRootPath(const std::string& root, const std::string& path) {
     if (path.empty() || path == "/")
         return root;
@@ -278,11 +267,6 @@ void applyLocationDirective(LocationConfig& l, const std::string& d,
             fail("'redirect' expects [code] <url>", line);
         }
 
-    // root and alias differ exactly as in nginx:
-    //   root  /var/www + GET /pages/a.html -> /var/www/pages/a.html
-    //   alias /var/www + GET /pages/a.html -> /var/www/a.html
-    // Consumers always strip the location prefix, so `root` is implemented by
-    // folding the location path into the stored root -- see parseServer.
     } else if (d == "root") {
         if (a.size() != 1)
             fail("'root' expects exactly one path", line);
@@ -316,10 +300,6 @@ void applyLocationDirective(LocationConfig& l, const std::string& d,
     }
 }
 
-// pos points just past "location". Parses "<path> { ... }".
-// Inheritance from the enclosing server is deliberately NOT applied here: at
-// this point the server block is still half-built. parseServer resolves it in
-// a second pass. `bodySet` reports whether this block set its own body size.
 LocationConfig parseLocation(const std::vector<Token>& toks, size_t& pos,
                              bool& bodySet, bool& isAlias) {
     if (pos >= toks.size())
@@ -334,7 +314,7 @@ LocationConfig parseLocation(const std::vector<Token>& toks, size_t& pos,
     expect(toks, pos, "{");
 
     bodySet = false;
-    isAlias = false;   // no root/alias -> inherits server root, which is root semantics
+    isAlias = false;
     while (true) {
         if (pos >= toks.size())
             fail("unclosed 'location' block (missing '}')", lastLine(toks));
@@ -355,17 +335,13 @@ LocationConfig parseLocation(const std::vector<Token>& toks, size_t& pos,
     return loc;
 }
 
-// pos points just past the '{' that opened the server block.
 ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
     ServerConfig srv = ServerConfig();
-    srv.host = "0.0.0.0"; // defaults, overridden by 'listen'
+    srv.host = "0.0.0.0";
     srv.port = 8080;
 
-    // 0 is a legal client_max_body_size ("reject every body"), so it cannot
-    // double as "unset". Track explicitness per location, parallel to
-    // srv.locations, rather than adding a field to the shared LocationConfig.
     std::vector<bool> bodyExplicit;
-    std::vector<bool> aliasSemantics;   // parallel too: which used `alias`
+    std::vector<bool> aliasSemantics;
 
     bool bodySet = false;
     while (true) {
@@ -393,22 +369,13 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
         applyServerDirective(srv, directive, args, dline, bodySet);
     }
 
-    // Apply defaults for anything left unset.
     if (srv.root.empty())
         srv.root = "/var/www/html";
     if (srv.index_files.empty())
         srv.index_files.push_back("index.html");
     if (!bodySet)
-        srv.client_max_body_size = 1024UL * 1024UL; // 1M
+        srv.client_max_body_size = 1024UL * 1024UL;
 
-    // `error_page` names a URI, not a filesystem path. Both consumers
-    // (Dispatcher's error filler and _startErrorResponse) hand the stored value
-    // straight to FileUtils::read_file, so an unresolved "/404.html" opened the
-    // literal path /404.html at the filesystem root and always failed -- which is
-    // why custom error pages silently never loaded and the generated page was
-    // always used. Resolved ONCE here, where srv.root is final, so neither
-    // consumer has to know about roots. Both still fall back to the generated
-    // page if the file cannot be read, so a wrong path degrades, never breaks.
     for (std::map<int, std::string>::iterator it = srv.error_pages.begin();
          it != srv.error_pages.end(); ++it) {
         std::string& page = it->second;
@@ -420,10 +387,6 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
         page = base + (page[0] == '/' ? page : "/" + page);
     }
 
-    // Second pass: resolve location inheritance only now that `srv` is final
-    // (all directives seen, all defaults applied). Doing this inside the loop
-    // above snapshots a half-built server, which makes the parse result depend
-    // on the order directives happen to appear in.
     for (size_t i = 0; i < srv.locations.size(); ++i) {
         LocationConfig& loc = srv.locations[i];
         if (loc.root.empty())
@@ -433,13 +396,6 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
         if (!bodyExplicit[i])
             loc.client_max_body_size = srv.client_max_body_size;
 
-        // THE root/alias distinction, and the only place it exists. Consumers
-        // always strip the location prefix before joining; folding the path in
-        // here turns that same strip-then-join into nginx `root`. `alias` skips
-        // the fold. Nothing downstream learns which directive was used, so
-        // LocationConfig needs no new field.
-        // Done AFTER inheritance: a location with no root of its own inherits
-        // the server's, and a server root is always root semantics.
         if (!aliasSemantics[i])
             loc.root = joinRootPath(loc.root, loc.path);
     }
@@ -447,25 +403,6 @@ ServerConfig parseServer(const std::vector<Token>& toks, size_t& pos) {
     return srv;
 }
 
-// ── Reject a server block that can never be selected ────────────────────────
-// The correction sheet: "try to setup the same port multiple times. It should
-// not work." Taken literally that would forbid virtual hosts -- which the SAME
-// sheet demands two items earlier ("multiple servers with different hostnames").
-// The subject settles it: a website is keyed by its interface:port pair, and the
-// virtual host feature is out of scope. We implemented vhosts anyway (the subject
-// permits it), so a repeated endpoint is only undecidable when the NAME repeats
-// too. That is the case refused here, and only that case. See study/A16.
-//
-// What makes a block unreachable is exactly how Server::_resolveServerConfig
-// picks one: candidates[0] is the default for the endpoint, and the name scan
-// returns on its FIRST match. So:
-//   - a later block whose (endpoint, name) pair is already claimed loses the
-//     name scan to the earlier one, always;
-//   - a later block with NO server_name is competing for the default slot, and
-//     the default is whichever block came first on that endpoint -- named or not.
-// Neither can be reached by any request, from any client. Refusing them removes
-// no working configuration; it only stops us accepting config that does nothing
-// while printing "+ virtual host" as though it worked.
 static std::string lowerName(const std::string& s) {
     std::string out(s);
     for (size_t i = 0; i < out.size(); ++i)
@@ -483,9 +420,6 @@ static void claimServer(const ServerConfig& srv,
     const std::string endpoint = key.str();
 
     if (srv.server_names.empty()) {
-        // Reachable only as the endpoint's default, and the default is the first
-        // block on it. Being here after the endpoint is known means something
-        // already holds that slot.
         if (endpoints_seen.count(endpoint) != 0)
             fail("this server block listens on " + endpoint + " with no 'server_name', "
                  "but another block already answers there; it could never be "
@@ -502,35 +436,12 @@ static void claimServer(const ServerConfig& srv,
     endpoints_seen.insert(endpoint);
 }
 
-// ── Config that parses but cannot do what it says ───────────────────────────
-// Nothing here is a syntax error, so the parser was happy with all of it and a
-// broken config loaded in silence. Each case below cost real debugging time:
-//
-//   - config/default.conf declares `location /test-upload` TWICE with
-//     contradictory settings. Router::match keeps the FIRST on a tie
-//     (`path.length() > best_length` is strictly greater), so the second block
-//     was dead config that looked live.
-//   - Its main server roots at /var/www/html, which does not exist on this
-//     machine. Every request that server could answer was already a 404.
-//   - A peer testing with Postman hit `allowed_methods GET POST DELETE` on a
-//     location with no upload_directory and got 403 with no explanation. The
-//     config says POST is fine; PostHandler.cpp refuses it because there is
-//     nowhere to put a body. Both are behaving as written -- the config is the
-//     bug, and now it says so at startup instead of at request time.
-//
-// Only the duplicate is fatal: it is unambiguous, no correct config ever has
-// one, and the discarded block is invisible otherwise. The rest warn, because a
-// server that refuses to boot in front of an evaluator is worse than one that
-// explains itself and runs.
 static bool statIsDir(const std::string& p) {
     struct stat st;
     return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static bool listsMethod(const LocationConfig& loc, const std::string& m) {
-    // An EMPTY methods list means the author said nothing, and Dispatcher skips
-    // the check entirely. Only an explicit mention counts here, so a location
-    // that never meant to take a POST is not nagged about one.
     for (size_t i = 0; i < loc.methods.size(); ++i)
         if (loc.methods[i] == m) return true;
     return false;
@@ -574,18 +485,6 @@ static void validateServer(const ServerConfig& srv, int line) {
                       << loc.root << "', which does not exist -- every request that "
                       << "reaches it answers 404" << std::endl;
 
-        // RFC 7231 4.1 makes HEAD mandatory wherever GET is supported, but this
-        // server takes allowed_methods LITERALLY -- and it has to. MEASURED: adding
-        // HEAD to config/tester.conf's `location /` makes `HEAD /` answer 200, and
-        // the school tester then stops at test 3 with "FATAL ERROR ON LAST TEST: bad
-        // status code" (it reaches all 24 otherwise). The tester reads
-        // `allowed_methods GET` as GET and nothing else, so Dispatcher cannot imply
-        // HEAD from GET without failing the thing we are graded on.
-        //
-        // So the method check stays literal and the gap is surfaced HERE instead.
-        // Every shipped config except tester.conf now lists HEAD explicitly; this
-        // catches the next one that forgets, at startup rather than when an
-        // evaluator types `curl -I` and gets a 405. tester.conf trips it on purpose.
         if (listsMethod(loc, "GET") && !listsMethod(loc, "HEAD"))
             std::cerr << "config warning: " << where << " allows GET but not HEAD -- "
                       << "`curl -I` here answers 405, though RFC 7231 4.1 makes HEAD "
@@ -607,7 +506,6 @@ Config parseTokens(const std::vector<Token>& toks) {
         ++pos;
         expect(toks, pos, "{");
         config.push_back(parseServer(toks, pos));
-        // t.line is the 'server' keyword, so the error points at the block itself
         claimServer(config.back(), endpoints_seen, claimed, t.line);
         validateServer(config.back(), t.line);
     }
@@ -627,7 +525,7 @@ Config ConfigParser::parse(const std::string& config_file) {
     if (!file.is_open()) {
         std::cerr << "config error: cannot open config file '" << config_file << "'"
                   << std::endl;
-        return config; // empty
+        return config;
     }
 
     std::vector<Token> toks = tokenize(file);

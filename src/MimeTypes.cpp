@@ -6,12 +6,9 @@ std::string MimeTypes::typeFor(const std::string& filename)
     size_t slash = filename.find_last_of('/');
     size_t dot   = filename.find_last_of('.');
 
-    // the '.' must be in the filename itself, not in a directory name
-    // (e.g. "/my.dir/file" has a dot but no real extension)
     if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
         return "application/octet-stream";
 
-    // lowercase the extension so ".PNG" matches ".png"
     std::string ext = filename.substr(dot + 1);
     for (size_t i = 0; i < ext.size(); ++i)
         ext[i] = static_cast<char>(tolower(static_cast<unsigned char>(ext[i])));
@@ -28,5 +25,5 @@ std::string MimeTypes::typeFor(const std::string& filename)
     if (ext == "svg")                  return "image/svg+xml";
     if (ext == "pdf")                  return "application/pdf";
 
-    return "application/octet-stream";   // unknown extension -> generic binary
+    return "application/octet-stream";
 }
