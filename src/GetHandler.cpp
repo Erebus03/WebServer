@@ -27,17 +27,6 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
         {
             if (!FileUtils::is_header_safe(request.query_string))
                 return HttpStatus::make_response(400);
-
-            // request.uri arrives percent-DECODED (HttpParser's contract), so it
-            // cannot go into a Location header as-is: a request for /my%20dir would
-            // emit `Location: /my dir/`, a header value carrying a raw space, which
-            // is not a valid URI reference. encode_path re-encodes each segment and
-            // leaves the '/' separators alone. Ordinary paths are unchanged by it,
-            // which is why this is invisible to every existing test.
-            //
-            // The query string is NOT re-encoded: it is already in wire form (the
-            // parser splits it off at '?' without decoding it), so encoding here
-            // would double-encode every '&' and '=' in it.
             HttpResponse response = HttpStatus::make_response(301);
             std::string target = UrlCodec::encode_path(request.uri) + "/";
             if (!request.query_string.empty())
@@ -82,9 +71,6 @@ HttpResponse GetHandler::handle(const HttpRequest& request, const LocationConfig
     HttpResponse response = HttpStatus::make_response(200);
     if (!FileUtils::read_file(diskPath, response.body))
         return HttpStatus::make_response(500);
-
-    // label the file by its extension so browsers handle it right (css as css,
-    // json as json, ...). without this every file went out as text/html.
     response.headers["Content-Type"] = MimeTypes::typeFor(diskPath);
     return response;
 }

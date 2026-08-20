@@ -58,9 +58,6 @@ HttpResponse Dispatcher::produce_response(const HttpRequest& request, const Serv
     if (request.method == "GET")
         return GetHandler::handle(request, *location);
     if (request.method == "HEAD")
-        // body left intact on purpose: ResponseBuilder computes Content-Length
-        // from it, and Server.cpp:839 strips the body at the wire afterward.
-        // Clearing it here would make Content-Length read 0.
         return GetHandler::handle(request, *location);
     if (request.method == "DELETE")
         return DeleteHandler::handle(request, *location);

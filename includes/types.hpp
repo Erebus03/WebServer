@@ -7,11 +7,6 @@
 
 struct LocationConfig {
     std::string                        path;
-    // PRE-FOLDED by ConfigParser. For a `root` directive the location path is
-    // already appended here; for `alias` it is not. Every consumer must call
-    // FileUtils::strip_location_prefix(uri, path) before joining, or the location
-    // path is counted twice. Consumers: GetHandler.cpp, DeleteHandler.cpp,
-    // Server.cpp (CGI script path).
     std::string                        root;
     std::vector<std::string>           index_files;
     std::vector<std::string>           methods;
@@ -48,19 +43,13 @@ struct HttpRequest {
     ParseState                         state;
     std::string                        method;
     std::string                        uri;
-    std::string                        query_string;    // WITHOUT the leading '?' (RFC 3986 query
-                                                        // component; matches CGI QUERY_STRING).
-                                                        // TODO: confirm with B when the parser lands.
+    std::string                        query_string;
     std::string                        version;
     std::map<std::string, std::string> headers;
     std::string                        body;
     bool                               is_complete;
-    bool                               body_complete;   // true once `body` holds the WHOLE body.
-                                                        // A sets it false when he streams/drains the
-                                                        // body away, so C can tell "streamed off" from
-                                                        // "genuinely 0 bytes" and not write a silent
-                                                        // 0-byte file + 201. Parser sets it on COMPLETE.
-    int                                status;   // code to send on PARSE_ERROR (400 unless set otherwise)
+    bool                               body_complete;
+    int                                status;
 };
 
 struct HttpResponse {
@@ -70,12 +59,11 @@ struct HttpResponse {
     std::string                        body;
 };
 
-// one piece of a multipart/form-data body (a form field or an uploaded file).
 struct MultipartPart {
-    std::string name;          // the form field name
-    std::string filename;      // upload's filename (RAW, unsanitized); empty if a plain field
-    std::string content_type;  // the part's own Content-Type, empty if none
-    std::string data;          // the part's raw bytes
+    std::string name;
+    std::string filename;
+    std::string content_type;
+    std::string data;
 };
 
 #endif
